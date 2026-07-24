@@ -2,11 +2,11 @@
 
 A native macOS GitHub pull-request review app built with Zed's GPUI framework.
 
-The current implementation includes a virtualized, keyboard-navigable unified diff, an inline comment editor, and a local Git comparison parser.
+The current implementation includes a virtualized, keyboard-navigable unified diff, an inline comment editor, local Git comparisons, and GitHub PR loading through `gh`.
 
 ## Run
 
-Requirements: macOS, Xcode command-line tools, and the pinned Rust toolchain.
+Requirements: macOS, Xcode command-line tools, the pinned Rust toolchain, and an authenticated GitHub CLI (`gh auth login`) for PR loading.
 
 Run the generated 100,000-line fixture:
 
@@ -22,6 +22,16 @@ cargo run -p zreview -- /path/to/repository base-branch feature-branch
 ```
 
 The comparison uses merge-base semantics, equivalent to `base...head`.
+
+Load a GitHub PR using the current repository, or provide a local clone explicitly:
+
+```bash
+cargo run -p zreview -- pr 123
+cargo run -p zreview -- pr /path/to/repository 123
+cargo run -p zreview -- pr /path/to/repository https://github.com/acme/widgets/pull/123
+```
+
+ZReview reads metadata with `gh api`, fetches the base and `refs/pull/<number>/head` into `refs/zreview/...`, verifies both fetched SHAs, and then renders the local merge-base comparison. User branches and `FETCH_HEAD` are not changed.
 
 Controls:
 
@@ -45,7 +55,7 @@ cargo test --workspace
 
 Local comparisons are loaded through the `git` executable without a shell, external diff drivers, or text-conversion filters. The parser supports multiple hunks, additions, deletions, renames, copies, binary detection, unusual UTF-8 names, missing-final-newline markers, and direct or merge-base comparison modes.
 
-The UI includes a virtualized changed-file sidebar with status, line counts, keyboard navigation, and in-memory viewed state. It does not yet include GitHub access, persistence, syntax highlighting, or an AI review backend. The comment field is a minimal keyboard-input prototype used to validate focus and variable-height virtualized rows; it will be replaced by an IME-aware production editor.
+The UI includes a virtualized changed-file sidebar with status, line counts, keyboard navigation, in-memory viewed state, and pinned GitHub PR source metadata. It does not yet load existing GitHub review threads, submit reviews, persist state, provide syntax highlighting, or run an AI review backend. The comment field is a minimal keyboard-input prototype used to validate focus and variable-height virtualized rows; it will be replaced by an IME-aware production editor.
 
 ## License
 

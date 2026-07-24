@@ -46,4 +46,4 @@ The generated demo now contains twelve files while retaining the original 100,00
 
 ## Next step
 
-Add `crates/github` around authenticated `gh api` calls, resolve PR metadata and namespaced refs, and create a `ReviewSession` pinned to the PR's base/head SHAs.
+Add existing GitHub review comments and local anchored drafts to the PR-backed session.

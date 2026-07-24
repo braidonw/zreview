@@ -1,7 +1,8 @@
-use std::{env, process::ExitCode};
+use std::{env, path::Path, process::ExitCode};
 
 use domain::{DiffFile, FileStatus, ReviewSession, SessionSource};
 use git::{ComparisonMode, load_comparison};
+use github::{GithubClient, PullRequestSelector};
 use gpui::{
     App, AppContext, Application, Bounds, Focusable, WindowBounds, WindowOptions, px, size,
 };
@@ -12,7 +13,10 @@ fn main() -> ExitCode {
         Ok(session) => session,
         Err(message) => {
             eprintln!("zreview: {message}");
-            eprintln!("usage: zreview [<repository> <base> [<head>]]");
+            eprintln!("usage:");
+            eprintln!("  zreview");
+            eprintln!("  zreview <repository> <base> [<head>]");
+            eprintln!("  zreview pr [<repository>] <number-or-url>");
             return ExitCode::FAILURE;
         }
     };
@@ -29,7 +33,7 @@ fn main() -> ExitCode {
                     ..Default::default()
                 },
                 move |window, cx| {
-                    window.set_window_title("ZReview — local comparison");
+                    window.set_window_title("ZReview");
                     cx.new(|cx| ReviewView::new(session, window, cx))
                 },
             )
@@ -51,10 +55,17 @@ fn load_requested_session() -> Result<ReviewSession, String> {
     if arguments.is_empty() {
         return demo_session();
     }
+    if arguments.first().is_some_and(|argument| argument == "pr") {
+        return load_pull_request_session(&arguments[1..]);
+    }
     if !(2..=3).contains(&arguments.len()) {
         return Err("expected a repository, base revision, and optional head revision".to_owned());
     }
 
+    load_local_session(&arguments)
+}
+
+fn load_local_session(arguments: &[String]) -> Result<ReviewSession, String> {
     let repository = &arguments[0];
     let base = &arguments[1];
     let head = arguments.get(2).map_or("HEAD", String::as_str);
@@ -68,6 +79,55 @@ fn load_requested_session() -> Result<ReviewSession, String> {
 
     ReviewSession::new(source, comparison.files)
         .map_err(|_| format!("{base}...{head} contains no changed files"))
+}
+
+fn load_pull_request_session(arguments: &[String]) -> Result<ReviewSession, String> {
+    let (repository, selector) = match arguments {
+        [selector] => (
+            env::current_dir().map_err(|error| error.to_string())?,
+            selector,
+        ),
+        [repository, selector] => (Path::new(repository).to_path_buf(), selector),
+        _ => return Err("expected a PR number/URL and an optional repository path".to_owned()),
+    };
+    let selector = parse_pull_request_selector(selector)?;
+    let pull_request = GithubClient::default()
+        .load_pull_request(&repository, &selector)
+        .map_err(|error| error.to_string())?;
+    let metadata = pull_request.metadata;
+    let comparison = pull_request.comparison;
+    let source = SessionSource::GitHubPullRequest {
+        repository_root: comparison.repository_root,
+        owner: metadata.repository.owner.into(),
+        repository: metadata.repository.name.into(),
+        number: metadata.number,
+        title: metadata.title.into(),
+        url: metadata.url.into(),
+        base_ref: metadata.base_ref.into(),
+        head_ref: metadata.head_ref.into(),
+        base_sha: metadata.base_sha,
+        head_sha: metadata.head_sha,
+    };
+
+    ReviewSession::new(source, comparison.files).map_err(|_| {
+        format!(
+            "pull request #{} contains no changed files",
+            metadata.number
+        )
+    })
+}
+
+fn parse_pull_request_selector(value: &str) -> Result<PullRequestSelector, String> {
+    if value.starts_with("https://") {
+        Ok(PullRequestSelector::Url(value.to_owned()))
+    } else {
+        value
+            .parse::<u64>()
+            .ok()
+            .filter(|number| *number > 0)
+            .map(PullRequestSelector::Number)
+            .ok_or_else(|| format!("invalid pull request number or URL {value:?}"))
+    }
 }
 
 fn demo_session() -> Result<ReviewSession, String> {
@@ -90,4 +150,23 @@ fn demo_session() -> Result<ReviewSession, String> {
         .collect::<Vec<_>>();
 
     ReviewSession::new(SessionSource::Demo, files.into()).map_err(|error| error.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_pull_request_numbers_and_urls() {
+        assert_eq!(
+            parse_pull_request_selector("42").unwrap(),
+            PullRequestSelector::Number(42),
+        );
+        assert_eq!(
+            parse_pull_request_selector("https://github.com/acme/widgets/pull/42").unwrap(),
+            PullRequestSelector::Url("https://github.com/acme/widgets/pull/42".to_owned()),
+        );
+        assert!(parse_pull_request_selector("0").is_err());
+        assert!(parse_pull_request_selector("not-a-pr").is_err());
+    }
 }

@@ -24,6 +24,12 @@ pub struct ComparisonDiff {
     pub files: Arc<[DiffFile]>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GitRemote {
+    pub name: String,
+    pub urls: Vec<String>,
+}
+
 #[derive(Debug, Error)]
 pub enum GitError {
     #[error("failed to execute git in {repository}: {source}")]
@@ -75,7 +81,7 @@ pub fn load_comparison(
     head: &str,
     mode: ComparisonMode,
 ) -> Result<ComparisonDiff, GitError> {
-    let repository_root = resolve_repository_root(repository.as_ref())?;
+    let repository_root = repository_root(repository.as_ref())?;
     let base_sha = resolve_commit(&repository_root, base)?;
     let head_sha = resolve_commit(&repository_root, head)?;
     let diff_base = match mode {
@@ -97,13 +103,23 @@ pub fn load_comparison(
     })
 }
 
-fn resolve_repository_root(repository: &Path) -> Result<PathBuf, GitError> {
+/// Resolves a path inside a repository to its worktree root.
+///
+/// # Errors
+///
+/// Returns [`GitError`] when Git cannot inspect the path or returns non-UTF-8 output.
+pub fn repository_root(repository: &Path) -> Result<PathBuf, GitError> {
     let output = run_git(repository, "rev-parse", ["rev-parse", "--show-toplevel"])?;
     let root = output_text(output, "repository root")?;
     Ok(PathBuf::from(root.trim_end()))
 }
 
-fn resolve_commit(repository: &Path, revision: &str) -> Result<String, GitError> {
+/// Resolves a revision to a full commit object ID.
+///
+/// # Errors
+///
+/// Returns [`GitError`] when the revision is invalid or is not a commit.
+pub fn resolve_commit(repository: &Path, revision: &str) -> Result<String, GitError> {
     let commit_expression = format!("{revision}^{{commit}}");
     let output = run_git(
         repository,
@@ -123,6 +139,59 @@ fn resolve_commit(repository: &Path, revision: &str) -> Result<String, GitError>
         });
     }
     Ok(value)
+}
+
+/// Lists configured remotes and all of their fetch URLs.
+///
+/// # Errors
+///
+/// Returns [`GitError`] when Git cannot read the remote configuration or it contains
+/// non-UTF-8 names/URLs.
+pub fn remotes(repository: &Path) -> Result<Vec<GitRemote>, GitError> {
+    let root = repository_root(repository)?;
+    let output = run_git(&root, "remote", ["remote"])?;
+    let names = output_text(output, "remote names")?;
+    names
+        .lines()
+        .map(|name| {
+            let config_key = format!("remote.{name}.url");
+            let output = run_git(
+                &root,
+                "config --get-all",
+                ["config", "--get-all", "--", &config_key],
+            )?;
+            let urls = output_text(output, "remote URLs")?
+                .lines()
+                .map(str::to_owned)
+                .collect();
+            Ok(GitRemote {
+                name: name.to_owned(),
+                urls,
+            })
+        })
+        .collect()
+}
+
+/// Fetches explicit refspecs without updating `FETCH_HEAD` or user branches.
+///
+/// # Errors
+///
+/// Returns [`GitError`] when the remote/refspecs are invalid or the fetch fails.
+pub fn fetch_refspecs(
+    repository: &Path,
+    remote: &str,
+    refspecs: &[String],
+) -> Result<(), GitError> {
+    let mut args = vec![
+        "fetch".to_owned(),
+        "--no-tags".to_owned(),
+        "--no-write-fetch-head".to_owned(),
+        "--".to_owned(),
+        remote.to_owned(),
+    ];
+    args.extend(refspecs.iter().cloned());
+    run_git(repository, "fetch", args.iter().map(String::as_str))?;
+    Ok(())
 }
 
 fn merge_base(repository: &Path, base: &str, head: &str) -> Result<String, GitError> {
@@ -465,6 +534,45 @@ mod tests {
         assert_eq!(changed[1].status, FileStatus::Renamed);
         assert_eq!(changed[1].old_path.as_deref(), Some("old name.rs"));
         assert_eq!(changed[1].path, "new name.rs");
+    }
+
+    #[test]
+    fn lists_remotes_and_fetches_only_namespaced_refs() {
+        let source = TempDir::new().unwrap();
+        git(source.path(), ["init", "--quiet"]);
+        git(source.path(), ["config", "user.name", "ZReview Test"]);
+        git(
+            source.path(),
+            ["config", "user.email", "zreview@example.invalid"],
+        );
+        fs::write(source.path().join("README.md"), "source\n").unwrap();
+        git(source.path(), ["add", "."]);
+        git(source.path(), ["commit", "--quiet", "-m", "source"]);
+        let source_head = git_output(source.path(), ["rev-parse", "HEAD"]);
+        let source_branch = git_output(source.path(), ["branch", "--show-current"]);
+
+        let target = TempDir::new().unwrap();
+        git(target.path(), ["init", "--quiet"]);
+        git(
+            target.path(),
+            ["remote", "add", "origin", source.path().to_str().unwrap()],
+        );
+
+        let configured = remotes(target.path()).unwrap();
+        assert_eq!(configured[0].name, "origin");
+        assert_eq!(configured[0].urls, [source.path().to_str().unwrap()]);
+
+        let destination = "refs/zreview/test/head";
+        fetch_refspecs(
+            target.path(),
+            "origin",
+            &[format!("+refs/heads/{source_branch}:{destination}")],
+        )
+        .unwrap();
+        assert_eq!(
+            resolve_commit(target.path(), destination).unwrap(),
+            source_head
+        );
     }
 
     #[test]

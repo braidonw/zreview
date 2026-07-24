@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use domain::{DiffFile, DiffLine, DiffLineKind, FileStatus, ReviewSession};
+use domain::{DiffFile, DiffLine, DiffLineKind, FileStatus, ReviewSession, SessionSource};
 use gpui::{
     App, ClipboardItem, Context, Entity, FocusHandle, Focusable, KeyBinding, KeyDownEvent,
     ListAlignment, ListState, MouseButton, Render, SharedString, Window, actions, div, list,
@@ -26,6 +26,10 @@ actions!(
 const ROW_HEIGHT: f32 = 24.0;
 const COMMENT_HEIGHT: f32 = 104.0;
 const GUTTER_WIDTH: f32 = 58.0;
+
+fn short_sha(value: &str) -> &str {
+    value.get(..7).unwrap_or(value)
+}
 
 pub fn init(cx: &mut App) {
     cx.bind_keys([
@@ -661,6 +665,28 @@ impl Render for ReviewView {
             .collect::<Vec<_>>();
         let viewed_count = self.session.viewed_count();
         let file_count = files.len();
+        let (source_label, source_title) = match self.session.source() {
+            SessionSource::Demo => (
+                SharedString::from("Generated fixture"),
+                SharedString::from("Diff virtualization demo"),
+            ),
+            SessionSource::LocalComparison {
+                base_sha, head_sha, ..
+            } => (
+                SharedString::from("Local comparison"),
+                SharedString::from(format!("{}…{}", short_sha(base_sha), short_sha(head_sha))),
+            ),
+            SessionSource::GitHubPullRequest {
+                owner,
+                repository,
+                number,
+                title,
+                ..
+            } => (
+                SharedString::from(format!("{owner}/{repository} · PR #{number}")),
+                SharedString::from(title.to_string()),
+            ),
+        };
         let review_view = cx.entity();
 
         div()
@@ -684,7 +710,7 @@ impl Render for ReviewView {
                     .bg(rgb(0x0f172a))
                     .child(
                         div()
-                            .h(px(80.0))
+                            .h(px(112.0))
                             .flex_shrink_0()
                             .px_3()
                             .flex()
@@ -695,12 +721,22 @@ impl Render for ReviewView {
                             .border_color(rgb(0x1e293b))
                             .child(
                                 div()
+                                    .text_xs()
+                                    .text_color(rgb(0x60a5fa))
+                                    .overflow_hidden()
+                                    .whitespace_nowrap()
+                                    .child(source_label),
+                            )
+                            .child(
+                                div()
                                     .text_color(rgb(0xf8fafc))
                                     .font_weight(gpui::FontWeight::SEMIBOLD)
-                                    .child(format!("Changed files ({file_count})")),
+                                    .overflow_hidden()
+                                    .whitespace_nowrap()
+                                    .child(source_title),
                             )
                             .child(div().text_xs().text_color(rgb(0x64748b)).child(format!(
-                                "{viewed_count} viewed · ⇧⌘J/K navigate · ⇧⌘V toggle"
+                                "{file_count} files · {viewed_count} viewed · ⇧⌘J/K · ⇧⌘V"
                             ))),
                     )
                     .child(

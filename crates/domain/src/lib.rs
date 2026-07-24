@@ -155,6 +155,18 @@ pub enum SessionSource {
         base_sha: Arc<str>,
         head_sha: Arc<str>,
     },
+    GitHubPullRequest {
+        repository_root: PathBuf,
+        owner: Arc<str>,
+        repository: Arc<str>,
+        number: u64,
+        title: Arc<str>,
+        url: Arc<str>,
+        base_ref: Arc<str>,
+        head_ref: Arc<str>,
+        base_sha: Arc<str>,
+        head_sha: Arc<str>,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

@@ -45,4 +45,4 @@ A launch smoke test also loaded and displayed a real temporary repository compar
 
 ## Next step
 
-Implement the GitHub/`gh` metadata and PR-ref loading layer.
+Use the GitHub-loaded snapshot to fetch existing review comments and anchor local drafts.

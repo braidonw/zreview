@@ -1,5 +1,11 @@
 [workspace]
-members = ["apps/zreview", "crates/domain", "crates/git", "crates/ui"]
+members = [
+    "apps/zreview",
+    "crates/domain",
+    "crates/git",
+    "crates/github",
+    "crates/ui",
+]
 resolver = "2"
 
 [workspace.package]
@@ -11,7 +17,10 @@ repository = "https://github.com/braidon/zreview"
 [workspace.dependencies]
 domain = { path = "crates/domain" }
 git = { path = "crates/git" }
+github = { path = "crates/github" }
 gpui = { version = "=0.2.2", default-features = false, features = ["font-kit"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
 thiserror = "2.0"
 ui = { path = "crates/ui" }
 
