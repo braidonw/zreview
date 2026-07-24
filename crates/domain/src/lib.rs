@@ -1,4 +1,11 @@
-use std::{ops::Range, sync::Arc};
+use std::{
+    collections::BTreeSet,
+    error::Error,
+    fmt::{Display, Formatter},
+    ops::Range,
+    path::PathBuf,
+    sync::Arc,
+};
 
 /// The semantic role of one row in a unified diff.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -140,6 +147,123 @@ impl DiffFile {
     }
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum SessionSource {
+    Demo,
+    LocalComparison {
+        repository_root: PathBuf,
+        base_sha: Arc<str>,
+        head_sha: Arc<str>,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct EmptyReviewSession;
+
+impl Display for EmptyReviewSession {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("a review session requires at least one changed file")
+    }
+}
+
+impl Error for EmptyReviewSession {}
+
+/// UI-independent state for navigating one immutable comparison snapshot.
+#[derive(Clone, Debug)]
+pub struct ReviewSession {
+    source: SessionSource,
+    files: Arc<[DiffFile]>,
+    selected_file: usize,
+    viewed_paths: BTreeSet<Arc<str>>,
+}
+
+impl ReviewSession {
+    /// Creates a session pinned to a fixed collection of changed files.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EmptyReviewSession`] when `files` is empty.
+    pub fn new(source: SessionSource, files: Arc<[DiffFile]>) -> Result<Self, EmptyReviewSession> {
+        if files.is_empty() {
+            return Err(EmptyReviewSession);
+        }
+        Ok(Self {
+            source,
+            files,
+            selected_file: 0,
+            viewed_paths: BTreeSet::new(),
+        })
+    }
+
+    #[must_use]
+    pub const fn source(&self) -> &SessionSource {
+        &self.source
+    }
+
+    #[must_use]
+    pub fn files(&self) -> &[DiffFile] {
+        &self.files
+    }
+
+    #[must_use]
+    pub fn shared_files(&self) -> Arc<[DiffFile]> {
+        self.files.clone()
+    }
+
+    #[must_use]
+    pub const fn selected_file_index(&self) -> usize {
+        self.selected_file
+    }
+
+    #[must_use]
+    pub fn selected_file(&self) -> &DiffFile {
+        &self.files[self.selected_file]
+    }
+
+    /// Selects a file by index and reports whether the selection changed.
+    pub fn select_file(&mut self, index: usize) -> bool {
+        if index >= self.files.len() || index == self.selected_file {
+            return false;
+        }
+        self.selected_file = index;
+        true
+    }
+
+    pub fn select_next_file(&mut self) -> bool {
+        let next = self
+            .selected_file
+            .saturating_add(1)
+            .min(self.files.len().saturating_sub(1));
+        self.select_file(next)
+    }
+
+    pub fn select_previous_file(&mut self) -> bool {
+        self.select_file(self.selected_file.saturating_sub(1))
+    }
+
+    pub fn toggle_selected_viewed(&mut self) -> bool {
+        let path = self.selected_file().path.clone();
+        if self.viewed_paths.remove(&path) {
+            false
+        } else {
+            self.viewed_paths.insert(path);
+            true
+        }
+    }
+
+    #[must_use]
+    pub fn is_viewed(&self, index: usize) -> bool {
+        self.files
+            .get(index)
+            .is_some_and(|file| self.viewed_paths.contains(&file.path))
+    }
+
+    #[must_use]
+    pub fn viewed_count(&self) -> usize {
+        self.viewed_paths.len()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -164,5 +288,31 @@ mod tests {
         assert_eq!(DiffLineKind::Addition.marker(), '+');
         assert_eq!(DiffLineKind::Deletion.marker(), '-');
         assert_eq!(DiffLineKind::NoNewlineMarker.marker(), '\\');
+    }
+
+    #[test]
+    fn session_navigates_and_tracks_viewed_files() {
+        let mut first = DiffFile::demo(10);
+        first.path = "src/first.rs".into();
+        let mut second = DiffFile::demo(20);
+        second.path = "src/second.rs".into();
+        let mut session =
+            ReviewSession::new(SessionSource::Demo, vec![first, second].into()).unwrap();
+
+        assert_eq!(session.selected_file().path.as_ref(), "src/first.rs");
+        assert!(session.toggle_selected_viewed());
+        assert!(session.is_viewed(0));
+        assert_eq!(session.viewed_count(), 1);
+        assert!(session.select_next_file());
+        assert_eq!(session.selected_file().path.as_ref(), "src/second.rs");
+        assert!(!session.select_next_file());
+        assert!(session.select_previous_file());
+        assert!(!session.toggle_selected_viewed());
+        assert_eq!(session.viewed_count(), 0);
+    }
+
+    #[test]
+    fn session_rejects_an_empty_file_collection() {
+        assert!(ReviewSession::new(SessionSource::Demo, Arc::from([])).is_err());
     }
 }

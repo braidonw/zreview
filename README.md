@@ -14,7 +14,7 @@ Run the generated 100,000-line fixture:
 cargo run -p zreview
 ```
 
-Or review the first changed text file in a real local comparison. The head defaults to `HEAD`:
+Or review every changed file in a real local comparison. The head defaults to `HEAD`:
 
 ```bash
 cargo run -p zreview -- /path/to/repository main
@@ -29,7 +29,9 @@ Controls:
 - `k` / `↑`: select the previous line
 - `c`: open or close the inline comment editor
 - `⌘C`: copy the selected line
-- Mouse: select a row and use its **Comment** button
+- `⇧⌘J` / `⇧⌘K`: select the next or previous changed file
+- `⇧⌘V`: toggle the selected file's viewed state
+- Mouse: select files or diff rows and use the selected row's **Comment** button
 
 ## Validate
 
@@ -43,7 +45,7 @@ cargo test --workspace
 
 Local comparisons are loaded through the `git` executable without a shell, external diff drivers, or text-conversion filters. The parser supports multiple hunks, additions, deletions, renames, copies, binary detection, unusual UTF-8 names, missing-final-newline markers, and direct or merge-base comparison modes.
 
-The UI currently displays the first changed text file. It does not yet include a file picker, GitHub access, persistence, syntax highlighting, or an AI review backend. The comment field is a minimal keyboard-input prototype used to validate focus and variable-height virtualized rows; it will be replaced by an IME-aware production editor.
+The UI includes a virtualized changed-file sidebar with status, line counts, keyboard navigation, and in-memory viewed state. It does not yet include GitHub access, persistence, syntax highlighting, or an AI review backend. The comment field is a minimal keyboard-input prototype used to validate focus and variable-height virtualized rows; it will be replaced by an IME-aware production editor.
 
 ## License
 

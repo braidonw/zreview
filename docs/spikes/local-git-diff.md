@@ -21,7 +21,7 @@ Load a complete reviewable comparison from local Git objects and map every rende
 - validates hunk line counts before returning a file;
 - rejects absolute, parent-traversing, malformed, and non-UTF-8 repository paths.
 
-The app accepts a repository and revisions and renders the first changed text file:
+The app accepts a repository and revisions and renders the complete changed-file session:
 
 ```bash
 cargo run -p zreview -- /path/to/repository main
@@ -38,7 +38,6 @@ A launch smoke test also loaded and displayed a real temporary repository compar
 
 ## Current limitations
 
-- The UI only displays the first changed text file.
 - Files are loaded with one Git patch subprocess per changed path. This favors correctness for the first implementation but should be batched or concurrency-bounded before supporting very large PRs.
 - Domain paths are UTF-8 strings. Git permits arbitrary path bytes, although GitHub review paths are expected to be UTF-8-compatible.
 - Combined merge diffs and working-tree changes are not part of this comparison API.
@@ -46,4 +45,4 @@ A launch smoke test also loaded and displayed a real temporary repository compar
 
 ## Next step
 
-Add a changed-file sidebar and session model so every `DiffFile` in a `ComparisonDiff` can be selected without reloading the comparison. After that, implement the GitHub/`gh` metadata and PR-ref loading layer.
+Implement the GitHub/`gh` metadata and PR-ref loading layer.
