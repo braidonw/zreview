@@ -1,0 +1,21 @@
+[workspace]
+members = ["apps/zreview", "crates/domain", "crates/ui"]
+resolver = "2"
+
+[workspace.package]
+edition = "2024"
+rust-version = "1.96"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/braidon/zreview"
+
+[workspace.dependencies]
+domain = { path = "crates/domain" }
+gpui = { version = "=0.2.2", default-features = false, features = ["font-kit"] }
+ui = { path = "crates/ui" }
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+all = "warn"
+pedantic = "warn"
