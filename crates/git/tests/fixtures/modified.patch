@@ -1,0 +1,14 @@
+diff --git src/example.rs src/example.rs
+index 1111111..2222222 100644
+--- src/example.rs
++++ src/example.rs
+@@ -1,3 +1,3 @@
+ one
+-two
++two changed
+ three
+@@ -10,2 +10,3 @@
+ ten
++inserted
+ final
+\ No newline at end of file

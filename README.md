@@ -2,15 +2,26 @@
 
 A native macOS GitHub pull-request review app built with Zed's GPUI framework.
 
-The current implementation is the first risk-reduction spike: a virtualized, keyboard-navigable 100,000-line unified diff with an inline comment editor.
+The current implementation includes a virtualized, keyboard-navigable unified diff, an inline comment editor, and a local Git comparison parser.
 
 ## Run
 
 Requirements: macOS, Xcode command-line tools, and the pinned Rust toolchain.
 
+Run the generated 100,000-line fixture:
+
 ```bash
 cargo run -p zreview
 ```
+
+Or review the first changed text file in a real local comparison. The head defaults to `HEAD`:
+
+```bash
+cargo run -p zreview -- /path/to/repository main
+cargo run -p zreview -- /path/to/repository base-branch feature-branch
+```
+
+The comparison uses merge-base semantics, equivalent to `base...head`.
 
 Controls:
 
@@ -28,9 +39,11 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 ```
 
-## Scope of this spike
+## Current scope
 
-This version uses generated diff data. It intentionally does not include Git/GitHub access, persistence, syntax highlighting, or an AI review backend. The comment field is a minimal keyboard-input prototype used to validate focus and variable-height virtualized rows; it will be replaced by an IME-aware production editor.
+Local comparisons are loaded through the `git` executable without a shell, external diff drivers, or text-conversion filters. The parser supports multiple hunks, additions, deletions, renames, copies, binary detection, unusual UTF-8 names, missing-final-newline markers, and direct or merge-base comparison modes.
+
+The UI currently displays the first changed text file. It does not yet include a file picker, GitHub access, persistence, syntax highlighting, or an AI review backend. The comment field is a minimal keyboard-input prototype used to validate focus and variable-height virtualized rows; it will be replaced by an IME-aware production editor.
 
 ## License
 

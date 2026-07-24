@@ -6,6 +6,7 @@ pub enum DiffLineKind {
     Context,
     Addition,
     Deletion,
+    NoNewlineMarker,
 }
 
 impl DiffLineKind {
@@ -15,6 +16,7 @@ impl DiffLineKind {
             Self::Context => ' ',
             Self::Addition => '+',
             Self::Deletion => '-',
+            Self::NoNewlineMarker => '\\',
         }
     }
 }
@@ -37,10 +39,24 @@ pub struct DiffHunk {
     pub line_range: Range<usize>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FileStatus {
+    Added,
+    Deleted,
+    Modified,
+    Renamed,
+    Copied,
+    TypeChanged,
+    Unmerged,
+}
+
 /// A reviewable file. Lines are flat to make virtualized indexing constant-time.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DiffFile {
     pub path: Arc<str>,
+    pub old_path: Option<Arc<str>>,
+    pub status: FileStatus,
+    pub is_binary: bool,
     pub hunks: Arc<[DiffHunk]>,
     pub lines: Arc<[DiffLine]>,
 }
@@ -96,6 +112,7 @@ impl DiffFile {
                     format!("assert_reviewable(reviewed_value_{index}, repository_guidance);")
                         .into()
                 }
+                DiffLineKind::NoNewlineMarker => unreachable!("demo lines always contain text"),
             };
 
             lines.push(DiffLine {
@@ -108,6 +125,9 @@ impl DiffFile {
 
         Self {
             path: "src/generated_review_fixture.rs".into(),
+            old_path: None,
+            status: FileStatus::Modified,
+            is_binary: false,
             hunks: vec![DiffHunk {
                 header: format!("@@ -1,{} +1,{} @@", old_line - 1, new_line - 1).into(),
                 old_start: 1,
@@ -143,5 +163,6 @@ mod tests {
         assert_eq!(DiffLineKind::Context.marker(), ' ');
         assert_eq!(DiffLineKind::Addition.marker(), '+');
         assert_eq!(DiffLineKind::Deletion.marker(), '-');
+        assert_eq!(DiffLineKind::NoNewlineMarker.marker(), '\\');
     }
 }

@@ -1,17 +1,17 @@
 [package]
-name = "zreview"
+name = "git"
 version = "0.1.0"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-publish = false
 
 [dependencies]
 domain.workspace = true
-git.workspace = true
-gpui.workspace = true
-ui.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+tempfile = "3.27"
 
 [lints]
 workspace = true

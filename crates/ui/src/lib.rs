@@ -218,6 +218,7 @@ impl DiffView {
             DiffLineKind::Context => (rgb(0x0f172a), rgb(0x64748b)),
             DiffLineKind::Addition => (rgb(0x10281d), rgb(0x4ade80)),
             DiffLineKind::Deletion => (rgb(0x30191d), rgb(0xf87171)),
+            DiffLineKind::NoNewlineMarker => (rgb(0x0f172a), rgb(0xfbbf24)),
         };
         let old_number = line
             .old_line

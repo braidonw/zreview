@@ -1,5 +1,5 @@
 [workspace]
-members = ["apps/zreview", "crates/domain", "crates/ui"]
+members = ["apps/zreview", "crates/domain", "crates/git", "crates/ui"]
 resolver = "2"
 
 [workspace.package]
@@ -10,7 +10,9 @@ repository = "https://github.com/braidon/zreview"
 
 [workspace.dependencies]
 domain = { path = "crates/domain" }
+git = { path = "crates/git" }
 gpui = { version = "=0.2.2", default-features = false, features = ["font-kit"] }
+thiserror = "2.0"
 ui = { path = "crates/ui" }
 
 [workspace.lints.rust]
