@@ -17,6 +17,10 @@ use git::{ComparisonMode, GitError};
 use github::{GithubClient, GithubError, PullRequestLocator, PullRequestSelector};
 use store::{DraftStore, DraftWriter, StoreError};
 
+mod review_run;
+
+pub use review_run::{ReviewRun, run as run_review};
+
 /// How many files the generated fixture contains, and how long its first file is.
 const DEMO_FILES: usize = 12;
 const DEMO_STRESS_LINES: usize = 100_000;

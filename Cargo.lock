@@ -4927,6 +4927,7 @@ dependencies = [
  "domain",
  "git",
  "github",
+ "review",
  "store",
  "tempfile",
 ]
