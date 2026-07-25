@@ -7,9 +7,13 @@
 
 use std::path::{Path, PathBuf};
 
-use domain::{DiffFile, FileStatus, LoadStage, ReviewSession, SessionFailure, SessionSource};
+use domain::{
+    DiffAnchor, DiffFile, DraftSink, FileStatus, LoadStage, LoadedSession, ReviewSession,
+    SessionFailure, SessionSource,
+};
 use git::{ComparisonMode, GitError};
 use github::{GithubClient, GithubError, PullRequestLocator, PullRequestSelector};
+use store::{DraftStore, DraftWriter, StoreError};
 
 /// How many files the generated fixture contains, and how long its first file is.
 const DEMO_FILES: usize = 12;
@@ -60,21 +64,118 @@ impl SessionRequest {
 /// remediation when the failure is one the reviewer can act on.
 pub fn load(
     request: &SessionRequest,
+    drafts: &DraftStorage,
     report: &dyn Fn(LoadStage),
-) -> Result<ReviewSession, SessionFailure> {
+) -> Result<LoadedSession, SessionFailure> {
     report(LoadStage::Starting);
-    match request {
-        SessionRequest::Demo => Ok(load_demo()),
+    let mut session = match request {
+        SessionRequest::Demo => load_demo(),
         SessionRequest::LocalComparison {
             repository,
             base,
             head,
-        } => load_local(repository, base, head, report),
+        } => load_local(repository, base, head, report)?,
         SessionRequest::PullRequest {
             repository,
             selector,
-        } => load_pull_request(repository, selector, report),
+        } => load_pull_request(repository, selector, report)?,
+    };
+
+    let draft_sink = attach_draft_storage(&mut session, drafts);
+    Ok(LoadedSession {
+        session,
+        draft_sink,
+    })
+}
+
+/// Where drafts are persisted.
+///
+/// Passed in rather than resolved internally so a test never touches the
+/// reviewer's real review data, and so relocating it later needs no new plumbing.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub enum DraftStorage {
+    /// The review data directory in the user's Application Support.
+    #[default]
+    Default,
+    /// A specific database file.
+    At(PathBuf),
+    /// Keep drafts in memory only; nothing is written.
+    Disabled,
+}
+
+impl DraftStorage {
+    fn path(&self) -> Option<Result<PathBuf, StoreError>> {
+        match self {
+            Self::Default => Some(store::default_database_path()),
+            Self::At(path) => Some(Ok(path.clone())),
+            Self::Disabled => None,
+        }
     }
+}
+
+/// Restores saved drafts into the session and returns where new ones are written.
+///
+/// Storage failing does not fail the load: a reviewer can still read a diff
+/// without persistence. It is recorded as a warning instead, because typing into
+/// something that is not saving is exactly the situation they must be told about.
+fn attach_draft_storage(
+    session: &mut ReviewSession,
+    drafts: &DraftStorage,
+) -> Option<Box<dyn DraftSink>> {
+    let scope = session.source().draft_scope()?;
+    let path = match drafts.path()? {
+        Ok(path) => path,
+        Err(error) => {
+            session.push_warning(draft_storage_warning(&error));
+            return None;
+        }
+    };
+
+    // One connection to read the existing drafts, and a second for the writer
+    // thread, so a connection is never shared across threads.
+    let reader = match DraftStore::open(&path) {
+        Ok(reader) => reader,
+        Err(error) => {
+            session.push_warning(draft_storage_warning(&error));
+            return None;
+        }
+    };
+    match reader.load(&scope) {
+        Ok(saved) => restore_saved_drafts(session, saved),
+        Err(error) => session.push_warning(draft_storage_warning(&error)),
+    }
+
+    match DraftStore::open(&path) {
+        Ok(writer) => Some(Box::new(DraftWriter::spawn(writer, scope))),
+        Err(error) => {
+            session.push_warning(draft_storage_warning(&error));
+            None
+        }
+    }
+}
+
+fn restore_saved_drafts(session: &mut ReviewSession, saved: Vec<(DiffAnchor, String)>) {
+    let restored = session.restore_drafts(saved);
+    if restored.stale == 0 {
+        return;
+    }
+
+    session.push_warning(
+        SessionFailure::new(format!(
+            "{} saved draft{} no longer match this diff",
+            restored.stale,
+            if restored.stale == 1 { "" } else { "s" },
+        ))
+        .with_remediation(
+            "They are kept and shown, but must be moved to a line in the current diff before they can be submitted.",
+        ),
+    );
+}
+
+fn draft_storage_warning(error: &StoreError) -> SessionFailure {
+    SessionFailure::from_error("Drafts are not being saved", error).with_remediation(
+        "Review can continue, but anything written will be lost when ZReview closes.",
+    )
 }
 
 fn load_local(
@@ -142,7 +243,7 @@ fn load_pull_request(
         Ok(comments) => {
             session.set_review_comments(comments);
         }
-        Err(error) => session.set_comment_load_failure(describe_github_failure(&error, repository)),
+        Err(error) => session.push_warning(describe_github_failure(&error, repository)),
     }
 
     Ok(session)
@@ -222,7 +323,9 @@ mod tests {
 
     #[test]
     fn the_demo_request_loads_without_a_repository() {
-        let session = load(&SessionRequest::Demo, &|_| {}).unwrap();
+        let session = load(&SessionRequest::Demo, &DraftStorage::Disabled, &|_| {})
+            .unwrap()
+            .session;
 
         assert_eq!(session.files().len(), DEMO_FILES);
         assert_eq!(session.files()[0].line_count(), DEMO_STRESS_LINES);
@@ -241,9 +344,11 @@ mod tests {
                 base: "main".to_owned(),
                 head: "feature".to_owned(),
             },
+            &DraftStorage::Disabled,
             &|stage| stages.borrow_mut().push(stage),
         )
-        .unwrap();
+        .unwrap()
+        .session;
 
         assert_eq!(
             stages.into_inner(),
@@ -268,6 +373,7 @@ mod tests {
                 base: "main".to_owned(),
                 head: "HEAD".to_owned(),
             },
+            &DraftStorage::Disabled,
             &|_| {},
         )
         .unwrap_err();
@@ -294,6 +400,7 @@ mod tests {
                 base: "main".to_owned(),
                 head: "main".to_owned(),
             },
+            &DraftStorage::Disabled,
             &|_| {},
         )
         .unwrap_err();
@@ -312,11 +419,167 @@ mod tests {
                 base: "no-such-branch".to_owned(),
                 head: "main".to_owned(),
             },
+            &DraftStorage::Disabled,
             &|_| {},
         )
         .unwrap_err();
 
         assert!(failure.remediation.is_some(), "should be actionable");
+    }
+
+    fn local_request(repository: &TempDir) -> SessionRequest {
+        SessionRequest::LocalComparison {
+            repository: repository.path().to_path_buf(),
+            base: "main".to_owned(),
+            head: "feature".to_owned(),
+        }
+    }
+
+    /// The whole point of persistence: what was typed comes back after the
+    /// process that typed it is gone.
+    #[test]
+    fn a_draft_survives_reopening_the_session() {
+        let repository = temporary_repository();
+        let data = TempDir::new().unwrap();
+        let storage = DraftStorage::At(data.path().join("review-data.sqlite3"));
+        let request = local_request(&repository);
+
+        {
+            let mut loaded = load(&request, &storage, &|_| {}).unwrap();
+            let sink = loaded.draft_sink.as_ref().expect("drafts should persist");
+            assert!(loaded.session.set_draft(0, 0, "worth keeping"));
+            let anchor = loaded.session.anchor_for(0, 0).unwrap();
+            sink.save(&anchor, "worth keeping");
+            assert_eq!(sink.failure(), None);
+            // Dropping joins the writer thread, so the write has landed.
+        }
+
+        let reopened = load(&request, &storage, &|_| {}).unwrap().session;
+
+        assert_eq!(reopened.drafts().len(), 1);
+        let draft = reopened.draft_at(0, 0).expect("it should re-anchor");
+        assert_eq!(draft.body, "worth keeping");
+        assert!(!draft.is_stale);
+        assert!(reopened.warnings().is_empty(), "nothing to warn about");
+    }
+
+    #[test]
+    fn a_discarded_draft_does_not_come_back() {
+        let repository = temporary_repository();
+        let data = TempDir::new().unwrap();
+        let storage = DraftStorage::At(data.path().join("review-data.sqlite3"));
+        let request = local_request(&repository);
+
+        {
+            let loaded = load(&request, &storage, &|_| {}).unwrap();
+            let sink = loaded.draft_sink.as_ref().unwrap();
+            let anchor = loaded.session.anchor_for(0, 0).unwrap();
+            sink.save(&anchor, "second thoughts");
+            sink.discard(&anchor);
+        }
+
+        assert!(
+            load(&request, &storage, &|_| {})
+                .unwrap()
+                .session
+                .drafts()
+                .is_empty()
+        );
+    }
+
+    /// A draft written against a head that is no longer current is kept and the
+    /// reviewer is told, rather than being silently dropped or silently moved.
+    #[test]
+    fn a_draft_from_another_head_is_restored_as_stale_with_a_warning() {
+        let repository = temporary_repository();
+        let data = TempDir::new().unwrap();
+        let path = data.path().join("review-data.sqlite3");
+        let storage = DraftStorage::At(path.clone());
+        let request = local_request(&repository);
+
+        // Write directly, as an earlier head would have.
+        {
+            let scope = load(&request, &DraftStorage::Disabled, &|_| {})
+                .unwrap()
+                .session
+                .source()
+                .draft_scope()
+                .unwrap();
+            let store = DraftStore::open(&path).unwrap();
+            store
+                .upsert(
+                    &scope,
+                    &DiffAnchor {
+                        path: "feature.txt".into(),
+                        side: domain::DiffSide::Right,
+                        line: 1,
+                        head_sha: "0".repeat(40).into(),
+                    },
+                    "written before the branch moved",
+                )
+                .unwrap();
+        }
+
+        let reopened = load(&request, &storage, &|_| {}).unwrap().session;
+
+        assert_eq!(reopened.drafts().stale_count(), 1);
+        assert_eq!(
+            reopened.drafts().stale().next().unwrap().body,
+            "written before the branch moved",
+        );
+        let warning = reopened
+            .warnings()
+            .iter()
+            .find(|warning| warning.summary.contains("no longer match"))
+            .expect("the reviewer should be told");
+        assert!(warning.remediation.is_some());
+    }
+
+    #[test]
+    fn disabled_storage_leaves_drafts_in_memory_only() {
+        let repository = temporary_repository();
+        let loaded = load(
+            &local_request(&repository),
+            &DraftStorage::Disabled,
+            &|_| {},
+        )
+        .unwrap();
+
+        assert!(loaded.draft_sink.is_none());
+        assert!(loaded.session.warnings().is_empty(), "not a failure");
+    }
+
+    /// A generated fixture has no identity to store drafts under, so it gets no
+    /// sink and no complaint about it.
+    #[test]
+    fn the_demo_persists_nothing() {
+        let loaded = load(&SessionRequest::Demo, &DraftStorage::Default, &|_| {}).unwrap();
+
+        assert!(loaded.draft_sink.is_none());
+        assert!(loaded.session.warnings().is_empty());
+    }
+
+    #[test]
+    fn unusable_storage_warns_but_still_opens_the_session() {
+        let repository = temporary_repository();
+        // A path whose parent cannot be created, because it is a file.
+        let file = TempDir::new().unwrap();
+        let blocker = file.path().join("not-a-directory");
+        std::fs::write(&blocker, "").unwrap();
+        let storage = DraftStorage::At(blocker.join("review-data.sqlite3"));
+
+        let loaded = load(&local_request(&repository), &storage, &|_| {}).unwrap();
+
+        assert!(loaded.draft_sink.is_none(), "nowhere to write");
+        let warning = loaded
+            .session
+            .warnings()
+            .first()
+            .expect("the reviewer must be told drafts are not saved");
+        assert_eq!(warning.summary, "Drafts are not being saved");
+        assert!(warning.remediation.is_some());
+        // The diff is still reviewable.
+        assert_eq!(loaded.session.files().len(), 1);
     }
 
     #[test]

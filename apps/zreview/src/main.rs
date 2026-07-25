@@ -2,7 +2,7 @@ use std::{env, path::Path, process::ExitCode};
 
 use github::PullRequestSelector;
 use gpui::{App, AppContext, Application, Bounds, WindowBounds, WindowOptions, px, size};
-use session::SessionRequest;
+use session::{DraftStorage, SessionRequest};
 use ui::SessionView;
 
 mod loading;
@@ -43,7 +43,7 @@ fn main() -> ExitCode {
             )
             .expect("failed to open ZReview window");
 
-        loading::spawn(window, request, cx);
+        loading::spawn(window, request, DraftStorage::Default, cx);
         cx.activate(true);
     });
 

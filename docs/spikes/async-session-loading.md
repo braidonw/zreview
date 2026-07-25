@@ -108,7 +108,5 @@ open with the error shown in-app and prints nothing to the terminal.
 
 ## Next step
 
-Local anchored drafts, on the anchor model from
-[review-comments.md](review-comments.md): an inline composer that writes a draft
-keyed to a validated anchor, a draft queue, and eager persistence. That is the
-first piece of Phase 3 that needs a store, so it also forces the SQLite decision.
+Local anchored drafts landed in [local-drafts.md](local-drafts.md), which also
+settled the SQLite decision.

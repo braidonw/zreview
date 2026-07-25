@@ -3,8 +3,9 @@
 use std::sync::Arc;
 
 use domain::{
-    CommentThread, DiffAnchor, DiffFile, DiffLine, DiffLineKind, DraftComment, Drafts, FileStatus,
-    LoadStage, PlacedComments, ReviewSession, SessionFailure, SessionSource,
+    CommentThread, DiffAnchor, DiffFile, DiffLine, DiffLineKind, DraftComment, DraftSink, Drafts,
+    FileStatus, LoadStage, LoadedSession, PlacedComments, ReviewSession, SessionFailure,
+    SessionSource,
 };
 use gpui::{
     App, ClipboardItem, Context, Entity, EventEmitter, FocusHandle, Focusable, KeyBinding,
@@ -1029,13 +1030,14 @@ impl ReviewView {
             .child(div().text_xs().text_color(rgb(0x64748b)).child(format!(
                 "{file_count} files · {viewed_count} viewed · {thread_count} conversations"
             )))
-            // A pull request whose conversation failed to load must not look like
-            // one that simply has no discussion.
-            .children(self.session.comment_load_failure().map(|failure| {
+            // Conversations that would not load, or drafts that are not being
+            // saved, must be visible: a session that quietly lacks either looks
+            // exactly like one that has nothing to show.
+            .children(self.session.warnings().iter().map(|warning| {
                 div()
                     .text_xs()
                     .text_color(rgb(0xfbbf24))
-                    .child(SharedString::from(failure.summary.clone()))
+                    .child(SharedString::from(warning.summary.clone()))
             }))
     }
 
@@ -1206,12 +1208,18 @@ enum SessionState {
         /// The stage the loader last reported.
         stage: SharedString,
     },
-    Ready(Entity<ReviewView>),
+    Ready {
+        review: Entity<ReviewView>,
+        /// Held so draft changes keep reaching storage.
+        _drafts_subscription: Subscription,
+    },
     Failed(SessionFailure),
 }
 
 pub struct SessionView {
     state: SessionState,
+    /// Where draft changes are written, once the session is ready.
+    draft_sink: Option<Box<dyn DraftSink>>,
     focus_handle: FocusHandle,
 }
 
@@ -1224,6 +1232,7 @@ impl SessionView {
                 description: description.into(),
                 stage: SharedString::from(LoadStage::default().label()),
             },
+            draft_sink: None,
             focus_handle: cx.focus_handle(),
         }
     }
@@ -1245,16 +1254,21 @@ impl SessionView {
     /// Moves to the loaded session, or to the failure that stopped it.
     pub fn finish(
         &mut self,
-        result: Result<ReviewSession, SessionFailure>,
+        result: Result<LoadedSession, SessionFailure>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         self.state = match result {
-            Ok(session) => {
-                let review = cx.new(|cx| ReviewView::new(session, window, cx));
+            Ok(loaded) => {
+                self.draft_sink = loaded.draft_sink;
+                let review = cx.new(|cx| ReviewView::new(loaded.session, window, cx));
+                let subscription = cx.subscribe(&review, Self::on_drafts_changed);
                 let focus_handle = review.read(cx).diff_view.read(cx).focus_handle.clone();
                 window.focus(&focus_handle);
-                SessionState::Ready(review)
+                SessionState::Ready {
+                    review,
+                    _drafts_subscription: subscription,
+                }
             }
             Err(failure) => {
                 window.focus(&self.focus_handle);
@@ -1262,6 +1276,32 @@ impl SessionView {
             }
         };
         cx.notify();
+    }
+
+    /// Writes a draft change through to storage.
+    ///
+    /// The sink is asked to save on every keystroke, which is what makes the text
+    /// survive a crash; it is required not to block, so this stays cheap.
+    fn on_drafts_changed(
+        &mut self,
+        _review: Entity<ReviewView>,
+        event: &DraftsChanged,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(sink) = &self.draft_sink {
+            match &event.draft {
+                Some(draft) => sink.save(&event.anchor, &draft.body),
+                None => sink.discard(&event.anchor),
+            }
+        }
+        // Renders the alarm if writing has started failing.
+        cx.notify();
+    }
+
+    /// The reason drafts are not reaching storage, if they are not.
+    #[must_use]
+    pub fn draft_write_failure(&self) -> Option<String> {
+        self.draft_sink.as_ref().and_then(|sink| sink.failure())
     }
 
     #[must_use]
@@ -1296,7 +1336,9 @@ impl Focusable for SessionView {
     fn focus_handle(&self, cx: &App) -> FocusHandle {
         match &self.state {
             // Hand focus to the diff so its keybindings work immediately.
-            SessionState::Ready(review) => review.read(cx).diff_view.read(cx).focus_handle.clone(),
+            SessionState::Ready { review, .. } => {
+                review.read(cx).diff_view.read(cx).focus_handle.clone()
+            }
             _ => self.focus_handle.clone(),
         }
     }
@@ -1352,7 +1394,27 @@ impl Render for SessionView {
             ])
             .into_any(),
 
-            SessionState::Ready(review) => review.clone().into_any_element(),
+            // A banner rather than a line in the sidebar: writes failing means
+            // the reviewer's work is being lost as they type, which outranks
+            // anything else on screen.
+            SessionState::Ready { review, .. } => div()
+                .size_full()
+                .flex()
+                .flex_col()
+                .bg(rgb(0x020617))
+                .children(self.draft_write_failure().map(|failure| {
+                    div()
+                        .flex_shrink_0()
+                        .px_4()
+                        .py_2()
+                        .bg(rgb(0x7f1d1d))
+                        .text_color(rgb(0xfee2e2))
+                        .font_family("SF Mono")
+                        .text_size(px(13.0))
+                        .child(format!("Drafts are not being saved: {failure}"))
+                }))
+                .child(div().flex_1().min_h_0().child(review.clone()))
+                .into_any(),
         }
     }
 }
@@ -1525,7 +1587,9 @@ mod tests {
         cx.update(|window, app| {
             view.update(app, |view, cx| {
                 view.finish(
-                    Ok(repository_backed_session(&["src/review.rs"])),
+                    Ok(LoadedSession::unsaved(repository_backed_session(&[
+                        "src/review.rs",
+                    ]))),
                     window,
                     cx,
                 );
@@ -1536,6 +1600,124 @@ mod tests {
         assert!(cx.read(|app| view.read(app).failure().is_none()));
         // The diff takes focus, so its keybindings work without a click.
         cx.dispatch_action(SelectNextLine);
+    }
+
+    /// Records what a session view asks storage to do.
+    #[derive(Clone, Default)]
+    struct RecordingSink {
+        calls: Arc<std::sync::Mutex<Vec<String>>>,
+        failure: Option<String>,
+    }
+
+    impl RecordingSink {
+        fn calls(&self) -> Vec<String> {
+            self.calls.lock().unwrap().clone()
+        }
+    }
+
+    impl domain::DraftSink for RecordingSink {
+        fn save(&self, anchor: &DiffAnchor, body: &str) {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(format!("save {} {} {body}", anchor.path, anchor.line));
+        }
+
+        fn discard(&self, anchor: &DiffAnchor) {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(format!("discard {} {}", anchor.path, anchor.line));
+        }
+
+        fn failure(&self) -> Option<String> {
+            self.failure.clone()
+        }
+    }
+
+    fn ready_session_view(
+        cx: &mut TestAppContext,
+        sink: Option<Box<dyn domain::DraftSink>>,
+    ) -> (Entity<SessionView>, &mut gpui::VisualTestContext) {
+        let (view, cx) = cx.add_window_view(|_window, cx| SessionView::loading("a review", cx));
+        cx.update(|window, app| {
+            view.update(app, |view, cx| {
+                view.finish(
+                    Ok(LoadedSession {
+                        session: repository_backed_session(&["src/review.rs"]),
+                        draft_sink: sink,
+                    }),
+                    window,
+                    cx,
+                );
+            });
+        });
+        (view, cx)
+    }
+
+    /// The last link in the chain: a keystroke reaching storage.
+    #[gpui::test]
+    fn draft_changes_reach_the_sink(cx: &mut TestAppContext) {
+        cx.update(init);
+        let sink = RecordingSink::default();
+        let (_view, cx) = ready_session_view(cx, Some(Box::new(sink.clone())));
+
+        cx.dispatch_action(ToggleComment);
+        cx.simulate_input("hi");
+
+        // One write per keystroke, each with the text so far.
+        assert_eq!(
+            sink.calls(),
+            [
+                "save src/review.rs 1 h".to_owned(),
+                "save src/review.rs 1 hi".to_owned(),
+            ],
+        );
+    }
+
+    #[gpui::test]
+    fn discarding_a_draft_reaches_the_sink(cx: &mut TestAppContext) {
+        cx.update(init);
+        let sink = RecordingSink::default();
+        let (_view, cx) = ready_session_view(cx, Some(Box::new(sink.clone())));
+
+        cx.dispatch_action(ToggleComment);
+        cx.simulate_input("x");
+        cx.simulate_keystrokes("backspace");
+
+        // An emptied draft is a removal, not a blank comment.
+        assert_eq!(
+            sink.calls().last().map(String::as_str),
+            Some("discard src/review.rs 1"),
+        );
+    }
+
+    /// Writes failing means work is being lost as it is typed, so the view has to
+    /// be able to say so.
+    #[gpui::test]
+    fn a_failing_sink_is_reported(cx: &mut TestAppContext) {
+        cx.update(init);
+        let sink = RecordingSink {
+            failure: Some("disk is full".to_owned()),
+            ..RecordingSink::default()
+        };
+        let (view, cx) = ready_session_view(cx, Some(Box::new(sink)));
+
+        assert_eq!(
+            cx.read(|app| view.read(app).draft_write_failure()),
+            Some("disk is full".to_owned()),
+        );
+    }
+
+    #[gpui::test]
+    fn a_session_without_a_sink_still_accepts_drafts(cx: &mut TestAppContext) {
+        cx.update(init);
+        let (view, cx) = ready_session_view(cx, None);
+
+        cx.dispatch_action(ToggleComment);
+        cx.simulate_input("in memory only");
+
+        assert_eq!(cx.read(|app| view.read(app).draft_write_failure()), None);
     }
 
     #[gpui::test]
@@ -1587,7 +1769,7 @@ mod tests {
     fn a_conversation_load_failure_is_visible_on_a_ready_session(cx: &mut TestAppContext) {
         cx.update(init);
         let mut session = repository_backed_session(&["src/review.rs"]);
-        session.set_comment_load_failure(SessionFailure::new("GitHub's rate limit is exhausted"));
+        session.push_warning(SessionFailure::new("GitHub's rate limit is exhausted"));
 
         let (view, cx) = cx.add_window_view(|window, cx| ReviewView::new(session, window, cx));
 
@@ -1597,8 +1779,9 @@ mod tests {
             cx.read(|app| view
                 .read(app)
                 .session
-                .comment_load_failure()
-                .map(|failure| failure.summary.clone())),
+                .warnings()
+                .first()
+                .map(|warning| warning.summary.clone())),
             Some("GitHub's rate limit is exhausted".to_owned()),
         );
     }

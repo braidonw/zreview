@@ -1,0 +1,20 @@
+[package]
+name = "store"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+domain.workspace = true
+# SQLite is compiled in rather than linked against the system library, so the
+# schema the app was tested with is the schema it ships with.
+rusqlite = { version = "0.40", default-features = false, features = ["bundled"] }
+thiserror.workspace = true
+
+[dev-dependencies]
+tempfile = "3.27"
+
+[lints]
+workspace = true

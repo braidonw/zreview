@@ -7,6 +7,41 @@
 
 use std::fmt::Display;
 
+use crate::{DraftSink, ReviewSession};
+
+/// A session that is ready to review, together with where its drafts are written.
+///
+/// The sink travels with the session because it is bound to the same scope: the
+/// two are only correct together, and pairing them here means no caller can wire
+/// a session to the wrong storage.
+pub struct LoadedSession {
+    pub session: ReviewSession,
+    /// Absent when there is nothing to persist to — the generated fixture, or a
+    /// database that could not be opened.
+    pub draft_sink: Option<Box<dyn DraftSink>>,
+}
+
+impl std::fmt::Debug for LoadedSession {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("LoadedSession")
+            .field("session", &self.session)
+            .field("persists_drafts", &self.draft_sink.is_some())
+            .finish()
+    }
+}
+
+impl LoadedSession {
+    /// A session with nowhere to persist drafts.
+    #[must_use]
+    pub fn unsaved(session: ReviewSession) -> Self {
+        Self {
+            session,
+            draft_sink: None,
+        }
+    }
+}
+
 /// How far session loading has progressed.
 ///
 /// Stages exist so a large pull request does not sit behind an unexplained wait.

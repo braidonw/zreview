@@ -14,8 +14,8 @@ mod session;
 
 pub use anchor::{AnchorError, AnchorIndex, AnchorLocation, DiffAnchor, DiffSide};
 pub use comment::{CommentThread, PlacedComments, ReviewComment, UnplacedReason, UnplacedThread};
-pub use draft::{DraftComment, Drafts};
-pub use session::{LoadStage, SessionFailure};
+pub use draft::{DraftComment, DraftSink, Drafts};
+pub use session::{LoadStage, LoadedSession, SessionFailure};
 
 /// The semantic role of one row in a unified diff.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -207,6 +207,33 @@ impl SessionSource {
             }
         }
     }
+
+    /// The identity that persisted drafts belong to.
+    ///
+    /// Deliberately excludes the head commit. A pull request that is pushed to
+    /// mid-review must still hand back the drafts written against the old head —
+    /// as stale, needing re-anchoring, but present. Keying on the head instead
+    /// would leave them in storage and invisible, which is losing them by another
+    /// name.
+    ///
+    /// A pull request's scope is its repository and number, so drafts follow the
+    /// review rather than the clone it was read in. A local comparison has no
+    /// identity beyond its checkout, so it uses that.
+    #[must_use]
+    pub fn draft_scope(&self) -> Option<String> {
+        match self {
+            Self::Demo => None,
+            Self::LocalComparison {
+                repository_root, ..
+            } => Some(format!("local:{}", repository_root.display())),
+            Self::GitHubPullRequest {
+                owner,
+                repository,
+                number,
+                ..
+            } => Some(format!("github:{owner}/{repository}#{number}")),
+        }
+    }
 }
 
 /// The outcome of restoring drafts saved in an earlier session.
@@ -245,7 +272,7 @@ pub struct ReviewSession {
     viewed_paths: BTreeSet<Arc<str>>,
     anchors: Option<AnchorIndex>,
     comments: Arc<PlacedComments>,
-    comment_failure: Option<SessionFailure>,
+    warnings: Vec<SessionFailure>,
     drafts: Arc<Drafts>,
 }
 
@@ -269,7 +296,7 @@ impl ReviewSession {
             viewed_paths: BTreeSet::new(),
             anchors,
             comments: Arc::new(PlacedComments::default()),
-            comment_failure: None,
+            warnings: Vec::new(),
             drafts: Arc::new(Drafts::default()),
         })
     }
@@ -354,18 +381,20 @@ impl ReviewSession {
         restored
     }
 
-    /// Records that existing conversations could not be loaded.
+    /// Records something that went wrong without making the session unusable.
     ///
-    /// The diff is still reviewable without them, but the reviewer must be told:
-    /// a pull request that silently appears to have no discussion is worse than
-    /// one that says its discussion is missing.
-    pub fn set_comment_load_failure(&mut self, failure: SessionFailure) {
-        self.comment_failure = Some(failure);
+    /// Conversations that would not load, or drafts that cannot be persisted, do
+    /// not stop a reviewer reading the diff — but they must be told. A pull
+    /// request that silently appears to have no discussion is worse than one that
+    /// says its discussion is missing, and a reviewer typing into something that
+    /// is not saving needs to know immediately.
+    pub fn push_warning(&mut self, warning: SessionFailure) {
+        self.warnings.push(warning);
     }
 
     #[must_use]
-    pub fn comment_load_failure(&self) -> Option<&SessionFailure> {
-        self.comment_failure.as_ref()
+    pub fn warnings(&self) -> &[SessionFailure] {
+        &self.warnings
     }
 
     /// Places published review comments against this snapshot and reports how
@@ -569,6 +598,40 @@ mod tests {
         let mut file = DiffFile::demo(40);
         file.path = "src/review.rs".into();
         ReviewSession::new(source, vec![file].into()).unwrap()
+    }
+
+    /// A pull request keeps its drafts across a push; the head is not in the key.
+    #[test]
+    fn draft_scope_identifies_the_review_not_the_head() {
+        let pull_request = SessionSource::GitHubPullRequest {
+            repository_root: PathBuf::from("/tmp/repository"),
+            owner: "acme".into(),
+            repository: "widgets".into(),
+            number: 42,
+            title: "Improve the review flow".into(),
+            url: "https://github.com/acme/widgets/pull/42".into(),
+            base_ref: "main".into(),
+            head_ref: "feature".into(),
+            base_sha: "b".repeat(40).into(),
+            recorded_base_sha: "r".repeat(40).into(),
+            diff_base_sha: "d".repeat(40).into(),
+            head_sha: "h".repeat(40).into(),
+        };
+        assert_eq!(
+            pull_request.draft_scope().unwrap(),
+            "github:acme/widgets#42",
+        );
+
+        let local = SessionSource::LocalComparison {
+            repository_root: PathBuf::from("/tmp/repository"),
+            base_sha: "b".repeat(40).into(),
+            diff_base_sha: "d".repeat(40).into(),
+            head_sha: "h".repeat(40).into(),
+        };
+        assert_eq!(local.draft_scope().unwrap(), "local:/tmp/repository");
+
+        // Nothing to persist for a generated fixture.
+        assert!(SessionSource::Demo.draft_scope().is_none());
     }
 
     #[test]

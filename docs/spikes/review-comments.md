@@ -98,5 +98,5 @@ returned exactly the committed fixture.
 ## Next step
 
 Session loading moved off the blocking path in
-[async-session-loading.md](async-session-loading.md). Local anchored drafts come
-next, on top of the anchor model this spike landed.
+[async-session-loading.md](async-session-loading.md), and the anchor model this
+spike landed now carries local drafts — see [local-drafts.md](local-drafts.md).

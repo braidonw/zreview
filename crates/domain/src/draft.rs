@@ -15,6 +15,26 @@ use std::{
 
 use crate::{DiffAnchor, DiffSide};
 
+/// Where draft changes are written so they survive the process.
+///
+/// Declared here, next to the drafts themselves, so the storage implementation
+/// depends on the domain rather than the other way round — and so a view can
+/// report a write failure without knowing a database exists.
+///
+/// Implementations must not block: this is called from the UI thread as the
+/// reviewer types. `Send` because a sink is built wherever loading happens, which
+/// is not the thread that will use it.
+pub trait DraftSink: Send + 'static {
+    /// Records the current text at an anchor.
+    fn save(&self, anchor: &DiffAnchor, body: &str);
+
+    /// Records that the draft at an anchor is gone.
+    fn discard(&self, anchor: &DiffAnchor);
+
+    /// The most recent write failure, if writes are failing.
+    fn failure(&self) -> Option<String>;
+}
+
 /// A draft's position, ordered so a queue reads down the file.
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 struct DraftKey {

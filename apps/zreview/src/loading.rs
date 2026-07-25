@@ -11,9 +11,9 @@ use std::{
     time::Duration,
 };
 
-use domain::{LoadStage, ReviewSession, SessionFailure};
+use domain::{LoadStage, LoadedSession, SessionFailure};
 use gpui::{App, WindowHandle};
-use session::SessionRequest;
+use session::{DraftStorage, SessionRequest};
 use ui::SessionView;
 
 /// How often the foreground task publishes progress.
@@ -30,18 +30,23 @@ const POLL_INTERVAL: Duration = Duration::from_millis(100);
 #[derive(Default)]
 struct Handoff {
     stage: LoadStage,
-    result: Option<Result<ReviewSession, SessionFailure>>,
+    result: Option<Result<LoadedSession, SessionFailure>>,
 }
 
 /// Loads `request` in the background and publishes the outcome into `window`.
-pub fn spawn(window: WindowHandle<SessionView>, request: SessionRequest, cx: &mut App) {
+pub fn spawn(
+    window: WindowHandle<SessionView>,
+    request: SessionRequest,
+    drafts: DraftStorage,
+    cx: &mut App,
+) {
     let handoff = Arc::new(Mutex::new(Handoff::default()));
 
     cx.background_executor()
         .spawn({
             let handoff = Arc::clone(&handoff);
             async move {
-                let result = session::load(&request, &|stage| {
+                let result = session::load(&request, &drafts, &|stage| {
                     lock(&handoff).stage = stage;
                 });
                 lock(&handoff).result = Some(result);
@@ -114,7 +119,7 @@ mod tests {
             .update(cx, |view, _window, _cx| assert!(view.is_loading()))
             .unwrap();
 
-        cx.update(|cx| spawn(window, SessionRequest::Demo, cx));
+        cx.update(|cx| spawn(window, SessionRequest::Demo, DraftStorage::Disabled, cx));
         settle(cx);
 
         window
@@ -141,6 +146,7 @@ mod tests {
                     base: "main".to_owned(),
                     head: "HEAD".to_owned(),
                 },
+                DraftStorage::Disabled,
                 cx,
             );
         });

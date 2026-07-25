@@ -5,6 +5,7 @@ members = [
     "crates/git",
     "crates/github",
     "crates/session",
+    "crates/store",
     "crates/ui",
 ]
 resolver = "2"
@@ -23,6 +24,7 @@ gpui = { version = "=0.2.2", default-features = false, features = ["font-kit"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 session = { path = "crates/session" }
+store = { path = "crates/store" }
 thiserror = "2.0"
 ui = { path = "crates/ui" }
 
