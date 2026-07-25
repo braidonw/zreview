@@ -8,14 +8,25 @@ use std::{
 };
 
 mod anchor;
+mod backend;
 mod comment;
 mod draft;
+mod finding;
 mod session;
 mod submission;
 
 pub use anchor::{AnchorError, AnchorIndex, AnchorLocation, DiffAnchor, DiffSide};
+pub use backend::{
+    GuidanceExcerpt, IgnoreProgress, ReviewBackend, ReviewError, ReviewEventSink, ReviewProgress,
+    ReviewRequest,
+};
 pub use comment::{CommentThread, PlacedComments, ReviewComment, UnplacedReason, UnplacedThread};
 pub use draft::{DraftComment, DraftSink, Drafts};
+pub use finding::{
+    Finding, FindingId, FindingOrigin, Findings, GuidanceCitation, MAX_COMMENT_BYTES, MAX_FINDINGS,
+    MAX_RATIONALE_BYTES, MAX_TITLE_BYTES, RawFinding, RawLocation, RejectedFinding,
+    RejectionReason, Severity, fingerprint,
+};
 pub use session::{LoadStage, LoadedSession, SessionFailure};
 pub use submission::{
     ExcludedDraft, ExclusionReason, ReviewEvent, ReviewSubmission, ReviewSubmitter,
