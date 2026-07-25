@@ -4,8 +4,9 @@ use std::sync::Arc;
 
 use domain::{
     ChangeCounts, CommentThread, DiffAnchor, DiffFile, DiffLine, DiffLineKind, DraftComment,
-    DraftSink, Drafts, FileStatus, LoadStage, LoadedSession, PlacedComments, ReviewSession,
-    SessionFailure, SessionSource,
+    DraftSink, Drafts, ExcludedDraft, FileStatus, LoadStage, LoadedSession, PlacedComments,
+    ReviewEvent, ReviewSession, ReviewSubmission, ReviewSubmitter, SessionFailure, SessionSource,
+    SubmissionOutcome,
 };
 use gpui::{
     App, ClipboardItem, Context, Entity, EventEmitter, FocusHandle, Focusable, KeyBinding,
@@ -77,8 +78,12 @@ impl EventEmitter<CommentEdited> for CommentEditor {}
 
 impl CommentEditor {
     fn new(cx: &mut Context<Self>) -> Self {
+        Self::with_content(String::new(), cx)
+    }
+
+    fn with_content(content: String, cx: &mut Context<Self>) -> Self {
         Self {
-            content: String::new(),
+            content,
             focus_handle: cx.focus_handle(),
         }
     }
@@ -971,24 +976,36 @@ impl Render for DiffView {
     }
 }
 
-/// Emitted when the session's drafts change, so whoever owns persistence can
-/// write them without this view knowing about a database.
-pub struct DraftsChanged {
-    /// The draft that changed, or `None` when one was discarded.
-    pub draft: Option<DraftComment>,
-    /// The anchor that was affected, whether written or discarded.
-    pub anchor: DiffAnchor,
+/// What the review view asks its owner to do.
+///
+/// Persistence and submission both live outside this view, so it reports rather
+/// than acts — which is also what keeps `crates/ui` free of a database and a
+/// forge.
+pub enum ReviewViewEvent {
+    /// A draft was written or removed at an anchor.
+    DraftChanged {
+        anchor: DiffAnchor,
+        /// `None` when the draft was removed.
+        draft: Option<DraftComment>,
+    },
+    /// The review summary changed.
+    SummaryChanged { body: String },
+    /// The reviewer asked to submit. Nothing is posted until they confirm.
+    SubmitRequested { event: ReviewEvent },
 }
 
 pub struct ReviewView {
     session: ReviewSession,
     diff_view: Entity<DiffView>,
+    summary_editor: Entity<CommentEditor>,
     file_list_state: ListState,
     /// Held so draft edits keep reaching the session.
     _diff_subscription: Subscription,
+    /// Held so summary edits keep reaching the session.
+    _summary_subscription: Subscription,
 }
 
-impl EventEmitter<DraftsChanged> for ReviewView {}
+impl EventEmitter<ReviewViewEvent> for ReviewView {}
 
 impl ReviewView {
     #[must_use]
@@ -1000,14 +1017,45 @@ impl ReviewView {
         let file_count = session.files().len();
         let diff_view =
             cx.new(|cx| DiffView::new(selected_file, selected_index, comments, drafts, window, cx));
-        let subscription = cx.subscribe(&diff_view, Self::on_diff_event);
+        let diff_subscription = cx.subscribe(&diff_view, Self::on_diff_event);
+
+        // The summary reuses the composer, so it inherits the same
+        // keybinding isolation the inline editor needed.
+        let existing_summary = session.summary().to_owned();
+        let summary_editor = cx.new(|cx| CommentEditor::with_content(existing_summary, cx));
+        let summary_subscription =
+            cx.subscribe(&summary_editor, |this, editor, _: &CommentEdited, cx| {
+                let body = editor.read(cx).content().to_owned();
+                this.session.set_summary(body.clone());
+                cx.emit(ReviewViewEvent::SummaryChanged { body });
+                cx.notify();
+            });
 
         Self {
             session,
             diff_view,
+            summary_editor,
             file_list_state: ListState::new(file_count, ListAlignment::Top, px(36.0)),
-            _diff_subscription: subscription,
+            _diff_subscription: diff_subscription,
+            _summary_subscription: summary_subscription,
         }
+    }
+
+    /// Forgets what a forge accepted, and reports the anchors it consumed.
+    pub fn mark_submitted(
+        &mut self,
+        submission: &ReviewSubmission,
+        cx: &mut Context<Self>,
+    ) -> Vec<DiffAnchor> {
+        let anchors = submission.submitted_anchors();
+        self.session.mark_submitted(submission);
+        self.summary_editor
+            .update(cx, |editor, cx| editor.load(String::new(), cx));
+        let drafts = self.session.shared_drafts();
+        self.diff_view
+            .update(cx, |view, cx| view.set_drafts(drafts, cx));
+        cx.notify();
+        anchors
     }
 
     /// Applies a draft change to the session, then republishes it for rendering
@@ -1029,11 +1077,11 @@ impl ReviewView {
                 let draft = drafts.get(&moved.anchored).cloned();
                 self.diff_view
                     .update(cx, |view, cx| view.set_drafts(drafts, cx));
-                cx.emit(DraftsChanged {
+                cx.emit(ReviewViewEvent::DraftChanged {
                     draft: None,
                     anchor: moved.vacated,
                 });
-                cx.emit(DraftsChanged {
+                cx.emit(ReviewViewEvent::DraftChanged {
                     draft,
                     anchor: moved.anchored,
                 });
@@ -1065,7 +1113,7 @@ impl ReviewView {
         let draft = drafts.get(&anchor).cloned();
         self.diff_view
             .update(cx, |view, cx| view.set_drafts(drafts, cx));
-        cx.emit(DraftsChanged { draft, anchor });
+        cx.emit(ReviewViewEvent::DraftChanged { draft, anchor });
         cx.notify();
     }
 
@@ -1121,6 +1169,86 @@ impl ReviewView {
     fn toggle_viewed(&mut self, _: &ToggleViewed, _: &mut Window, cx: &mut Context<Self>) {
         self.session.toggle_selected_viewed();
         cx.notify();
+    }
+
+    /// The summary field and the three ways to submit.
+    ///
+    /// Each event is its own button rather than a menu, so choosing to approve is
+    /// as deliberate as choosing to request changes.
+    fn render_submit_bar(&self, cx: &mut Context<Self>) -> gpui::Div {
+        let drafts = self.session.drafts();
+        let stale = drafts.stale_count();
+        let ready = drafts.len() - stale;
+        let can_submit = self.session.source().head_sha().is_some();
+        let review_view = cx.entity();
+
+        div()
+            .h(px(92.0))
+            .flex_shrink_0()
+            .px_3()
+            .py_2()
+            .flex()
+            .items_center()
+            .gap_3()
+            .border_t_1()
+            .border_color(rgb(0x1e293b))
+            .bg(rgb(0x0f172a))
+            .font_family("SF Mono")
+            .text_size(px(13.0))
+            .child(
+                div()
+                    .w(px(150.0))
+                    .flex_shrink_0()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .child(
+                        div()
+                            .text_color(rgb(0xf8fafc))
+                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                            .child(format!("{ready} to submit")),
+                    )
+                    .when(stale > 0, |counts| {
+                        counts.child(
+                            div()
+                                .text_xs()
+                                .text_color(rgb(0xf87171))
+                                .child(format!("{stale} not anchored")),
+                        )
+                    }),
+            )
+            .child(div().flex_1().min_w_0().child(self.summary_editor.clone()))
+            .children(can_submit.then(|| {
+                div().flex_shrink_0().flex().gap_2().children(
+                    [
+                        (ReviewEvent::Comment, rgb(0x2563eb)),
+                        (ReviewEvent::Approve, rgb(0x15803d)),
+                        (ReviewEvent::RequestChanges, rgb(0xb91c1c)),
+                    ]
+                    .map(|(event, colour)| {
+                        let view = review_view.clone();
+                        div()
+                            .id(SharedString::from(format!(
+                                "submit-{}",
+                                event.github_value()
+                            )))
+                            .px_3()
+                            .py_2()
+                            .rounded_md()
+                            .bg(colour)
+                            .text_xs()
+                            .text_color(rgb(0xffffff))
+                            .cursor_pointer()
+                            .on_mouse_down(MouseButton::Left, move |_, _window, cx| {
+                                cx.stop_propagation();
+                                view.update(cx, |_review, cx| {
+                                    cx.emit(ReviewViewEvent::SubmitRequested { event });
+                                });
+                            })
+                            .child(event.label())
+                    }),
+                )
+            }))
     }
 
     /// The sidebar header: what is under review, and its overall counts.
@@ -1340,7 +1468,15 @@ impl Render for ReviewView {
                         .flex_1(),
                     ),
             )
-            .child(div().flex_1().min_w_0().child(self.diff_view.clone()))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .flex()
+                    .flex_col()
+                    .child(div().flex_1().min_h_0().child(self.diff_view.clone()))
+                    .child(self.render_submit_bar(cx)),
+            )
     }
 }
 
@@ -1364,10 +1500,27 @@ enum SessionState {
     Failed(SessionFailure),
 }
 
+/// How far a submission has got.
+///
+/// `Confirming` exists because nothing may be posted without an explicit human
+/// action. It holds the exact request that will be sent, so what the reviewer
+/// approves is what leaves the machine — not a re-derivation of it.
+enum SubmissionState {
+    Idle,
+    Confirming(Box<ReviewSubmission>),
+    Sending,
+    Sent(SubmissionOutcome),
+    Failed(SessionFailure),
+}
+
 pub struct SessionView {
     state: SessionState,
     /// Where draft changes are written, once the session is ready.
     draft_sink: Option<Box<dyn DraftSink>>,
+    /// Where a confirmed review is posted. Absent when the session is not a pull
+    /// request, in which case submitting is not offered at all.
+    submitter: Option<Arc<dyn ReviewSubmitter>>,
+    submission: SubmissionState,
     focus_handle: FocusHandle,
 }
 
@@ -1381,6 +1534,8 @@ impl SessionView {
                 stage: SharedString::from(LoadStage::default().label()),
             },
             draft_sink: None,
+            submitter: None,
+            submission: SubmissionState::Idle,
             focus_handle: cx.focus_handle(),
         }
     }
@@ -1409,8 +1564,11 @@ impl SessionView {
         self.state = match result {
             Ok(loaded) => {
                 self.draft_sink = loaded.draft_sink;
+                self.submitter = loaded.submitter;
                 let review = cx.new(|cx| ReviewView::new(loaded.session, window, cx));
-                let subscription = cx.subscribe(&review, Self::on_drafts_changed);
+                let subscription = cx.subscribe(&review, |this, review, event, cx| {
+                    this.on_review_event(&review, event, cx);
+                });
                 let focus_handle = review.read(cx).diff_view.read(cx).focus_handle.clone();
                 window.focus(&focus_handle);
                 SessionState::Ready {
@@ -1430,27 +1588,138 @@ impl SessionView {
     ///
     /// The sink is asked to save on every keystroke, which is what makes the text
     /// survive a crash; it is required not to block, so this stays cheap.
-    fn on_drafts_changed(
+    fn on_review_event(
         &mut self,
-        _review: Entity<ReviewView>,
-        event: &DraftsChanged,
+        review: &Entity<ReviewView>,
+        event: &ReviewViewEvent,
         cx: &mut Context<Self>,
     ) {
-        if let Some(sink) = &self.draft_sink {
-            match &event.draft {
-                Some(draft) => sink.save(&event.anchor, &draft.body),
-                None => sink.discard(&event.anchor),
+        match event {
+            ReviewViewEvent::DraftChanged { anchor, draft } => {
+                if let Some(sink) = &self.draft_sink {
+                    match draft {
+                        Some(draft) => sink.save(anchor, &draft.body),
+                        None => sink.discard(anchor),
+                    }
+                }
             }
+            ReviewViewEvent::SummaryChanged { body } => {
+                if let Some(sink) = &self.draft_sink
+                    && let Some(head_sha) = review.read(cx).session().source().head_sha()
+                {
+                    sink.save_summary(head_sha, body);
+                }
+            }
+            ReviewViewEvent::SubmitRequested { event } => self.begin_confirmation(*event, cx),
         }
         // Renders the alarm if writing has started failing.
         cx.notify();
     }
 
     /// The loaded review, once there is one.
-    #[cfg(test)]
     fn review(&self) -> Option<&Entity<ReviewView>> {
         match &self.state {
             SessionState::Ready { review, .. } => Some(review),
+            _ => None,
+        }
+    }
+
+    /// Assembles what submitting would post and shows it for approval.
+    ///
+    /// Deliberately stops here. PLAN requires that nothing is ever posted without
+    /// an explicit human submission action, so building the request and sending it
+    /// are two separate steps with a person in between.
+    fn begin_confirmation(&mut self, event: ReviewEvent, cx: &mut Context<Self>) {
+        let Some(review) = self.review().cloned() else {
+            return;
+        };
+        self.submission = match review.read(cx).session().prepare_submission(event) {
+            Ok(submission) => SubmissionState::Confirming(Box::new(submission)),
+            Err(refused) => SubmissionState::Failed(
+                SessionFailure::new("This review cannot be submitted yet")
+                    .with_remediation(refused.to_string()),
+            ),
+        };
+        cx.notify();
+    }
+
+    fn cancel_submission(&mut self, cx: &mut Context<Self>) {
+        self.submission = SubmissionState::Idle;
+        cx.notify();
+    }
+
+    /// Posts the confirmed review.
+    ///
+    /// The request is sent on a background thread because it is network I/O, and
+    /// local drafts are forgotten only after the forge has accepted it — until
+    /// then the local copy is the only copy.
+    fn send_confirmed(&mut self, cx: &mut Context<Self>) {
+        let (SubmissionState::Confirming(submission), Some(submitter), Some(review)) = (
+            &self.submission,
+            self.submitter.clone(),
+            self.review().cloned(),
+        ) else {
+            return;
+        };
+        let submission = submission.clone();
+        self.submission = SubmissionState::Sending;
+        cx.notify();
+
+        cx.spawn(async move |this, cx| {
+            let posted = {
+                let submission = submission.clone();
+                cx.background_executor()
+                    .spawn(async move { submitter.submit(&submission) })
+                    .await
+            };
+
+            this.update(cx, |this, cx| {
+                this.submission = match posted {
+                    Ok(outcome) => {
+                        // Only now is it safe to forget them.
+                        let anchors =
+                            review.update(cx, |review, cx| review.mark_submitted(&submission, cx));
+                        if let (Some(sink), Some(head_sha)) = (
+                            this.draft_sink.as_ref(),
+                            review.read(cx).session().source().head_sha(),
+                        ) {
+                            sink.clear_submitted(head_sha, &anchors);
+                        }
+                        SubmissionState::Sent(outcome)
+                    }
+                    // Nothing local was touched, so every draft is still there.
+                    Err(failure) => SubmissionState::Failed(failure),
+                };
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// The review awaiting confirmation, if one is.
+    #[must_use]
+    pub fn confirming(&self) -> Option<&ReviewSubmission> {
+        match &self.submission {
+            SubmissionState::Confirming(submission) => Some(submission),
+            _ => None,
+        }
+    }
+
+    /// The outcome of a review the forge accepted.
+    #[must_use]
+    pub fn submitted(&self) -> Option<&SubmissionOutcome> {
+        match &self.submission {
+            SubmissionState::Sent(outcome) => Some(outcome),
+            _ => None,
+        }
+    }
+
+    /// Why submitting failed or was refused.
+    #[must_use]
+    pub fn submission_failure(&self) -> Option<&SessionFailure> {
+        match &self.submission {
+            SubmissionState::Failed(failure) => Some(failure),
             _ => None,
         }
     }
@@ -1472,6 +1741,224 @@ impl SessionView {
             SessionState::Failed(failure) => Some(failure),
             _ => None,
         }
+    }
+
+    /// Everything about the submission that belongs above the diff.
+    ///
+    /// The confirmation is a full panel rather than a small dialog because PLAN
+    /// requires the reviewer to see every inline comment, the summary, the event,
+    /// and the pinned head before anything is posted.
+    fn render_submission_banner(&self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
+        let view = cx.entity();
+        let panel = || {
+            div()
+                .flex_shrink_0()
+                .max_h(px(420.0))
+                .overflow_hidden()
+                .px_4()
+                .py_3()
+                .flex()
+                .flex_col()
+                .gap_2()
+                .border_b_1()
+                .border_color(rgb(0x1e293b))
+                .bg(rgb(0x0b1220))
+                .font_family("SF Mono")
+                .text_size(px(13.0))
+        };
+
+        match &self.submission {
+            SubmissionState::Idle => None,
+
+            SubmissionState::Sending => Some(
+                panel()
+                    .child(
+                        div()
+                            .text_color(rgb(0x93c5fd))
+                            .child("Submitting the review…"),
+                    )
+                    .into_any(),
+            ),
+
+            SubmissionState::Sent(outcome) => Some(
+                panel()
+                    .child(
+                        div()
+                            .text_color(rgb(0x4ade80))
+                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                            .child(format!(
+                                "Submitted as {} with {} inline comment{}",
+                                outcome.state,
+                                outcome.comment_count,
+                                if outcome.comment_count == 1 { "" } else { "s" },
+                            )),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(rgb(0x94a3b8))
+                            .child(SharedString::from(outcome.url.clone())),
+                    )
+                    .into_any(),
+            ),
+
+            SubmissionState::Failed(failure) => Some(
+                panel()
+                    .child(
+                        div()
+                            .text_color(rgb(0xf87171))
+                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                            .child(SharedString::from(failure.summary.clone())),
+                    )
+                    .children(failure.remediation.as_ref().map(|remediation| {
+                        div()
+                            .text_color(rgb(0xfde68a))
+                            .child(SharedString::from(remediation.clone()))
+                    }))
+                    .children(failure.detail.as_ref().map(|detail| {
+                        div()
+                            .text_xs()
+                            .text_color(rgb(0x94a3b8))
+                            .child(SharedString::from(detail.clone()))
+                    }))
+                    .into_any(),
+            ),
+
+            SubmissionState::Confirming(submission) => {
+                Some(Self::render_confirmation(submission, panel(), &view))
+            }
+        }
+    }
+
+    /// The full request, laid out for approval.
+    #[allow(clippy::too_many_lines)]
+    fn render_confirmation(
+        submission: &ReviewSubmission,
+        panel: gpui::Div,
+        view: &Entity<Self>,
+    ) -> gpui::AnyElement {
+        let send_view = view.clone();
+        let cancel_view = view.clone();
+        panel
+            .child(
+                div()
+                    .text_color(rgb(0xf8fafc))
+                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                    .child(format!(
+                        "{} with {} inline comment{}",
+                        submission.event.label(),
+                        submission.comments.len(),
+                        if submission.comments.len() == 1 {
+                            ""
+                        } else {
+                            "s"
+                        },
+                    )),
+            )
+            // The head is shown because it is what the review will be
+            // pinned to, and therefore what it can still be rejected
+            // for.
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(rgb(0x64748b))
+                    .child(format!("pinned to {}", short_sha(&submission.head_sha))),
+            )
+            .children((!submission.body.is_empty()).then(|| {
+                div()
+                    .p_2()
+                    .rounded_md()
+                    .bg(rgb(0x131c31))
+                    .text_color(rgb(0xcbd5e1))
+                    .child(SharedString::from(submission.body.clone()))
+            }))
+            .children(submission.comments.iter().map(|comment| {
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .p_2()
+                    .rounded_md()
+                    .border_l_2()
+                    .border_color(rgb(0x2563eb))
+                    .bg(rgb(0x131c31))
+                    .child(div().text_xs().text_color(rgb(0x94a3b8)).child(format!(
+                        "{} {} line {}",
+                        comment.path, comment.side, comment.line,
+                    )))
+                    .child(
+                        div()
+                            .text_color(rgb(0xe5e7eb))
+                            .child(SharedString::from(comment.body.clone())),
+                    )
+            }))
+            // Shown, never hidden: a reviewer must not believe these
+            // were posted.
+            .children((!submission.excluded.is_empty()).then(|| {
+                div()
+                    .mt_1()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .child(div().text_color(rgb(0xf87171)).child(format!(
+                        "{} draft{} will NOT be posted",
+                        submission.excluded.len(),
+                        if submission.excluded.len() == 1 {
+                            ""
+                        } else {
+                            "s"
+                        },
+                    )))
+                    .children(
+                        submission
+                            .excluded
+                            .iter()
+                            .map(|ExcludedDraft { draft, reason }| {
+                                div().text_xs().text_color(rgb(0x94a3b8)).child(format!(
+                                    "{} line {} — {reason}: {}",
+                                    draft.anchor.path, draft.anchor.line, draft.body,
+                                ))
+                            }),
+                    )
+            }))
+            .child(
+                div()
+                    .mt_2()
+                    .flex()
+                    .gap_2()
+                    .child(
+                        div()
+                            .id("confirm-submit")
+                            .px_3()
+                            .py_2()
+                            .rounded_md()
+                            .bg(rgb(0x2563eb))
+                            .text_color(rgb(0xffffff))
+                            .cursor_pointer()
+                            .on_mouse_down(MouseButton::Left, move |_, _window, cx| {
+                                cx.stop_propagation();
+                                send_view.update(cx, SessionView::send_confirmed);
+                            })
+                            .child("Post this review to GitHub"),
+                    )
+                    .child(
+                        div()
+                            .id("cancel-submit")
+                            .px_3()
+                            .py_2()
+                            .rounded_md()
+                            .border_1()
+                            .border_color(rgb(0x475569))
+                            .text_color(rgb(0xcbd5e1))
+                            .cursor_pointer()
+                            .on_mouse_down(MouseButton::Left, move |_, _window, cx| {
+                                cx.stop_propagation();
+                                cancel_view.update(cx, SessionView::cancel_submission);
+                            })
+                            .child("Cancel"),
+                    ),
+            )
+            .into_any()
     }
 
     fn render_centered(children: Vec<gpui::AnyElement>) -> gpui::Div {
@@ -1502,7 +1989,7 @@ impl Focusable for SessionView {
 }
 
 impl Render for SessionView {
-    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         match &self.state {
             SessionState::Loading { description, stage } => Self::render_centered(vec![
                 div()
@@ -1570,6 +2057,7 @@ impl Render for SessionView {
                         .text_size(px(13.0))
                         .child(format!("Drafts are not being saved: {failure}"))
                 }))
+                .children(self.render_submission_banner(cx))
                 .child(div().flex_1().min_h_0().child(review.clone()))
                 .into_any(),
         }
@@ -1826,6 +2314,7 @@ mod tests {
                     Ok(LoadedSession {
                         session: repository_backed_session(&["src/review.rs"]),
                         draft_sink: sink,
+                        submitter: None,
                     }),
                     window,
                     cx,
@@ -2086,6 +2575,306 @@ mod tests {
         assert!(cx.read(|app| view.read(app).session().drafts().is_empty()));
     }
 
+    /// Records every submission attempt, so a test can prove one did not happen.
+    #[derive(Clone, Default)]
+    struct RecordingSubmitter {
+        posted: Arc<std::sync::Mutex<Vec<ReviewSubmission>>>,
+        failure: Option<SessionFailure>,
+    }
+
+    impl RecordingSubmitter {
+        fn posted(&self) -> Vec<ReviewSubmission> {
+            self.posted.lock().unwrap().clone()
+        }
+    }
+
+    impl ReviewSubmitter for RecordingSubmitter {
+        fn submit(
+            &self,
+            submission: &ReviewSubmission,
+        ) -> Result<SubmissionOutcome, SessionFailure> {
+            self.posted.lock().unwrap().push(submission.clone());
+            self.failure.clone().map_or_else(
+                || {
+                    Ok(SubmissionOutcome {
+                        state: "COMMENTED".to_owned(),
+                        url: "https://github.com/acme/widgets/pull/42".to_owned(),
+                        comment_count: submission.comments.len(),
+                    })
+                },
+                Err,
+            )
+        }
+    }
+
+    fn submittable_session() -> ReviewSession {
+        let head_sha: Arc<str> = "a".repeat(40).into();
+        let mut file = DiffFile::demo(40);
+        file.path = "src/review.rs".into();
+        ReviewSession::new(
+            domain::SessionSource::GitHubPullRequest {
+                repository_root: std::path::PathBuf::from("/tmp/repository"),
+                owner: "acme".into(),
+                repository: "widgets".into(),
+                number: 42,
+                title: "Improve the review flow".into(),
+                url: "https://github.com/acme/widgets/pull/42".into(),
+                base_ref: "main".into(),
+                head_ref: "feature".into(),
+                base_sha: Arc::clone(&head_sha),
+                recorded_base_sha: Arc::clone(&head_sha),
+                diff_base_sha: Arc::clone(&head_sha),
+                head_sha,
+            },
+            vec![file].into(),
+        )
+        .unwrap()
+    }
+
+    fn submittable_view(
+        cx: &mut TestAppContext,
+        session: ReviewSession,
+        submitter: RecordingSubmitter,
+        sink: RecordingSink,
+    ) -> (Entity<SessionView>, &mut gpui::VisualTestContext) {
+        let (view, cx) = cx.add_window_view(|_window, cx| SessionView::loading("a review", cx));
+        cx.update(|window, app| {
+            view.update(app, |view, cx| {
+                view.finish(
+                    Ok(LoadedSession {
+                        session,
+                        draft_sink: Some(Box::new(sink)),
+                        submitter: Some(Arc::new(submitter)),
+                    }),
+                    window,
+                    cx,
+                );
+            });
+        });
+        (view, cx)
+    }
+
+    /// The property the whole design turns on: asking to submit posts nothing.
+    #[gpui::test]
+    fn requesting_submission_does_not_post_anything(cx: &mut TestAppContext) {
+        cx.update(init);
+        let submitter = RecordingSubmitter::default();
+        let mut session = submittable_session();
+        session.set_draft(0, 6, "needs a test");
+        session.set_summary("Two notes.");
+        let (view, cx) = submittable_view(cx, session, submitter.clone(), RecordingSink::default());
+
+        cx.update(|_window, app| {
+            let review = review_of(&view, app);
+            review.update(app, |_review, cx| {
+                cx.emit(ReviewViewEvent::SubmitRequested {
+                    event: ReviewEvent::Comment,
+                });
+            });
+        });
+
+        // Waiting on a human, not on the network.
+        assert!(
+            submitter.posted().is_empty(),
+            "nothing may be posted before confirmation",
+        );
+        cx.update(|_window, app| {
+            let submission = view.read(app).confirming().expect("should be confirming");
+            assert_eq!(submission.event, ReviewEvent::Comment);
+            assert_eq!(submission.comments.len(), 1);
+            assert_eq!(submission.body, "Two notes.");
+        });
+    }
+
+    #[gpui::test]
+    fn confirming_posts_the_review_and_clears_what_was_sent(cx: &mut TestAppContext) {
+        cx.update(init);
+        let submitter = RecordingSubmitter::default();
+        let sink = RecordingSink::default();
+        let mut session = submittable_session();
+        session.set_draft(0, 6, "needs a test");
+        session.set_summary("Two notes.");
+        let (view, cx) = submittable_view(cx, session, submitter.clone(), sink.clone());
+
+        cx.update(|_window, app| {
+            let review = review_of(&view, app);
+            review.update(app, |_review, cx| {
+                cx.emit(ReviewViewEvent::SubmitRequested {
+                    event: ReviewEvent::Comment,
+                });
+            });
+        });
+        cx.update(|_window, app| {
+            view.update(app, SessionView::send_confirmed);
+        });
+        cx.run_until_parked();
+
+        let posted = submitter.posted();
+        assert_eq!(posted.len(), 1, "posted exactly once");
+        assert_eq!(posted[0].comments.len(), 1);
+        assert_eq!(posted[0].head_sha.as_ref(), "a".repeat(40));
+
+        cx.update(|_window, app| {
+            assert!(
+                view.read(app).submitted().is_some(),
+                "should report success"
+            );
+            let session = review_of(&view, app).read(app).session();
+            // Forgotten only after the forge accepted it.
+            assert!(session.drafts().is_empty());
+            assert_eq!(session.summary(), "");
+        });
+        assert!(
+            sink.calls()
+                .iter()
+                .any(|call| call.starts_with("clear submitted [src/review.rs 6")),
+            "storage should be told what was posted: {:?}",
+            sink.calls(),
+        );
+    }
+
+    /// A failed submission must leave every draft exactly where it was.
+    #[gpui::test]
+    fn a_failed_submission_keeps_every_draft(cx: &mut TestAppContext) {
+        cx.update(init);
+        let submitter = RecordingSubmitter {
+            failure: Some(
+                SessionFailure::new("The pull request moved on")
+                    .with_remediation("Your drafts are unchanged."),
+            ),
+            ..RecordingSubmitter::default()
+        };
+        let sink = RecordingSink::default();
+        let mut session = submittable_session();
+        session.set_draft(0, 6, "needs a test");
+        session.set_summary("Two notes.");
+        let (view, cx) = submittable_view(cx, session, submitter.clone(), sink.clone());
+
+        cx.update(|_window, app| {
+            let review = review_of(&view, app);
+            review.update(app, |_review, cx| {
+                cx.emit(ReviewViewEvent::SubmitRequested {
+                    event: ReviewEvent::Comment,
+                });
+            });
+        });
+        cx.update(|_window, app| {
+            view.update(app, SessionView::send_confirmed);
+        });
+        cx.run_until_parked();
+
+        cx.update(|_window, app| {
+            let failure = view
+                .read(app)
+                .submission_failure()
+                .expect("the failure should be shown");
+            assert_eq!(failure.summary, "The pull request moved on");
+
+            let session = review_of(&view, app).read(app).session();
+            assert_eq!(session.drafts().len(), 1, "the draft is still here");
+            assert_eq!(session.summary(), "Two notes.", "so is the summary");
+        });
+        assert!(
+            !sink.calls().iter().any(|call| call.contains("clear")),
+            "nothing may be cleared when the post failed: {:?}",
+            sink.calls(),
+        );
+    }
+
+    #[gpui::test]
+    fn a_review_that_cannot_be_assembled_explains_itself_without_posting(cx: &mut TestAppContext) {
+        cx.update(init);
+        let submitter = RecordingSubmitter::default();
+        // A comment review with a draft but no summary: GitHub requires a body.
+        let mut session = submittable_session();
+        session.set_draft(0, 6, "needs a test");
+        let (view, cx) = submittable_view(cx, session, submitter.clone(), RecordingSink::default());
+
+        cx.update(|_window, app| {
+            let review = review_of(&view, app);
+            review.update(app, |_review, cx| {
+                cx.emit(ReviewViewEvent::SubmitRequested {
+                    event: ReviewEvent::Comment,
+                });
+            });
+        });
+
+        cx.update(|_window, app| {
+            let failure = view.read(app).submission_failure().expect("should refuse");
+            assert!(
+                failure
+                    .remediation
+                    .as_ref()
+                    .unwrap()
+                    .contains("needs a summary"),
+                "unexpected remediation: {:?}",
+                failure.remediation,
+            );
+            assert!(view.read(app).confirming().is_none());
+        });
+        assert!(submitter.posted().is_empty());
+    }
+
+    #[gpui::test]
+    fn cancelling_a_confirmation_posts_nothing(cx: &mut TestAppContext) {
+        cx.update(init);
+        let submitter = RecordingSubmitter::default();
+        let mut session = submittable_session();
+        session.set_summary("Just a note.");
+        let (view, cx) = submittable_view(cx, session, submitter.clone(), RecordingSink::default());
+
+        cx.update(|_window, app| {
+            let review = review_of(&view, app);
+            review.update(app, |_review, cx| {
+                cx.emit(ReviewViewEvent::SubmitRequested {
+                    event: ReviewEvent::Approve,
+                });
+            });
+        });
+        cx.update(|_window, app| {
+            view.update(app, SessionView::cancel_submission);
+        });
+        cx.run_until_parked();
+
+        assert!(submitter.posted().is_empty());
+        cx.update(|_window, app| {
+            assert!(view.read(app).confirming().is_none());
+            // The summary survives cancelling.
+            assert_eq!(
+                review_of(&view, app).read(app).session().summary(),
+                "Just a note.",
+            );
+        });
+    }
+
+    /// Typing in the summary must reach both the session and storage.
+    #[gpui::test]
+    fn the_summary_is_stored_as_it_is_typed(cx: &mut TestAppContext) {
+        cx.update(init);
+        let sink = RecordingSink::default();
+        let (view, cx) = submittable_view(
+            cx,
+            submittable_session(),
+            RecordingSubmitter::default(),
+            sink.clone(),
+        );
+
+        cx.update(|window, app| {
+            let review = review_of(&view, app);
+            let editor = review.read(app).summary_editor.clone();
+            window.focus(&editor.read(app).focus_handle);
+        });
+        cx.simulate_input("ok");
+
+        cx.update(|_window, app| {
+            assert_eq!(review_of(&view, app).read(app).session().summary(), "ok");
+        });
+        assert_eq!(
+            sink.calls(),
+            ["summary o".to_owned(), "summary ok".to_owned()],
+        );
+    }
+
     /// Moving a stale draft has to reach storage as a removal *and* a write, or
     /// reopening would show the draft in both places.
     #[gpui::test]
@@ -2109,6 +2898,7 @@ mod tests {
                     Ok(LoadedSession {
                         session,
                         draft_sink: Some(Box::new(sink.clone())),
+                        submitter: None,
                     }),
                     window,
                     cx,

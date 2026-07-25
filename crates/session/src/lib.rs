@@ -7,9 +7,11 @@
 
 use std::path::{Path, PathBuf};
 
+use std::sync::Arc;
+
 use domain::{
     DiffAnchor, DiffFile, DraftSink, FileStatus, LoadStage, LoadedSession, ReviewSession,
-    SessionFailure, SessionSource,
+    ReviewSubmission, ReviewSubmitter, SessionFailure, SessionSource, SubmissionOutcome,
 };
 use git::{ComparisonMode, GitError};
 use github::{GithubClient, GithubError, PullRequestLocator, PullRequestSelector};
@@ -68,23 +70,34 @@ pub fn load(
     report: &dyn Fn(LoadStage),
 ) -> Result<LoadedSession, SessionFailure> {
     report(LoadStage::Starting);
-    let mut session = match request {
-        SessionRequest::Demo => load_demo(),
+    // Only a pull request has somewhere to submit to, so only that branch produces
+    // a submitter.
+    let (mut session, submitter) = match request {
+        SessionRequest::Demo => (load_demo(), None),
         SessionRequest::LocalComparison {
             repository,
             base,
             head,
-        } => load_local(repository, base, head, report)?,
+        } => (load_local(repository, base, head, report)?, None),
         SessionRequest::PullRequest {
             repository,
             selector,
-        } => load_pull_request(repository, selector, report)?,
+        } => {
+            let (session, locator) = load_pull_request(repository, selector, report)?;
+            let submitter: Arc<dyn ReviewSubmitter> = Arc::new(GithubSubmitter {
+                client: GithubClient::default(),
+                repository: repository.clone(),
+                locator,
+            });
+            (session, Some(submitter))
+        }
     };
 
     let draft_sink = attach_draft_storage(&mut session, drafts);
     Ok(LoadedSession {
         session,
         draft_sink,
+        submitter,
     })
 }
 
@@ -154,6 +167,50 @@ fn attach_draft_storage(
     }
 }
 
+/// Sends confirmed reviews to GitHub.
+///
+/// Holds the locator rather than deriving it at submission time, so a review is
+/// always posted to the pull request it was read from.
+struct GithubSubmitter {
+    client: GithubClient,
+    repository: PathBuf,
+    locator: PullRequestLocator,
+}
+
+impl ReviewSubmitter for GithubSubmitter {
+    fn submit(&self, submission: &ReviewSubmission) -> Result<SubmissionOutcome, SessionFailure> {
+        let submitted = self
+            .client
+            .submit_review(&self.repository, &self.locator, submission)
+            .map_err(|error| describe_submission_failure(&error, &self.repository))?;
+
+        Ok(SubmissionOutcome {
+            state: submitted.state,
+            url: submitted.url,
+            comment_count: submission.comments.len(),
+        })
+    }
+}
+
+/// Describes a failed submission, leading with the fact that nothing was lost.
+///
+/// A reviewer whose submission just failed needs to know their words are still
+/// there before they need to know why it failed.
+fn describe_submission_failure(error: &GithubError, repository: &Path) -> SessionFailure {
+    let summary = match error {
+        GithubError::HeadMoved { .. } => "The pull request moved on before this could be submitted",
+        GithubError::Validation { .. } => "GitHub rejected the review",
+        _ => return describe_github_failure(error, repository),
+    };
+
+    SessionFailure::from_error(summary, error).with_remediation(match error {
+        GithubError::HeadMoved { .. } => {
+            "Your drafts are unchanged. Reopen the pull request to re-anchor them against the new head, then submit again."
+        }
+        _ => "Your drafts are unchanged, so nothing was lost and you can submit again.",
+    })
+}
+
 fn restore_saved_drafts(session: &mut ReviewSession, saved: Vec<(DiffAnchor, String)>) {
     let restored = session.restore_drafts(saved);
     if restored.stale == 0 {
@@ -204,7 +261,7 @@ fn load_pull_request(
     repository: &Path,
     selector: &PullRequestSelector,
     report: &dyn Fn(LoadStage),
-) -> Result<ReviewSession, SessionFailure> {
+) -> Result<(ReviewSession, PullRequestLocator), SessionFailure> {
     let client = GithubClient::default();
     let pull_request = client
         .load_pull_request_reporting(repository, selector, report)
@@ -246,7 +303,7 @@ fn load_pull_request(
         Err(error) => session.push_warning(describe_github_failure(&error, repository)),
     }
 
-    Ok(session)
+    Ok((session, locator))
 }
 
 fn load_demo() -> ReviewSession {

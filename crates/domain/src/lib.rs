@@ -18,8 +18,8 @@ pub use comment::{CommentThread, PlacedComments, ReviewComment, UnplacedReason, 
 pub use draft::{DraftComment, DraftSink, Drafts};
 pub use session::{LoadStage, LoadedSession, SessionFailure};
 pub use submission::{
-    ExcludedDraft, ExclusionReason, ReviewEvent, ReviewSubmission, SubmissionRefused,
-    SubmittableComment,
+    ExcludedDraft, ExclusionReason, ReviewEvent, ReviewSubmission, ReviewSubmitter,
+    SubmissionOutcome, SubmissionRefused, SubmittableComment,
 };
 
 /// The semantic role of one row in a unified diff.

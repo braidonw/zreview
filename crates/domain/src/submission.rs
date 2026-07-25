@@ -15,7 +15,7 @@ use std::{
     sync::Arc,
 };
 
-use crate::{DiffAnchor, DiffSide, DraftComment};
+use crate::{DiffAnchor, DiffSide, DraftComment, SessionFailure};
 
 /// What submitting the review asserts about it.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -135,6 +135,36 @@ impl ReviewSubmission {
     pub fn is_empty(&self) -> bool {
         self.comments.is_empty() && self.body.trim().is_empty()
     }
+}
+
+/// Where a review a human has confirmed is sent.
+///
+/// A port, like [`crate::DraftSink`]: declared next to the submission it carries
+/// so the forge implementation depends on the domain, and so a view can offer to
+/// submit without knowing what a forge is.
+///
+/// `submit` blocks on network I/O, so it must not be called on a UI thread.
+/// `Sync` because it is invoked from a background worker.
+pub trait ReviewSubmitter: Send + Sync + 'static {
+    /// Posts the review, returning where it landed.
+    ///
+    /// # Errors
+    ///
+    /// Returns a failure carrying what to tell the reviewer. Implementations must
+    /// leave local state untouched: whether this succeeds is what decides if the
+    /// drafts can be forgotten, and until it does the local copy is the only one.
+    fn submit(&self, submission: &ReviewSubmission) -> Result<SubmissionOutcome, SessionFailure>;
+}
+
+/// A review the forge accepted.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SubmissionOutcome {
+    /// What the review was recorded as, such as `CHANGES_REQUESTED`.
+    pub state: String,
+    /// Where to read it.
+    pub url: String,
+    /// How many inline comments went with it.
+    pub comment_count: usize,
 }
 
 /// Why a review cannot be assembled at all.

@@ -110,7 +110,8 @@ line, and came back non-stale on reopen with no warnings.
   currently selected row. There is no way to move several at once.
 - The composer is still the prototype editor: append and backspace, no cursor, no
   selection, no IME. Editing a long draft is genuinely awkward.
-- Nothing is submitted anywhere yet. Drafts accumulate locally.
+- ~~Nothing is submitted anywhere yet.~~ See
+  [review-submission.md](review-submission.md).
 - A draft is written on every keystroke rather than on a short debounce as PLAN
   suggests. WAL makes it cheap enough that the simpler behaviour is safer, but a
   debounce would cut the write volume.
@@ -122,6 +123,5 @@ line, and came back non-stale on reopen with no warnings.
 
 ## Next step
 
-The review summary and batch submission — the rest of Phase 3. Submission is where
-the anchor validator earns its place: only anchors that resolve may become inline
-comments, and everything else has to be moved or folded into the summary.
+The review summary and batch submission landed in
+[review-submission.md](review-submission.md).
