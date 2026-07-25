@@ -2038,6 +2038,7 @@ dependencies = [
 name = "github"
 version = "0.1.0"
 dependencies = [
+ "domain",
  "git",
  "serde",
  "serde_json",

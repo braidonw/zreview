@@ -8,8 +8,10 @@ use std::{
 };
 
 mod anchor;
+mod comment;
 
 pub use anchor::{AnchorError, AnchorIndex, AnchorLocation, DiffAnchor, DiffSide};
+pub use comment::{CommentThread, PlacedComments, ReviewComment, UnplacedReason, UnplacedThread};
 
 /// The semantic role of one row in a unified diff.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

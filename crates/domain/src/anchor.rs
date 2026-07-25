@@ -169,6 +169,12 @@ impl AnchorIndex {
         &self.head_sha
     }
 
+    /// The session file index for a reviewed path.
+    #[must_use]
+    pub fn file_index(&self, path: &str) -> Option<usize> {
+        self.files.get(path).map(|file| file.file)
+    }
+
     /// The number of commentable positions across the snapshot.
     #[must_use]
     pub fn len(&self) -> usize {

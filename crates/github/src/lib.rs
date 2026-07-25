@@ -4,6 +4,7 @@ use std::{
     sync::Arc,
 };
 
+use domain::{DiffSide, ReviewComment};
 use git::{ComparisonDiff, ComparisonMode, GitRemote};
 use serde::Deserialize;
 use thiserror::Error;
@@ -85,6 +86,9 @@ pub enum GithubError {
     #[error("GitHub returned invalid pull request JSON: {0}")]
     InvalidResponse(#[from] serde_json::Error),
 
+    #[error("GitHub review comment {id} is unusable: {message}")]
+    InvalidComment { id: u64, message: String },
+
     #[error("GitHub returned PR #{actual} when #{expected} was requested")]
     UnexpectedPullRequest { expected: u64, actual: u64 },
 
@@ -165,27 +169,66 @@ impl GithubClient {
             "repos/{}/{}/pulls/{}",
             locator.repository.owner, locator.repository.name, locator.number
         );
+        let stdout = self.api(repository, &[], &endpoint)?;
+        let response: ApiPullRequest = serde_json::from_slice(&stdout)?;
+        normalize_metadata(response, locator)
+    }
+
+    /// Fetches every published inline review comment on a pull request.
+    ///
+    /// Comments are returned in the order GitHub published them, replies
+    /// included. Grouping them into threads and deciding where each one belongs
+    /// is [`domain::PlacedComments`]'s job, because that depends on the snapshot
+    /// rather than on the response.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`GithubError`] when `gh` fails, a page is malformed, or a comment
+    /// names a diff side that is not `LEFT` or `RIGHT`.
+    pub fn fetch_review_comments(
+        &self,
+        repository: &Path,
+        locator: &PullRequestLocator,
+    ) -> Result<Vec<ReviewComment>, GithubError> {
+        let endpoint = format!(
+            "repos/{}/{}/pulls/{}/comments?per_page=100",
+            locator.repository.owner, locator.repository.name, locator.number
+        );
+        let stdout = self.api(repository, &["--paginate"], &endpoint)?;
+        parse_review_comments(&stdout)
+    }
+
+    /// Runs one `gh api` call and returns its stdout.
+    ///
+    /// Arguments are passed as an array so no shell is involved, and the REST API
+    /// version is pinned so a server-side default change cannot alter the
+    /// response shape underneath the parsers.
+    fn api(
+        &self,
+        repository: &Path,
+        extra: &[&str],
+        endpoint: &str,
+    ) -> Result<Vec<u8>, GithubError> {
+        let mut args = vec!["api", "--method", "GET"];
+        args.extend_from_slice(extra);
+        args.extend_from_slice(&[
+            endpoint,
+            "-H",
+            "Accept: application/vnd.github+json",
+            "-H",
+            "X-GitHub-Api-Version: 2022-11-28",
+        ]);
+
         let output = Command::new(&self.gh_executable)
             .current_dir(repository)
-            .args([
-                "api",
-                "--method",
-                "GET",
-                &endpoint,
-                "-H",
-                "Accept: application/vnd.github+json",
-                "-H",
-                "X-GitHub-Api-Version: 2022-11-28",
-            ])
+            .args(&args)
             .env("GH_PROMPT_DISABLED", "1")
             .output()
             .map_err(|source| GithubError::Execute {
                 repository: repository.to_path_buf(),
                 source,
             })?;
-        let output = successful_output(output)?;
-        let response: ApiPullRequest = serde_json::from_slice(&output.stdout)?;
-        normalize_metadata(response, locator)
+        Ok(successful_output(output)?.stdout)
     }
 }
 
@@ -242,6 +285,82 @@ struct ApiPullRequestRef {
 #[derive(Debug, Deserialize)]
 struct ApiRepository {
     full_name: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ApiReviewComment {
+    id: u64,
+    body: String,
+    path: String,
+    /// Absent when GitHub considers the comment outdated or it is file-level.
+    #[serde(default)]
+    line: Option<u32>,
+    #[serde(default)]
+    start_line: Option<u32>,
+    /// GitHub omits this for comments on the head revision.
+    #[serde(default)]
+    side: Option<String>,
+    #[serde(default)]
+    in_reply_to_id: Option<u64>,
+    /// `"line"` or `"file"`.
+    #[serde(default)]
+    subject_type: Option<String>,
+    /// Null once the author's account is deleted.
+    #[serde(default)]
+    user: Option<ApiUser>,
+    created_at: String,
+    html_url: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ApiUser {
+    login: String,
+}
+
+/// GitHub's placeholder for a deleted account, matching what its own UI shows.
+const DELETED_USER: &str = "ghost";
+
+/// Parses the output of a paginated `gh api` call over review comments.
+///
+/// `gh --paginate` merges array pages into one array in current versions but has
+/// emitted one array per page, so both framings are accepted rather than
+/// depending on the installed CLI's behaviour.
+fn parse_review_comments(stdout: &[u8]) -> Result<Vec<ReviewComment>, GithubError> {
+    let mut comments = Vec::new();
+    for page in serde_json::Deserializer::from_slice(stdout).into_iter::<Vec<ApiReviewComment>>() {
+        for comment in page? {
+            comments.push(normalize_review_comment(comment)?);
+        }
+    }
+    Ok(comments)
+}
+
+fn normalize_review_comment(comment: ApiReviewComment) -> Result<ReviewComment, GithubError> {
+    // An unrecognized side would silently place the comment against the wrong
+    // revision, so it is reported rather than guessed.
+    let side = match comment.side.as_deref() {
+        None => DiffSide::Right,
+        Some(value) => DiffSide::from_github(value).ok_or_else(|| GithubError::InvalidComment {
+            id: comment.id,
+            message: format!("unknown diff side {value:?}"),
+        })?,
+    };
+
+    Ok(ReviewComment {
+        id: comment.id,
+        author: comment
+            .user
+            .map_or_else(|| DELETED_USER.into(), |user| user.login.into()),
+        body: comment.body.into(),
+        path: comment.path.into(),
+        side,
+        line: comment.line,
+        start_line: comment.start_line,
+        in_reply_to_id: comment.in_reply_to_id,
+        is_file_level: comment.subject_type.as_deref() == Some("file"),
+        created_at: comment.created_at.into(),
+        url: comment.html_url.into(),
+    })
 }
 
 fn normalize_metadata(
@@ -699,6 +818,213 @@ mod tests {
         );
     }
 
+    /// Two pages emitted as concatenated arrays, the framing `gh --paginate`
+    /// produces when a jq filter is in play, covering every field shape the
+    /// mapper has to handle.
+    const COMMENT_PAGES: &str = r#"[
+  {
+    "id": 10,
+    "body": "This branch is not covered.",
+    "path": "src/review.rs",
+    "line": 11,
+    "start_line": null,
+    "side": "RIGHT",
+    "in_reply_to_id": null,
+    "subject_type": "line",
+    "user": {"login": "reviewer"},
+    "created_at": "2026-07-20T10:00:00Z",
+    "html_url": "https://github.com/acme/widgets/pull/42#discussion_r10"
+  },
+  {
+    "id": 11,
+    "body": "Agreed, adding a test.",
+    "path": "src/review.rs",
+    "line": 11,
+    "side": "RIGHT",
+    "in_reply_to_id": 10,
+    "subject_type": "line",
+    "user": null,
+    "created_at": "2026-07-20T11:00:00Z",
+    "html_url": "https://github.com/acme/widgets/pull/42#discussion_r11"
+  }
+]
+[
+  {
+    "id": 12,
+    "body": "Why was this removed?",
+    "path": "src/review.rs",
+    "line": 10,
+    "start_line": 8,
+    "side": "LEFT",
+    "in_reply_to_id": null,
+    "subject_type": "line",
+    "user": {"login": "maintainer"},
+    "created_at": "2026-07-21T09:00:00Z",
+    "html_url": "https://github.com/acme/widgets/pull/42#discussion_r12"
+  },
+  {
+    "id": 13,
+    "body": "This whole file needs an owner.",
+    "path": "src/review.rs",
+    "line": null,
+    "side": "RIGHT",
+    "in_reply_to_id": null,
+    "subject_type": "file",
+    "user": {"login": "maintainer"},
+    "created_at": "2026-07-21T09:30:00Z",
+    "html_url": "https://github.com/acme/widgets/pull/42#discussion_r13"
+  },
+  {
+    "id": 14,
+    "body": "Stale note on code that has since changed.",
+    "path": "src/review.rs",
+    "line": null,
+    "side": "RIGHT",
+    "in_reply_to_id": null,
+    "subject_type": "line",
+    "user": {"login": "reviewer"},
+    "created_at": "2026-07-21T10:00:00Z",
+    "html_url": "https://github.com/acme/widgets/pull/42#discussion_r14"
+  }
+]"#;
+
+    #[test]
+    fn maps_paginated_review_comments() {
+        let comments = parse_review_comments(COMMENT_PAGES.as_bytes()).unwrap();
+
+        assert_eq!(
+            comments
+                .iter()
+                .map(|comment| comment.id)
+                .collect::<Vec<_>>(),
+            [10, 11, 12, 13, 14],
+            "both pages should be read, in order",
+        );
+
+        let first = &comments[0];
+        assert_eq!(first.author.as_ref(), "reviewer");
+        assert_eq!(first.side, DiffSide::Right);
+        assert_eq!(first.line, Some(11));
+        assert!(!first.is_file_level);
+        assert!(!first.is_multiline());
+
+        // A deleted account falls back to GitHub's own placeholder.
+        assert_eq!(comments[1].author.as_ref(), DELETED_USER);
+        assert_eq!(comments[1].in_reply_to_id, Some(10));
+
+        let left = &comments[2];
+        assert_eq!(left.side, DiffSide::Left);
+        assert_eq!(left.start_line, Some(8));
+        assert!(left.is_multiline());
+
+        assert!(comments[3].is_file_level);
+        assert_eq!(comments[3].line, None);
+
+        // No line and not file-level: outdated.
+        assert!(!comments[4].is_file_level);
+        assert_eq!(comments[4].line, None);
+    }
+
+    /// Guards the mapper against the real response shape, which carries 26 fields
+    /// per comment where the mapper reads nine.
+    #[test]
+    fn maps_a_captured_github_response() {
+        let captured = include_bytes!("../tests/fixtures/review-comments.json");
+        let comments = parse_review_comments(captured).unwrap();
+
+        assert_eq!(comments.len(), 3);
+        for comment in &comments {
+            assert_eq!(comment.author.as_ref(), "Copilot");
+            assert_eq!(comment.path.as_ref(), "crates/globset/src/lib.rs");
+            assert_eq!(comment.side, DiffSide::Right);
+            assert!(!comment.is_file_level);
+            assert!(comment.in_reply_to_id.is_none());
+            // Every comment in this response spans a range.
+            assert!(comment.is_multiline(), "expected a multi-line range");
+            assert!(!comment.body.is_empty());
+            assert!(comment.url.starts_with("https://github.com/"));
+        }
+        assert_eq!(comments[0].line, Some(753));
+        assert_eq!(comments[0].start_line, Some(749));
+    }
+
+    #[test]
+    fn reads_pages_that_gh_merged_into_one_array() {
+        // Current gh versions concatenate array pages into a single array.
+        let merged = COMMENT_PAGES.replace("]\n[", ",");
+        let comments = parse_review_comments(merged.as_bytes()).unwrap();
+
+        assert_eq!(comments.len(), 5);
+        assert_eq!(comments[4].id, 14);
+    }
+
+    #[test]
+    fn an_absent_side_defaults_to_the_head_revision() {
+        let body = br#"[{"id":1,"body":"b","path":"p","line":3,
+            "created_at":"t","html_url":"u","user":{"login":"a"}}]"#;
+        let comments = parse_review_comments(body).unwrap();
+
+        assert_eq!(comments[0].side, DiffSide::Right);
+    }
+
+    #[test]
+    fn an_unknown_side_is_reported_rather_than_guessed() {
+        let body = br#"[{"id":7,"body":"b","path":"p","line":3,"side":"MIDDLE",
+            "created_at":"t","html_url":"u","user":{"login":"a"}}]"#;
+        let error = parse_review_comments(body).unwrap_err();
+
+        assert!(
+            matches!(&error, GithubError::InvalidComment { id: 7, message }
+                if message.contains("MIDDLE")),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn an_empty_comment_response_is_not_an_error() {
+        assert!(parse_review_comments(b"[]").unwrap().is_empty());
+        assert!(parse_review_comments(b"").unwrap().is_empty());
+        assert!(parse_review_comments(b"[]\n[]\n").unwrap().is_empty());
+    }
+
+    #[test]
+    fn fetches_review_comments_through_gh() {
+        let directory = TempDir::new().unwrap();
+        let gh = directory.path().join("gh");
+        write_fake_comment_gh(&gh);
+        let locator = PullRequestLocator {
+            repository: RepositorySlug::new("acme", "widgets"),
+            number: 42,
+        };
+
+        let comments = GithubClient::new(&gh)
+            .fetch_review_comments(directory.path(), &locator)
+            .unwrap();
+
+        assert_eq!(comments.len(), 5);
+        assert_eq!(comments[0].path.as_ref(), "src/review.rs");
+    }
+
+    /// Asserts the exact argument array, including `--paginate` and the pinned
+    /// API version, then emits two concatenated pages.
+    fn write_fake_comment_gh(path: &Path) {
+        let body = format!(
+            r#"#!/bin/sh
+expected="api --method GET --paginate repos/acme/widgets/pulls/42/comments?per_page=100 -H Accept: application/vnd.github+json -H X-GitHub-Api-Version: 2022-11-28"
+if [ "$*" != "$expected" ]; then
+  echo "unexpected gh arguments:" >&2
+  echo "  got:      $*" >&2
+  echo "  expected: $expected" >&2
+  exit 64
+fi
+cat <<'JSON'
+{COMMENT_PAGES}
+JSON
+"#
+        );
+        write_executable(path, &body);
+    }
+
     fn write_fake_gh(path: &Path, base_sha: &str, head_sha: &str) {
         let body = format!(
             r#"#!/bin/sh
@@ -719,6 +1045,10 @@ cat <<'JSON'
 JSON
 "#,
         );
+        write_executable(path, &body);
+    }
+
+    fn write_executable(path: &Path, body: &str) {
         fs::write(path, body).unwrap();
         let mut permissions = fs::metadata(path).unwrap().permissions();
         permissions.set_mode(0o755);
