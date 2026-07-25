@@ -15,7 +15,10 @@ use std::{
 use crate::{DiffFile, DiffLineKind};
 
 /// Which revision of a file a comment is attached to.
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+///
+/// Ordered so a draft queue can be sorted by position: the base revision's view
+/// of a line comes before the head's.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum DiffSide {
     /// The base revision. Carries deletion and context lines.
     Left,

@@ -9,10 +9,12 @@ use std::{
 
 mod anchor;
 mod comment;
+mod draft;
 mod session;
 
 pub use anchor::{AnchorError, AnchorIndex, AnchorLocation, DiffAnchor, DiffSide};
 pub use comment::{CommentThread, PlacedComments, ReviewComment, UnplacedReason, UnplacedThread};
+pub use draft::{DraftComment, Drafts};
 pub use session::{LoadStage, SessionFailure};
 
 /// The semantic role of one row in a unified diff.
@@ -207,6 +209,22 @@ impl SessionSource {
     }
 }
 
+/// The outcome of restoring drafts saved in an earlier session.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct RestoredDrafts {
+    /// Drafts that still resolve to a displayed row.
+    pub anchored: usize,
+    /// Drafts kept but no longer attachable to a row.
+    pub stale: usize,
+}
+
+impl RestoredDrafts {
+    #[must_use]
+    pub const fn total(self) -> usize {
+        self.anchored + self.stale
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct EmptyReviewSession;
 
@@ -228,6 +246,7 @@ pub struct ReviewSession {
     anchors: Option<AnchorIndex>,
     comments: Arc<PlacedComments>,
     comment_failure: Option<SessionFailure>,
+    drafts: Arc<Drafts>,
 }
 
 impl ReviewSession {
@@ -251,7 +270,88 @@ impl ReviewSession {
             anchors,
             comments: Arc::new(PlacedComments::default()),
             comment_failure: None,
+            drafts: Arc::new(Drafts::default()),
         })
+    }
+
+    #[must_use]
+    pub fn drafts(&self) -> &Drafts {
+        &self.drafts
+    }
+
+    /// A snapshot of the drafts for a view to render.
+    ///
+    /// Mutations copy on write, so a view holding a snapshot keeps rendering a
+    /// consistent set while the session moves on.
+    #[must_use]
+    pub fn shared_drafts(&self) -> Arc<Drafts> {
+        Arc::clone(&self.drafts)
+    }
+
+    /// The anchor a displayed row would be commented on, if it can carry one.
+    #[must_use]
+    pub fn anchor_for(&self, file: usize, row: usize) -> Option<DiffAnchor> {
+        let anchors = self.anchors.as_ref()?;
+        anchors.anchor_for_row(self.files.get(file)?, row)
+    }
+
+    /// Creates or replaces the draft on a displayed row.
+    ///
+    /// An empty body removes the draft instead of storing a comment with nothing
+    /// in it. Returns `false` when the row cannot carry a comment, which is the
+    /// caller's signal not to offer a composer there at all.
+    pub fn set_draft(&mut self, file: usize, row: usize, body: impl Into<String>) -> bool {
+        let Some(anchor) = self.anchor_for(file, row) else {
+            return false;
+        };
+        let body = body.into();
+        let drafts = Arc::make_mut(&mut self.drafts);
+        if body.trim().is_empty() {
+            drafts.remove_at(file, row);
+        } else {
+            drafts.insert(anchor, body, file, row);
+        }
+        true
+    }
+
+    /// Discards the draft on a row, if there is one.
+    pub fn clear_draft(&mut self, file: usize, row: usize) -> bool {
+        Arc::make_mut(&mut self.drafts)
+            .remove_at(file, row)
+            .is_some()
+    }
+
+    #[must_use]
+    pub fn draft_at(&self, file: usize, row: usize) -> Option<&DraftComment> {
+        self.drafts.at(file, row)
+    }
+
+    /// Restores drafts written in an earlier session, reporting how many could no
+    /// longer be anchored.
+    ///
+    /// A draft whose anchor no longer resolves is kept and marked stale rather
+    /// than dropped: the diff can change under a draft — a base branch that moved
+    /// shifts the merge base, and with it which lines are displayed — and silently
+    /// deleting the reviewer's words would be the worst possible response.
+    pub fn restore_drafts(
+        &mut self,
+        drafts: impl IntoIterator<Item = (DiffAnchor, String)>,
+    ) -> RestoredDrafts {
+        let mut restored = RestoredDrafts::default();
+        for (anchor, body) in drafts {
+            let location = self
+                .anchors
+                .as_ref()
+                .and_then(|index| index.resolve(&anchor).ok());
+            if let Some(location) = location {
+                Arc::make_mut(&mut self.drafts).insert(anchor, body, location.file, location.row);
+                restored.anchored += 1;
+            } else {
+                Arc::make_mut(&mut self.drafts).insert_stale(anchor, body);
+                restored.stale += 1;
+            }
+        }
+        restored
     }
 
     /// Records that existing conversations could not be loaded.
@@ -457,6 +557,144 @@ mod tests {
         assert_eq!(anchor.side, DiffSide::Right);
         assert_eq!(anchor.path.as_ref(), "src/review.rs");
         assert_eq!(anchors.resolve(&anchor).unwrap().row, 6);
+    }
+
+    fn anchored_session() -> ReviewSession {
+        let source = SessionSource::LocalComparison {
+            repository_root: PathBuf::from("/tmp/repository"),
+            base_sha: "b".repeat(40).into(),
+            diff_base_sha: "d".repeat(40).into(),
+            head_sha: "h".repeat(40).into(),
+        };
+        let mut file = DiffFile::demo(40);
+        file.path = "src/review.rs".into();
+        ReviewSession::new(source, vec![file].into()).unwrap()
+    }
+
+    #[test]
+    fn a_draft_is_created_against_the_rows_anchor() {
+        let mut session = anchored_session();
+
+        // Row 6 of the fixture is an addition, so it anchors on the right.
+        assert!(session.set_draft(0, 6, "needs a test"));
+
+        let draft = session.draft_at(0, 6).expect("the draft should be stored");
+        assert_eq!(draft.body, "needs a test");
+        assert_eq!(draft.anchor.side, DiffSide::Right);
+        assert_eq!(draft.anchor.path.as_ref(), "src/review.rs");
+        assert_eq!(draft.anchor.head_sha.as_ref(), "h".repeat(40));
+        assert!(!draft.is_stale);
+        assert_eq!(session.drafts().len(), 1);
+    }
+
+    #[test]
+    fn an_emptied_draft_is_removed_rather_than_stored_blank() {
+        let mut session = anchored_session();
+        session.set_draft(0, 6, "a thought");
+
+        assert!(session.set_draft(0, 6, "   \n  "));
+
+        assert!(session.draft_at(0, 6).is_none());
+        assert!(session.drafts().is_empty());
+    }
+
+    #[test]
+    fn clearing_a_draft_reports_whether_there_was_one() {
+        let mut session = anchored_session();
+        session.set_draft(0, 6, "a thought");
+
+        assert!(session.clear_draft(0, 6));
+        assert!(!session.clear_draft(0, 6));
+    }
+
+    #[test]
+    fn a_session_without_anchors_cannot_hold_drafts() {
+        let mut session =
+            ReviewSession::new(SessionSource::Demo, vec![DiffFile::demo(20)].into()).unwrap();
+
+        assert!(
+            !session.set_draft(0, 6, "nowhere to put this"),
+            "a demo session has no head to anchor against",
+        );
+        assert!(session.drafts().is_empty());
+    }
+
+    #[test]
+    fn a_row_that_cannot_carry_a_comment_is_refused() {
+        let source = SessionSource::LocalComparison {
+            repository_root: PathBuf::from("/tmp/repository"),
+            base_sha: "b".repeat(40).into(),
+            diff_base_sha: "d".repeat(40).into(),
+            head_sha: "h".repeat(40).into(),
+        };
+        let mut file = DiffFile::demo(4);
+        file.path = "src/review.rs".into();
+        // Replace the last row with a marker, which has no source line.
+        let mut lines = file.lines.to_vec();
+        lines[3] = DiffLine {
+            kind: DiffLineKind::NoNewlineMarker,
+            old_line: None,
+            new_line: None,
+            text: "No newline at end of file".into(),
+        };
+        file.lines = lines.into();
+        let mut session = ReviewSession::new(source, vec![file].into()).unwrap();
+
+        assert!(!session.set_draft(0, 3, "cannot go here"));
+        assert!(session.set_draft(0, 0, "but this can"));
+        assert_eq!(session.drafts().len(), 1);
+    }
+
+    #[test]
+    fn restored_drafts_reattach_to_their_rows() {
+        let mut session = anchored_session();
+        let anchor = session.anchor_for(0, 6).unwrap();
+
+        let restored = session.restore_drafts([(anchor, "from last time".to_owned())]);
+
+        assert_eq!(restored.anchored, 1);
+        assert_eq!(restored.stale, 0);
+        assert_eq!(restored.total(), 1);
+        assert_eq!(session.draft_at(0, 6).unwrap().body, "from last time");
+    }
+
+    /// The diff can change under a draft, so restoring must keep text it can no
+    /// longer place rather than deleting the reviewer's words.
+    #[test]
+    fn a_draft_that_no_longer_resolves_is_kept_as_stale() {
+        let mut session = anchored_session();
+        let unreachable = DiffAnchor {
+            path: "src/review.rs".into(),
+            side: DiffSide::Right,
+            line: 9_999,
+            head_sha: "h".repeat(40).into(),
+        };
+
+        let restored = session.restore_drafts([(unreachable, "still worth saying".to_owned())]);
+
+        assert_eq!(restored.anchored, 0);
+        assert_eq!(restored.stale, 1);
+        assert_eq!(session.drafts().len(), 1);
+        assert_eq!(session.drafts().stale_count(), 1);
+        assert_eq!(
+            session.drafts().stale().next().unwrap().body,
+            "still worth saying",
+        );
+    }
+
+    #[test]
+    fn a_draft_from_another_snapshot_is_kept_as_stale() {
+        let mut session = anchored_session();
+        let mut anchor = session.anchor_for(0, 6).unwrap();
+        anchor.head_sha = "0".repeat(40).into();
+
+        let restored =
+            session.restore_drafts([(anchor, "written against an older head".to_owned())]);
+
+        assert_eq!(restored.stale, 1);
+        assert_eq!(session.drafts().stale_count(), 1);
+        // It did not take the row it would have occupied.
+        assert!(session.draft_at(0, 6).is_none());
     }
 
     #[test]

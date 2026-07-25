@@ -3,13 +3,13 @@
 use std::sync::Arc;
 
 use domain::{
-    CommentThread, DiffFile, DiffLine, DiffLineKind, FileStatus, LoadStage, PlacedComments,
-    ReviewSession, SessionFailure, SessionSource,
+    CommentThread, DiffAnchor, DiffFile, DiffLine, DiffLineKind, DraftComment, Drafts, FileStatus,
+    LoadStage, PlacedComments, ReviewSession, SessionFailure, SessionSource,
 };
 use gpui::{
-    App, ClipboardItem, Context, Entity, FocusHandle, Focusable, KeyBinding, KeyDownEvent,
-    ListAlignment, ListState, MouseButton, Render, SharedString, Window, actions, div, list,
-    prelude::*, px, rgb,
+    App, ClipboardItem, Context, Entity, EventEmitter, FocusHandle, Focusable, KeyBinding,
+    KeyDownEvent, ListAlignment, ListState, MouseButton, Render, SharedString, Subscription,
+    Window, actions, div, list, prelude::*, px, rgb,
 };
 
 actions!(
@@ -57,6 +57,12 @@ pub fn init(cx: &mut App) {
     ]);
 }
 
+/// Emitted when the reviewer changes the composer's text.
+///
+/// Carried as an event rather than polled so a draft is stored as it is typed,
+/// which is what makes the text survive a crash.
+pub struct CommentEdited;
+
 /// A deliberately small text-entry control for the virtualization spike.
 ///
 /// It proves that a focused, variable-height child can live inside the list.
@@ -65,6 +71,8 @@ pub struct CommentEditor {
     content: String,
     focus_handle: FocusHandle,
 }
+
+impl EventEmitter<CommentEdited> for CommentEditor {}
 
 impl CommentEditor {
     fn new(cx: &mut Context<Self>) -> Self {
@@ -77,6 +85,20 @@ impl CommentEditor {
     fn clear(&mut self, cx: &mut Context<Self>) {
         self.content.clear();
         cx.notify();
+    }
+
+    /// Loads existing text without reporting it as an edit.
+    ///
+    /// Opening the composer on a line that already has a draft has to show that
+    /// draft, and echoing it back as a change would be a pointless write.
+    fn load(&mut self, content: String, cx: &mut Context<Self>) {
+        self.content = content;
+        cx.notify();
+    }
+
+    #[must_use]
+    fn content(&self) -> &str {
+        &self.content
     }
 
     fn on_key_down(&mut self, event: &KeyDownEvent, _window: &mut Window, cx: &mut Context<Self>) {
@@ -112,6 +134,7 @@ impl CommentEditor {
 
         if handled {
             cx.stop_propagation();
+            cx.emit(CommentEdited);
             cx.notify();
         }
     }
@@ -168,19 +191,36 @@ struct DiffRow<'a> {
     selected: bool,
     show_comment: bool,
     threads: &'a [CommentThread],
+    draft: Option<&'a DraftComment>,
+}
+
+/// What the diff view asks the session to do about drafts.
+///
+/// The diff view renders a read-only snapshot and never mutates the session
+/// directly, so the session stays the single owner of draft state.
+pub enum DiffViewEvent {
+    /// The composer's text for a row changed.
+    DraftEdited { row: usize, body: String },
+    /// The reviewer discarded a row's draft.
+    DraftDiscarded { row: usize },
 }
 
 pub struct DiffView {
     file: Arc<DiffFile>,
-    /// Index of `file` in the session, which is how threads are keyed.
+    /// Index of `file` in the session, which is how threads and drafts are keyed.
     file_index: usize,
     comments: Arc<PlacedComments>,
+    drafts: Arc<Drafts>,
     list_state: ListState,
     selected_line: usize,
     comment_line: Option<usize>,
     comment_editor: Entity<CommentEditor>,
+    /// Held so the composer's edits keep reaching this view.
+    _editor_subscription: Subscription,
     focus_handle: FocusHandle,
 }
+
+impl EventEmitter<DiffViewEvent> for DiffView {}
 
 impl DiffView {
     #[must_use]
@@ -188,20 +228,38 @@ impl DiffView {
         file: Arc<DiffFile>,
         file_index: usize,
         comments: Arc<PlacedComments>,
+        drafts: Arc<Drafts>,
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
         let item_count = file.line_count();
+        let comment_editor = cx.new(CommentEditor::new);
+        let subscription = cx.subscribe(&comment_editor, |this, editor, _: &CommentEdited, cx| {
+            let Some(row) = this.comment_line else {
+                return;
+            };
+            let body = editor.read(cx).content().to_owned();
+            cx.emit(DiffViewEvent::DraftEdited { row, body });
+        });
+
         Self {
             file,
             file_index,
             comments,
+            drafts,
             list_state: ListState::new(item_count, ListAlignment::Top, px(ROW_HEIGHT)),
             selected_line: 0,
             comment_line: None,
-            comment_editor: cx.new(CommentEditor::new),
+            comment_editor,
+            _editor_subscription: subscription,
             focus_handle: cx.focus_handle(),
         }
+    }
+
+    /// Replaces the draft snapshot this view renders.
+    pub fn set_drafts(&mut self, drafts: Arc<Drafts>, cx: &mut Context<Self>) {
+        self.drafts = drafts;
+        cx.notify();
     }
 
     #[must_use]
@@ -209,6 +267,10 @@ impl DiffView {
         self.selected_line
     }
 
+    /// Switches to another file.
+    ///
+    /// The composer closes, which no longer loses anything: whatever was typed is
+    /// already stored as a draft on the session.
     fn set_file(&mut self, file: Arc<DiffFile>, file_index: usize, cx: &mut Context<Self>) {
         self.list_state = ListState::new(file.line_count(), ListAlignment::Top, px(ROW_HEIGHT));
         self.file = file;
@@ -243,12 +305,32 @@ impl DiffView {
             self.comment_line = None;
             window.focus(&self.focus_handle);
         } else {
-            self.comment_line = Some(self.selected_line);
-            self.comment_editor.update(cx, CommentEditor::clear);
-            let editor_focus = self.comment_editor.read(cx).focus_handle.clone();
-            window.focus(&editor_focus);
+            self.open_composer(self.selected_line, window, cx);
         }
         self.list_state.scroll_to_reveal_item(self.selected_line);
+        cx.notify();
+    }
+
+    /// Opens the composer on a row, showing that row's draft if it has one.
+    fn open_composer(&mut self, row: usize, window: &mut Window, cx: &mut Context<Self>) {
+        self.comment_line = Some(row);
+        let existing = self
+            .drafts
+            .at(self.file_index, row)
+            .map(|draft| draft.body.clone())
+            .unwrap_or_default();
+        self.comment_editor
+            .update(cx, |editor, cx| editor.load(existing, cx));
+        let editor_focus = self.comment_editor.read(cx).focus_handle.clone();
+        window.focus(&editor_focus);
+    }
+
+    /// Discards the row's draft and closes the composer.
+    fn discard_draft(&mut self, row: usize, window: &mut Window, cx: &mut Context<Self>) {
+        self.comment_line = None;
+        self.comment_editor.update(cx, CommentEditor::clear);
+        window.focus(&self.focus_handle);
+        cx.emit(DiffViewEvent::DraftDiscarded { row });
         cx.notify();
     }
 
@@ -345,7 +427,12 @@ impl DiffView {
             selected,
             show_comment,
             threads,
+            draft,
         } = row;
+        // While the composer is open the draft is being edited in it, so showing
+        // it read-only underneath as well would duplicate the same text.
+        let resting_draft = draft.filter(|_| !show_comment);
+        let draft_exists = draft.is_some();
         let (row_bg, marker_color) = match line.kind {
             DiffLineKind::Context => (rgb(0x0f172a), rgb(0x64748b)),
             DiffLineKind::Addition => (rgb(0x10281d), rgb(0x4ade80)),
@@ -364,6 +451,7 @@ impl DiffView {
         let select_view = view.clone();
         let comment_view = view.clone();
         let close_view = view.clone();
+        let discard_view = view.clone();
 
         div()
             .id(("diff-row", index))
@@ -421,6 +509,18 @@ impl DiffView {
                                 .child(format!("{}", threads.len())),
                         )
                     })
+                    .when(draft.is_some(), |row| {
+                        row.child(
+                            div()
+                                .mr_2()
+                                .px_1()
+                                .rounded_sm()
+                                .bg(rgb(0x78350f))
+                                .text_xs()
+                                .text_color(rgb(0xfde68a))
+                                .child("draft"),
+                        )
+                    })
                     .when(selected && !show_comment, |row| {
                         row.child(
                             div()
@@ -437,15 +537,11 @@ impl DiffView {
                                     cx.stop_propagation();
                                     comment_view.update(cx, |this, cx| {
                                         this.selected_line = index;
-                                        this.comment_line = Some(index);
-                                        this.comment_editor.update(cx, CommentEditor::clear);
-                                        let handle =
-                                            this.comment_editor.read(cx).focus_handle.clone();
-                                        window.focus(&handle);
+                                        this.open_composer(index, window, cx);
                                         cx.notify();
                                     });
                                 })
-                                .child("Comment"),
+                                .child(if draft_exists { "Edit" } else { "Comment" }),
                         )
                     }),
             )
@@ -461,6 +557,44 @@ impl DiffView {
                         .children(threads.iter().map(Self::render_thread)),
                 )
             })
+            // A draft the reviewer is not currently editing, shown so the diff
+            // reflects everything they have written.
+            .children(resting_draft.map(|draft| {
+                div().ml(px(GUTTER_WIDTH * 2.0 + 20.0)).mr_3().py_2().child(
+                    div()
+                        .p_2()
+                        .rounded_md()
+                        .border_l_2()
+                        .border_color(rgb(0xfbbf24))
+                        .bg(rgb(0x1c1917))
+                        .flex()
+                        .flex_col()
+                        .gap_1()
+                        .child(
+                            div()
+                                .flex()
+                                .gap_2()
+                                .text_xs()
+                                .child(
+                                    div()
+                                        .text_color(rgb(0xfde68a))
+                                        .font_weight(gpui::FontWeight::SEMIBOLD)
+                                        .child("Your draft"),
+                                )
+                                .when(draft.is_stale, |header| {
+                                    header.child(
+                                        div().text_color(rgb(0xf87171)).child("needs re-anchoring"),
+                                    )
+                                }),
+                        )
+                        .child(
+                            div()
+                                .text_sm()
+                                .text_color(rgb(0xe5e7eb))
+                                .child(SharedString::from(draft.body.clone())),
+                        ),
+                )
+            }))
             .when(show_comment, |row| {
                 row.child(
                     div()
@@ -491,7 +625,27 @@ impl DiffView {
                                         cx.notify();
                                     });
                                 })
-                                .child("Close"),
+                                .child("Done"),
+                        )
+                        .child(
+                            div()
+                                .id(("discard-draft", index))
+                                .px_3()
+                                .h(px(32.0))
+                                .flex()
+                                .items_center()
+                                .rounded_md()
+                                .border_1()
+                                .border_color(rgb(0x7f1d1d))
+                                .text_color(rgb(0xfca5a5))
+                                .cursor_pointer()
+                                .on_mouse_down(MouseButton::Left, move |_, window, cx| {
+                                    cx.stop_propagation();
+                                    discard_view.update(cx, |this, cx| {
+                                        this.discard_draft(index, window, cx);
+                                    });
+                                })
+                                .child("Discard"),
                         ),
                 )
             })
@@ -511,6 +665,8 @@ impl Render for DiffView {
         let file = self.file.clone();
         let file_index = self.file_index;
         let comments = Arc::clone(&self.comments);
+        let drafts = Arc::clone(&self.drafts);
+        let draft_count = self.drafts.for_path(&self.file.path).count();
         let selected_line = self.selected_line;
         let comment_line = self.comment_line;
         let view = cx.entity();
@@ -597,6 +753,7 @@ impl Render for DiffView {
                                     selected: selected_line == index,
                                     show_comment: comment_line == Some(index),
                                     threads: comments.threads_at(file_index, index),
+                                    draft: drafts.at(file_index, index),
                                 },
                                 &view,
                                 &comment_editor,
@@ -627,6 +784,14 @@ impl Render for DiffView {
                                     .text_xs()
                                     .child(format!("{thread_count} on a diff line")),
                             )
+                            .when(draft_count > 0, |panel| {
+                                panel.child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(rgb(0xfde68a))
+                                        .child(format!("{draft_count} of your drafts")),
+                                )
+                            })
                             // Threads GitHub reports without a usable position
                             // would otherwise be invisible, so they are listed
                             // against the file with the reason they cannot be
@@ -678,11 +843,24 @@ impl Render for DiffView {
     }
 }
 
+/// Emitted when the session's drafts change, so whoever owns persistence can
+/// write them without this view knowing about a database.
+pub struct DraftsChanged {
+    /// The draft that changed, or `None` when one was discarded.
+    pub draft: Option<DraftComment>,
+    /// The anchor that was affected, whether written or discarded.
+    pub anchor: DiffAnchor,
+}
+
 pub struct ReviewView {
     session: ReviewSession,
     diff_view: Entity<DiffView>,
     file_list_state: ListState,
+    /// Held so draft edits keep reaching the session.
+    _diff_subscription: Subscription,
 }
+
+impl EventEmitter<DraftsChanged> for ReviewView {}
 
 impl ReviewView {
     #[must_use]
@@ -690,13 +868,58 @@ impl ReviewView {
         let selected_file = Arc::new(session.selected_file().clone());
         let selected_index = session.selected_file_index();
         let comments = session.shared_comments();
+        let drafts = session.shared_drafts();
         let file_count = session.files().len();
+        let diff_view =
+            cx.new(|cx| DiffView::new(selected_file, selected_index, comments, drafts, window, cx));
+        let subscription = cx.subscribe(&diff_view, Self::on_diff_event);
+
         Self {
             session,
-            diff_view: cx
-                .new(|cx| DiffView::new(selected_file, selected_index, comments, window, cx)),
+            diff_view,
             file_list_state: ListState::new(file_count, ListAlignment::Top, px(36.0)),
+            _diff_subscription: subscription,
         }
+    }
+
+    /// Applies a draft change to the session, then republishes it for rendering
+    /// and for persistence.
+    fn on_diff_event(
+        &mut self,
+        _diff_view: Entity<DiffView>,
+        event: &DiffViewEvent,
+        cx: &mut Context<Self>,
+    ) {
+        let file = self.session.selected_file_index();
+        let row = match event {
+            DiffViewEvent::DraftEdited { row, .. } | DiffViewEvent::DraftDiscarded { row } => *row,
+        };
+        // The anchor is read before the change so a discarded draft still reports
+        // which position it was removed from.
+        let Some(anchor) = self.session.anchor_for(file, row) else {
+            return;
+        };
+
+        match event {
+            DiffViewEvent::DraftEdited { body, .. } => {
+                self.session.set_draft(file, row, body.clone());
+            }
+            DiffViewEvent::DraftDiscarded { .. } => {
+                self.session.clear_draft(file, row);
+            }
+        }
+
+        let drafts = self.session.shared_drafts();
+        let draft = drafts.get(&anchor).cloned();
+        self.diff_view
+            .update(cx, |view, cx| view.set_drafts(drafts, cx));
+        cx.emit(DraftsChanged { draft, anchor });
+        cx.notify();
+    }
+
+    #[must_use]
+    pub const fn session(&self) -> &ReviewSession {
+        &self.session
     }
 
     #[must_use]
@@ -1144,7 +1367,14 @@ mod tests {
         cx.update(init);
         let file = Arc::new(DiffFile::demo(100_000));
         let (view, cx) = cx.add_window_view(|window, cx| {
-            DiffView::new(file, 0, Arc::new(PlacedComments::default()), window, cx)
+            DiffView::new(
+                file,
+                0,
+                Arc::new(PlacedComments::default()),
+                Arc::new(Drafts::default()),
+                window,
+                cx,
+            )
         });
 
         cx.update(|window, app| {
@@ -1171,7 +1401,14 @@ mod tests {
         cx.update(init);
         let file = Arc::new(DiffFile::demo(100));
         let (view, cx) = cx.add_window_view(|window, cx| {
-            DiffView::new(file, 0, Arc::new(PlacedComments::default()), window, cx)
+            DiffView::new(
+                file,
+                0,
+                Arc::new(PlacedComments::default()),
+                Arc::new(Drafts::default()),
+                window,
+                cx,
+            )
         });
 
         cx.update(|window, app| {
@@ -1194,7 +1431,14 @@ mod tests {
         cx.update(init);
         let file = Arc::new(DiffFile::demo(100));
         let (view, cx) = cx.add_window_view(|window, cx| {
-            DiffView::new(file, 0, Arc::new(PlacedComments::default()), window, cx)
+            DiffView::new(
+                file,
+                0,
+                Arc::new(PlacedComments::default()),
+                Arc::new(Drafts::default()),
+                window,
+                cx,
+            )
         });
 
         cx.update(|window, app| {
@@ -1357,6 +1601,126 @@ mod tests {
                 .map(|failure| failure.summary.clone())),
             Some("GitHub's rate limit is exhausted".to_owned()),
         );
+    }
+
+    /// The point of the whole path: what is typed becomes a draft anchored to the
+    /// row, without the reviewer doing anything to save it.
+    #[gpui::test]
+    fn typing_in_the_composer_stores_an_anchored_draft(cx: &mut TestAppContext) {
+        cx.update(init);
+        let session = repository_backed_session(&["src/review.rs"]);
+        let (view, cx) = cx.add_window_view(|window, cx| ReviewView::new(session, window, cx));
+        cx.update(|window, app| {
+            let focus = view.read(app).diff_view.read(app).focus_handle.clone();
+            window.focus(&focus);
+        });
+
+        // Row 6 of the fixture is an addition, so it anchors on the right.
+        for _ in 0..6 {
+            cx.dispatch_action(SelectNextLine);
+        }
+        cx.dispatch_action(ToggleComment);
+        cx.simulate_input("needs a test");
+
+        let draft = cx
+            .read(|app| view.read(app).session().draft_at(0, 6).cloned())
+            .expect("typing should have stored a draft");
+        assert_eq!(draft.body, "needs a test");
+        assert_eq!(draft.anchor.side, domain::DiffSide::Right);
+        assert_eq!(draft.anchor.path.as_ref(), "src/review.rs");
+        assert!(!draft.is_stale);
+        assert_eq!(cx.read(|app| view.read(app).session().drafts().len()), 1);
+    }
+
+    /// Closing the composer and switching files used to lose the text. It is now
+    /// stored on the session, so it survives both.
+    #[gpui::test]
+    fn a_draft_survives_closing_the_composer_and_changing_files(cx: &mut TestAppContext) {
+        cx.update(init);
+        let session = repository_backed_session(&["src/first.rs", "src/second.rs"]);
+        let (view, cx) = cx.add_window_view(|window, cx| ReviewView::new(session, window, cx));
+        cx.update(|window, app| {
+            let focus = view.read(app).diff_view.read(app).focus_handle.clone();
+            window.focus(&focus);
+        });
+
+        cx.dispatch_action(ToggleComment);
+        cx.simulate_input("a thought");
+        cx.simulate_keystrokes("escape");
+        cx.simulate_keystrokes("cmd-shift-j");
+        cx.simulate_keystrokes("cmd-shift-k");
+
+        assert_eq!(
+            cx.read(|app| view
+                .read(app)
+                .session()
+                .draft_at(0, 0)
+                .map(|d| d.body.clone())),
+            Some("a thought".to_owned()),
+        );
+    }
+
+    /// Reopening a line has to show what is already there, or the reviewer would
+    /// silently start a second comment over the top of the first.
+    #[gpui::test]
+    fn reopening_the_composer_loads_the_existing_draft(cx: &mut TestAppContext) {
+        cx.update(init);
+        let session = repository_backed_session(&["src/review.rs"]);
+        let (view, cx) = cx.add_window_view(|window, cx| ReviewView::new(session, window, cx));
+        cx.update(|window, app| {
+            let focus = view.read(app).diff_view.read(app).focus_handle.clone();
+            window.focus(&focus);
+        });
+
+        cx.dispatch_action(ToggleComment);
+        cx.simulate_input("first half");
+        cx.simulate_keystrokes("escape");
+        cx.dispatch_action(ToggleComment);
+
+        assert_eq!(
+            cx.read(|app| view
+                .read(app)
+                .diff_view
+                .read(app)
+                .comment_editor
+                .read(app)
+                .content()
+                .to_owned()),
+            "first half",
+        );
+
+        // Appending continues the same draft rather than starting another.
+        cx.simulate_input(" and second");
+        assert_eq!(
+            cx.read(|app| view
+                .read(app)
+                .session()
+                .draft_at(0, 0)
+                .map(|d| d.body.clone())),
+            Some("first half and second".to_owned()),
+        );
+        assert_eq!(cx.read(|app| view.read(app).session().drafts().len()), 1);
+    }
+
+    #[gpui::test]
+    fn emptying_the_composer_removes_the_draft(cx: &mut TestAppContext) {
+        cx.update(init);
+        let session = repository_backed_session(&["src/review.rs"]);
+        let (view, cx) = cx.add_window_view(|window, cx| ReviewView::new(session, window, cx));
+        cx.update(|window, app| {
+            let focus = view.read(app).diff_view.read(app).focus_handle.clone();
+            window.focus(&focus);
+        });
+
+        cx.dispatch_action(ToggleComment);
+        cx.simulate_input("oops");
+        assert_eq!(cx.read(|app| view.read(app).session().drafts().len()), 1);
+
+        for _ in 0..4 {
+            cx.simulate_keystrokes("backspace");
+        }
+
+        assert!(cx.read(|app| view.read(app).session().drafts().is_empty()));
     }
 
     /// Threads add height to a row inside the virtualized list, so rendering a
