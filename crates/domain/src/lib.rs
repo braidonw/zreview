@@ -9,9 +9,11 @@ use std::{
 
 mod anchor;
 mod comment;
+mod session;
 
 pub use anchor::{AnchorError, AnchorIndex, AnchorLocation, DiffAnchor, DiffSide};
 pub use comment::{CommentThread, PlacedComments, ReviewComment, UnplacedReason, UnplacedThread};
+pub use session::{LoadStage, SessionFailure};
 
 /// The semantic role of one row in a unified diff.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -225,6 +227,7 @@ pub struct ReviewSession {
     viewed_paths: BTreeSet<Arc<str>>,
     anchors: Option<AnchorIndex>,
     comments: Arc<PlacedComments>,
+    comment_failure: Option<SessionFailure>,
 }
 
 impl ReviewSession {
@@ -247,7 +250,22 @@ impl ReviewSession {
             viewed_paths: BTreeSet::new(),
             anchors,
             comments: Arc::new(PlacedComments::default()),
+            comment_failure: None,
         })
+    }
+
+    /// Records that existing conversations could not be loaded.
+    ///
+    /// The diff is still reviewable without them, but the reviewer must be told:
+    /// a pull request that silently appears to have no discussion is worse than
+    /// one that says its discussion is missing.
+    pub fn set_comment_load_failure(&mut self, failure: SessionFailure) {
+        self.comment_failure = Some(failure);
+    }
+
+    #[must_use]
+    pub fn comment_load_failure(&self) -> Option<&SessionFailure> {
+        self.comment_failure.as_ref()
     }
 
     /// Places published review comments against this snapshot and reports how

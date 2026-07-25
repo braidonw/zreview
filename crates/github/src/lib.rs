@@ -4,7 +4,7 @@ use std::{
     sync::Arc,
 };
 
-use domain::{DiffSide, ReviewComment};
+use domain::{DiffSide, LoadStage, ReviewComment};
 use git::{ComparisonDiff, ComparisonMode, GitRemote};
 use serde::Deserialize;
 use thiserror::Error;
@@ -73,12 +73,36 @@ pub enum GithubError {
     #[error("no local remote matches GitHub repository {0}")]
     NoMatchingRemote(String),
 
+    #[error("the GitHub CLI (gh) was not found")]
+    GhMissing,
+
     #[error("failed to execute gh in {repository}: {source}")]
     Execute {
         repository: PathBuf,
         #[source]
         source: std::io::Error,
     },
+
+    #[error("GitHub rejected the request as unauthenticated: {detail}")]
+    Unauthenticated { detail: String },
+
+    #[error("GitHub refused the request: {detail}")]
+    Forbidden { detail: String },
+
+    #[error("GitHub has no such repository or pull request: {detail}")]
+    NotFound { detail: String },
+
+    #[error("the GitHub API rate limit is exhausted: {detail}")]
+    RateLimited { detail: String },
+
+    #[error("GitHub rejected the request as invalid: {detail}")]
+    Validation { detail: String },
+
+    #[error("GitHub returned a server error (HTTP {status}): {detail}")]
+    ServerError { status: u16, detail: String },
+
+    #[error("could not reach GitHub: {detail}")]
+    Network { detail: String },
 
     #[error("gh api failed with status {status}: {stderr}")]
     Command { status: i32, stderr: String },
@@ -102,6 +126,54 @@ pub enum GithubError {
 
     #[error(transparent)]
     Git(#[from] git::GitError),
+}
+
+impl GithubError {
+    /// The next thing the reviewer can actually do about this failure.
+    ///
+    /// Returns `None` when there is no honest advice to give; inventing one would
+    /// be worse than showing the error alone.
+    #[must_use]
+    pub const fn remediation(&self) -> Option<&'static str> {
+        match self {
+            Self::GhMissing => {
+                Some("Install the GitHub CLI from https://cli.github.com, then retry.")
+            }
+            Self::Unauthenticated { .. } => {
+                Some("Run `gh auth login`, then reopen the pull request.")
+            }
+            Self::Forbidden { .. } => Some(
+                "Check that your GitHub token has `repo` scope and that any required SSO authorization is active.",
+            ),
+            Self::NotFound { .. } => Some(
+                "Check the pull request number, and that the authenticated account can see the repository.",
+            ),
+            Self::RateLimited { .. } => {
+                Some("Wait for the GitHub rate limit to reset, then retry.")
+            }
+            Self::Network { .. } => {
+                Some("Check your network connection and https://githubstatus.com, then retry.")
+            }
+            Self::ServerError { .. } => Some("Check https://githubstatus.com, then retry."),
+            Self::HeadMoved { .. } => {
+                Some("Reload the pull request to review its new head commit.")
+            }
+            Self::NoGithubRemote | Self::NoMatchingRemote(_) => Some(
+                "Open a clone whose remote matches the pull request, or pass the full pull request URL.",
+            ),
+            Self::InvalidSelector(_) => Some(
+                "Pass a pull request number, or a full https://github.com/owner/repo/pull/N URL.",
+            ),
+            Self::Command { .. }
+            | Self::Execute { .. }
+            | Self::Validation { .. }
+            | Self::InvalidResponse(_)
+            | Self::InvalidComment { .. }
+            | Self::UnexpectedPullRequest { .. }
+            | Self::UnexpectedRepository { .. }
+            | Self::Git(_) => None,
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -134,14 +206,43 @@ impl GithubClient {
         repository: &Path,
         selector: &PullRequestSelector,
     ) -> Result<PullRequestDiff, GithubError> {
+        self.load_pull_request_reporting(repository, selector, &|_| {})
+    }
+
+    /// Loads a pull request, reporting each stage as it starts.
+    ///
+    /// Loading runs several subprocesses and can take a while on a large pull
+    /// request, so the caller is told what is happening rather than leaving the
+    /// reviewer behind an unexplained wait.
+    ///
+    /// # Errors
+    ///
+    /// As [`GithubClient::load_pull_request`].
+    pub fn load_pull_request_reporting(
+        &self,
+        repository: &Path,
+        selector: &PullRequestSelector,
+        report: &dyn Fn(LoadStage),
+    ) -> Result<PullRequestDiff, GithubError> {
         let root = git::repository_root(repository)?;
         let remotes = git::remotes(&root)?;
         let locator = resolve_selector(selector, &remotes)?;
+
+        // Checked before the first API call so an unauthenticated reviewer gets
+        // "run gh auth login" instead of a 401 from whatever happened to run
+        // first.
+        report(LoadStage::CheckingAuthentication);
+        self.check_authentication(&root)?;
+
+        report(LoadStage::ReadingPullRequest);
         let metadata = self.fetch_metadata(&root, &locator)?;
         let remote = select_remote(&remotes, &metadata.repository)
             .ok_or_else(|| GithubError::NoMatchingRemote(metadata.repository.full_name()))?;
 
+        report(LoadStage::FetchingObjects);
         let base_tip_sha = fetch_snapshot(&root, remote, &metadata)?;
+
+        report(LoadStage::BuildingDiff);
         let comparison = git::load_comparison(
             &root,
             &base_tip_sha,
@@ -153,6 +254,33 @@ impl GithubClient {
             metadata,
             comparison,
         })
+    }
+
+    /// Confirms `gh` exists and holds usable credentials.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`GithubError::GhMissing`] when the CLI is not installed and
+    /// [`GithubError::Unauthenticated`] when it is not logged in.
+    pub fn check_authentication(&self, repository: &Path) -> Result<(), GithubError> {
+        let output = Command::new(&self.gh_executable)
+            .current_dir(repository)
+            .args(["auth", "status"])
+            .env("GH_PROMPT_DISABLED", "1")
+            .output()
+            .map_err(|source| execution_error(repository, source))?;
+
+        if output.status.success() {
+            return Ok(());
+        }
+
+        // `gh auth status` reports the problem on stdout, unlike `gh api`.
+        let detail = [&output.stdout, &output.stderr]
+            .into_iter()
+            .map(|stream| String::from_utf8_lossy(stream).trim().to_owned())
+            .find(|text| !text.is_empty())
+            .unwrap_or_else(|| "gh auth status reported no active account".to_owned());
+        Err(GithubError::Unauthenticated { detail })
     }
 
     /// Fetches PR metadata through the authenticated `gh` CLI.
@@ -224,10 +352,7 @@ impl GithubClient {
             .args(&args)
             .env("GH_PROMPT_DISABLED", "1")
             .output()
-            .map_err(|source| GithubError::Execute {
-                repository: repository.to_path_buf(),
-                source,
-            })?;
+            .map_err(|source| execution_error(repository, source))?;
         Ok(successful_output(output)?.stdout)
     }
 }
@@ -577,11 +702,71 @@ fn successful_output(output: Output) -> Result<Output, GithubError> {
     if output.status.success() {
         Ok(output)
     } else {
-        Err(GithubError::Command {
-            status: output.status.code().unwrap_or(-1),
-            stderr: String::from_utf8_lossy(&output.stderr).trim().to_owned(),
-        })
+        Err(classify_failure(&output))
     }
+}
+
+/// Distinguishes "gh is not installed" from other spawn failures, because the
+/// remediation is completely different.
+fn execution_error(repository: &Path, source: std::io::Error) -> GithubError {
+    if source.kind() == std::io::ErrorKind::NotFound {
+        GithubError::GhMissing
+    } else {
+        GithubError::Execute {
+            repository: repository.to_path_buf(),
+            source,
+        }
+    }
+}
+
+/// Sorts a failed `gh api` call into a category the caller can act on.
+///
+/// `gh` exits 1 for every HTTP error and reports the status in stderr as
+/// `gh: <message> (HTTP <status>)`, so the status is recovered from there rather
+/// than from the exit code. Anything unrecognized stays a generic command
+/// failure instead of being forced into a category that might be wrong.
+fn classify_failure(output: &Output) -> GithubError {
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+    let status = output.status.code().unwrap_or(-1);
+
+    match http_status(&stderr) {
+        Some(401) => GithubError::Unauthenticated { detail: stderr },
+        // GitHub reports an exhausted rate limit as 403 with an explanatory body,
+        // and 429 only sometimes, so both are checked.
+        Some(403 | 429) if mentions_rate_limit(&stderr) => {
+            GithubError::RateLimited { detail: stderr }
+        }
+        Some(429) => GithubError::RateLimited { detail: stderr },
+        Some(403) => GithubError::Forbidden { detail: stderr },
+        Some(404) => GithubError::NotFound { detail: stderr },
+        Some(422) => GithubError::Validation { detail: stderr },
+        Some(server) if server >= 500 => GithubError::ServerError {
+            status: server,
+            detail: stderr,
+        },
+        _ if is_network_failure(&stderr) => GithubError::Network { detail: stderr },
+        _ => GithubError::Command { status, stderr },
+    }
+}
+
+/// Extracts the status from `gh`'s `(HTTP <status>)` suffix.
+fn http_status(stderr: &str) -> Option<u16> {
+    let after = stderr.split("(HTTP ").nth(1)?;
+    let digits = after.split(')').next()?;
+    digits.trim().parse().ok()
+}
+
+fn mentions_rate_limit(stderr: &str) -> bool {
+    let lowered = stderr.to_lowercase();
+    lowered.contains("rate limit") || lowered.contains("secondary rate")
+}
+
+fn is_network_failure(stderr: &str) -> bool {
+    let lowered = stderr.to_lowercase();
+    lowered.contains("error connecting to")
+        || lowered.contains("internet connection")
+        || lowered.contains("dial tcp")
+        || lowered.contains("no such host")
 }
 
 #[cfg(test)]
@@ -593,6 +778,166 @@ mod tests {
 
     const BASE_SHA: &str = "1111111111111111111111111111111111111111";
     const HEAD_SHA: &str = "2222222222222222222222222222222222222222";
+
+    /// Exit status alone cannot tell these apart: `gh` returns 1 for every HTTP
+    /// error, so the category comes from the reported status.
+    #[test]
+    fn classifies_gh_api_failures_by_reported_http_status() {
+        /// A stderr sample and the category it must land in.
+        type Case = (&'static str, fn(&GithubError) -> bool);
+
+        let cases: [Case; 8] = [
+            ("gh: Bad credentials (HTTP 401)", |error| {
+                matches!(error, GithubError::Unauthenticated { .. })
+            }),
+            ("gh: Resource not accessible (HTTP 403)", |error| {
+                matches!(error, GithubError::Forbidden { .. })
+            }),
+            ("gh: API rate limit exceeded (HTTP 403)", |error| {
+                matches!(error, GithubError::RateLimited { .. })
+            }),
+            (
+                "gh: You have exceeded a secondary rate limit (HTTP 429)",
+                |error| matches!(error, GithubError::RateLimited { .. }),
+            ),
+            ("gh: Not Found (HTTP 404)", |error| {
+                matches!(error, GithubError::NotFound { .. })
+            }),
+            ("gh: Validation Failed (HTTP 422)", |error| {
+                matches!(error, GithubError::Validation { .. })
+            }),
+            ("gh: Server Error (HTTP 503)", |error| {
+                matches!(error, GithubError::ServerError { status: 503, .. })
+            }),
+            (
+                "error connecting to api.github.com\ncheck your internet connection",
+                |error| matches!(error, GithubError::Network { .. }),
+            ),
+        ];
+
+        for (stderr, matches_category) in cases {
+            let error = classify_failure(&failed_output(stderr));
+            assert!(
+                matches_category(&error),
+                "{stderr:?} was classified as {error:?}",
+            );
+            // A rejected payload is a defect in this application rather than
+            // something a reviewer can act on, so it is the one category with no
+            // honest advice to offer.
+            let expects_remediation = !matches!(error, GithubError::Validation { .. });
+            assert_eq!(
+                error.remediation().is_some(),
+                expects_remediation,
+                "{stderr:?} remediation did not match expectation",
+            );
+            // The reported text survives classification in every case.
+            let shown = error.to_string();
+            assert!(
+                shown.contains("HTTP") || shown.contains("connecting"),
+                "detail was lost for {stderr:?}: {shown}",
+            );
+        }
+    }
+
+    #[test]
+    fn an_unrecognized_failure_stays_a_generic_command_error() {
+        // Better a plain report than a category that might be wrong.
+        let error = classify_failure(&failed_output("gh: something entirely new"));
+
+        assert!(matches!(error, GithubError::Command { status: 1, .. }));
+        assert_eq!(error.remediation(), None);
+    }
+
+    #[test]
+    fn extracts_the_http_status_from_gh_stderr() {
+        assert_eq!(http_status("gh: Not Found (HTTP 404)"), Some(404));
+        assert_eq!(
+            http_status("gh: Server Error (HTTP 500)"),
+            None.or(Some(500))
+        );
+        assert_eq!(http_status("no status here"), None);
+        assert_eq!(http_status("gh: broken (HTTP notanumber)"), None);
+    }
+
+    #[test]
+    fn a_missing_gh_executable_is_reported_as_such() {
+        let directory = TempDir::new().unwrap();
+        let client = GithubClient::new(directory.path().join("gh-does-not-exist"));
+
+        let error = client.check_authentication(directory.path()).unwrap_err();
+
+        assert!(matches!(error, GithubError::GhMissing));
+        assert!(
+            error.remediation().unwrap().contains("cli.github.com"),
+            "should point at installing gh",
+        );
+    }
+
+    #[test]
+    fn an_unauthenticated_gh_is_caught_before_any_api_call() {
+        let directory = TempDir::new().unwrap();
+        let gh = directory.path().join("gh");
+        // Mirrors `gh auth status`, which reports on stdout and exits 1.
+        write_executable(
+            &gh,
+            "#!/bin/sh\nif [ \"$1\" = \"auth\" ]; then\n  echo 'The token in GH_TOKEN is invalid.'\n  exit 1\nfi\necho 'api should not have been reached' >&2\nexit 99\n",
+        );
+
+        let error = GithubClient::new(&gh)
+            .check_authentication(directory.path())
+            .unwrap_err();
+
+        assert!(
+            matches!(&error, GithubError::Unauthenticated { detail }
+                if detail.contains("GH_TOKEN is invalid")),
+            "unexpected error: {error}",
+        );
+        assert!(error.remediation().unwrap().contains("gh auth login"));
+    }
+
+    #[test]
+    fn loading_reports_each_stage_in_order() {
+        let directory = TempDir::new().unwrap();
+        git(directory.path(), ["init", "--quiet"]);
+        let gh = directory.path().join("gh");
+        write_fake_gh(&gh, BASE_SHA, HEAD_SHA);
+
+        let stages = std::cell::RefCell::new(Vec::new());
+        // This clone has no matching remote, so loading fails partway — but only
+        // after reporting the stages it did reach.
+        let error = GithubClient::new(&gh)
+            .load_pull_request_reporting(
+                directory.path(),
+                &PullRequestSelector::Url("https://github.com/acme/widgets/pull/42".to_owned()),
+                &|stage| stages.borrow_mut().push(stage),
+            )
+            .unwrap_err();
+        assert!(
+            matches!(error, GithubError::NoMatchingRemote(_)),
+            "unexpected error: {error}",
+        );
+
+        assert_eq!(
+            stages.into_inner(),
+            [
+                LoadStage::CheckingAuthentication,
+                LoadStage::ReadingPullRequest
+            ],
+            "authentication is checked before anything is requested",
+        );
+    }
+
+    fn failed_output(stderr: &str) -> Output {
+        Output {
+            status: exit_status_one(),
+            stdout: Vec::new(),
+            stderr: stderr.as_bytes().to_vec(),
+        }
+    }
+
+    fn exit_status_one() -> std::process::ExitStatus {
+        Command::new("sh").args(["-c", "exit 1"]).status().unwrap()
+    }
 
     #[test]
     fn parses_pull_request_urls_and_remote_formats() {
@@ -1010,6 +1355,7 @@ mod tests {
     fn write_fake_comment_gh(path: &Path) {
         let body = format!(
             r#"#!/bin/sh
+if [ "$1" = "auth" ] && [ "$2" = "status" ]; then exit 0; fi
 expected="api --method GET --paginate repos/acme/widgets/pulls/42/comments?per_page=100 -H Accept: application/vnd.github+json -H X-GitHub-Api-Version: 2022-11-28"
 if [ "$*" != "$expected" ]; then
   echo "unexpected gh arguments:" >&2
@@ -1028,6 +1374,10 @@ JSON
     fn write_fake_gh(path: &Path, base_sha: &str, head_sha: &str) {
         let body = format!(
             r#"#!/bin/sh
+if [ "$1" = "auth" ] && [ "$2" = "status" ]; then
+  echo "Logged in to github.com as zreview-test"
+  exit 0
+fi
 if [ "$1" != "api" ] || [ "$2" != "--method" ] || [ "$3" != "GET" ] || [ "$4" != "repos/acme/widgets/pulls/42" ]; then
   echo "unexpected gh arguments: $*" >&2
   exit 64

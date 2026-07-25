@@ -69,7 +69,7 @@ No live GitHub credentials or network access are required by the test suite.
 
 - github.com only; GitHub Enterprise Server is deferred.
 - Number-only lookup prefers `origin`; fork ambiguity requires a full PR URL.
-- Metadata loading is synchronous before the GPUI window opens. It should move into an async session-loading state before production.
+- ~~Metadata loading is synchronous before the GPUI window opens.~~ Fixed by [async-session-loading.md](async-session-loading.md).
 - Checks, reviewers, and review submission are not implemented yet.
 - Repository fetches are a trust-sensitive operation and need an explicit repository trust/confirmation UX.
 

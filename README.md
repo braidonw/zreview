@@ -62,6 +62,8 @@ The UI includes a virtualized changed-file sidebar with status, line counts, key
 
 Existing GitHub review conversations are loaded and rendered read-only inside the diff. Replies are collapsed into threads and each thread is anchored to the line its opening comment sits on, using the same `path`/`side`/`line` model GitHub submission requires. A thread GitHub reports without a usable position — outdated, whole-file, or outside a displayed hunk — is listed against its file with the reason instead of being dropped. Replying to and resolving threads are deliberately out of scope for the MVP.
 
+The window opens before any Git or GitHub work starts. Loading runs on a background executor and reports its stage, and a failure is shown in the app with the next action to take — `gh auth login` for an unauthenticated CLI, a link for a missing one, and so on — rather than printed to a terminal you may not be watching. Only argument errors are still reported on the command line.
+
 It does not yet submit reviews, persist state, provide syntax highlighting, or run an AI review backend. The comment field is a minimal keyboard-input prototype used to validate focus and variable-height virtualized rows; it will be replaced by an IME-aware production editor.
 
 ## License

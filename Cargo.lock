@@ -4871,6 +4871,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "session"
+version = "0.1.0"
+dependencies = [
+ "domain",
+ "git",
+ "github",
+ "tempfile",
+]
+
+[[package]]
 name = "sha1_smol"
 version = "1.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7218,9 +7228,9 @@ name = "zreview"
 version = "0.1.0"
 dependencies = [
  "domain",
- "git",
  "github",
  "gpui",
+ "session",
  "ui",
 ]
 

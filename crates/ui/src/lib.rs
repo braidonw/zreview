@@ -3,8 +3,8 @@
 use std::sync::Arc;
 
 use domain::{
-    CommentThread, DiffFile, DiffLine, DiffLineKind, FileStatus, PlacedComments, ReviewSession,
-    SessionSource,
+    CommentThread, DiffFile, DiffLine, DiffLineKind, FileStatus, LoadStage, PlacedComments,
+    ReviewSession, SessionFailure, SessionSource,
 };
 use gpui::{
     App, ClipboardItem, Context, Entity, FocusHandle, Focusable, KeyBinding, KeyDownEvent,
@@ -748,6 +748,74 @@ impl ReviewView {
         cx.notify();
     }
 
+    /// The sidebar header: what is under review, and its overall counts.
+    fn render_source_header(&self) -> gpui::Div {
+        let (label, title) = match self.session.source() {
+            SessionSource::Demo => (
+                SharedString::from("Generated fixture"),
+                SharedString::from("Diff virtualization demo"),
+            ),
+            SessionSource::LocalComparison {
+                base_sha, head_sha, ..
+            } => (
+                SharedString::from("Local comparison"),
+                // `…` is the merge-base notation this comparison actually uses.
+                SharedString::from(format!("{}…{}", short_sha(base_sha), short_sha(head_sha))),
+            ),
+            SessionSource::GitHubPullRequest {
+                owner,
+                repository,
+                number,
+                title,
+                ..
+            } => (
+                SharedString::from(format!("{owner}/{repository} · PR #{number}")),
+                SharedString::from(title.to_string()),
+            ),
+        };
+        let file_count = self.session.files().len();
+        let viewed_count = self.session.viewed_count();
+        let thread_count = self.session.comments().thread_count();
+
+        div()
+            .flex_shrink_0()
+            .px_3()
+            .py_3()
+            .flex()
+            .flex_col()
+            .justify_center()
+            .gap_1()
+            .border_b_1()
+            .border_color(rgb(0x1e293b))
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(rgb(0x60a5fa))
+                    .overflow_hidden()
+                    .whitespace_nowrap()
+                    .child(label),
+            )
+            .child(
+                div()
+                    .text_color(rgb(0xf8fafc))
+                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                    .overflow_hidden()
+                    .whitespace_nowrap()
+                    .child(title),
+            )
+            .child(div().text_xs().text_color(rgb(0x64748b)).child(format!(
+                "{file_count} files · {viewed_count} viewed · {thread_count} conversations"
+            )))
+            // A pull request whose conversation failed to load must not look like
+            // one that simply has no discussion.
+            .children(self.session.comment_load_failure().map(|failure| {
+                div()
+                    .text_xs()
+                    .text_color(rgb(0xfbbf24))
+                    .child(SharedString::from(failure.summary.clone()))
+            }))
+    }
+
     fn render_file_row(
         file: &DiffFile,
         index: usize,
@@ -861,32 +929,8 @@ impl Render for ReviewView {
         let viewed = (0..files.len())
             .map(|index| self.session.is_viewed(index))
             .collect::<Vec<_>>();
-        let viewed_count = self.session.viewed_count();
-        let file_count = files.len();
         let comments = self.session.shared_comments();
-        let total_threads = comments.thread_count();
-        let (source_label, source_title) = match self.session.source() {
-            SessionSource::Demo => (
-                SharedString::from("Generated fixture"),
-                SharedString::from("Diff virtualization demo"),
-            ),
-            SessionSource::LocalComparison {
-                base_sha, head_sha, ..
-            } => (
-                SharedString::from("Local comparison"),
-                SharedString::from(format!("{}…{}", short_sha(base_sha), short_sha(head_sha))),
-            ),
-            SessionSource::GitHubPullRequest {
-                owner,
-                repository,
-                number,
-                title,
-                ..
-            } => (
-                SharedString::from(format!("{owner}/{repository} · PR #{number}")),
-                SharedString::from(title.to_string()),
-            ),
-        };
+        let header = self.render_source_header();
         let review_view = cx.entity();
 
         div()
@@ -908,37 +952,7 @@ impl Render for ReviewView {
                     .border_r_1()
                     .border_color(rgb(0x1e293b))
                     .bg(rgb(0x0f172a))
-                    .child(
-                        div()
-                            .h(px(112.0))
-                            .flex_shrink_0()
-                            .px_3()
-                            .flex()
-                            .flex_col()
-                            .justify_center()
-                            .gap_1()
-                            .border_b_1()
-                            .border_color(rgb(0x1e293b))
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .text_color(rgb(0x60a5fa))
-                                    .overflow_hidden()
-                                    .whitespace_nowrap()
-                                    .child(source_label),
-                            )
-                            .child(
-                                div()
-                                    .text_color(rgb(0xf8fafc))
-                                    .font_weight(gpui::FontWeight::SEMIBOLD)
-                                    .overflow_hidden()
-                                    .whitespace_nowrap()
-                                    .child(source_title),
-                            )
-                            .child(div().text_xs().text_color(rgb(0x64748b)).child(format!(
-                                "{file_count} files · {viewed_count} viewed · {total_threads} conversations"
-                            ))),
-                    )
+                    .child(header)
                     .child(
                         list(self.file_list_state.clone(), move |index, _, _| {
                             Self::render_file_row(
@@ -954,6 +968,169 @@ impl Render for ReviewView {
                     ),
             )
             .child(div().flex_1().min_w_0().child(self.diff_view.clone()))
+    }
+}
+
+/// The root view, and the session state machine PLAN section 9 calls for.
+///
+/// The window opens on this in [`SessionState::Loading`] before any Git or
+/// GitHub work starts, so a slow or failing load is something the reviewer
+/// watches rather than a terminal they may not be looking at.
+enum SessionState {
+    Loading {
+        /// What is being opened, known from the request alone.
+        description: SharedString,
+        /// The stage the loader last reported.
+        stage: SharedString,
+    },
+    Ready(Entity<ReviewView>),
+    Failed(SessionFailure),
+}
+
+pub struct SessionView {
+    state: SessionState,
+    focus_handle: FocusHandle,
+}
+
+impl SessionView {
+    /// Opens on the loading screen for a request that has not started yet.
+    #[must_use]
+    pub fn loading(description: impl Into<SharedString>, cx: &mut Context<Self>) -> Self {
+        Self {
+            state: SessionState::Loading {
+                description: description.into(),
+                stage: SharedString::from(LoadStage::default().label()),
+            },
+            focus_handle: cx.focus_handle(),
+        }
+    }
+
+    /// Records the stage the loader has reached.
+    ///
+    /// Ignored once the session has finished, so a late report cannot move a
+    /// ready or failed view back to loading.
+    pub fn set_stage(&mut self, label: impl Into<SharedString>, cx: &mut Context<Self>) {
+        if let SessionState::Loading { stage, .. } = &mut self.state {
+            let label = label.into();
+            if *stage != label {
+                *stage = label;
+                cx.notify();
+            }
+        }
+    }
+
+    /// Moves to the loaded session, or to the failure that stopped it.
+    pub fn finish(
+        &mut self,
+        result: Result<ReviewSession, SessionFailure>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.state = match result {
+            Ok(session) => {
+                let review = cx.new(|cx| ReviewView::new(session, window, cx));
+                let focus_handle = review.read(cx).diff_view.read(cx).focus_handle.clone();
+                window.focus(&focus_handle);
+                SessionState::Ready(review)
+            }
+            Err(failure) => {
+                window.focus(&self.focus_handle);
+                SessionState::Failed(failure)
+            }
+        };
+        cx.notify();
+    }
+
+    #[must_use]
+    pub fn is_loading(&self) -> bool {
+        matches!(self.state, SessionState::Loading { .. })
+    }
+
+    #[must_use]
+    pub fn failure(&self) -> Option<&SessionFailure> {
+        match &self.state {
+            SessionState::Failed(failure) => Some(failure),
+            _ => None,
+        }
+    }
+
+    fn render_centered(children: Vec<gpui::AnyElement>) -> gpui::Div {
+        div()
+            .size_full()
+            .flex()
+            .flex_col()
+            .items_center()
+            .justify_center()
+            .gap_3()
+            .bg(rgb(0x020617))
+            .font_family("SF Mono")
+            .text_size(px(13.0))
+            .children(children)
+    }
+}
+
+impl Focusable for SessionView {
+    fn focus_handle(&self, cx: &App) -> FocusHandle {
+        match &self.state {
+            // Hand focus to the diff so its keybindings work immediately.
+            SessionState::Ready(review) => review.read(cx).diff_view.read(cx).focus_handle.clone(),
+            _ => self.focus_handle.clone(),
+        }
+    }
+}
+
+impl Render for SessionView {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        match &self.state {
+            SessionState::Loading { description, stage } => Self::render_centered(vec![
+                div()
+                    .text_color(rgb(0xf8fafc))
+                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                    .child(format!("Opening {description}"))
+                    .into_any(),
+                div()
+                    .text_color(rgb(0x93c5fd))
+                    .child(format!("{stage}…"))
+                    .into_any(),
+            ])
+            .into_any(),
+
+            SessionState::Failed(failure) => Self::render_centered(vec![
+                div()
+                    .max_w(px(680.0))
+                    .flex()
+                    .flex_col()
+                    .gap_3()
+                    .child(
+                        div()
+                            .text_color(rgb(0xf87171))
+                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                            .child(SharedString::from(failure.summary.clone())),
+                    )
+                    // Remediation before detail: the reviewer wants the next
+                    // action more than the underlying message.
+                    .children(failure.remediation.as_ref().map(|remediation| {
+                        div()
+                            .p_3()
+                            .rounded_md()
+                            .border_l_2()
+                            .border_color(rgb(0xfbbf24))
+                            .bg(rgb(0x131c31))
+                            .text_color(rgb(0xfde68a))
+                            .child(SharedString::from(remediation.clone()))
+                    }))
+                    .children(failure.detail.as_ref().map(|detail| {
+                        div()
+                            .text_xs()
+                            .text_color(rgb(0x94a3b8))
+                            .child(SharedString::from(detail.clone()))
+                    }))
+                    .into_any(),
+            ])
+            .into_any(),
+
+            SessionState::Ready(review) => review.clone().into_any_element(),
+        }
     }
 }
 
@@ -1058,6 +1235,127 @@ mod tests {
         assert_eq!(
             cx.read(|app| { view.read(app).diff_view.read(app).file.path.to_string() }),
             "src/second.rs",
+        );
+    }
+
+    fn repository_backed_session(paths: &[&str]) -> ReviewSession {
+        let head_sha: Arc<str> = "a".repeat(40).into();
+        let files = paths
+            .iter()
+            .map(|path| {
+                let mut file = DiffFile::demo(40);
+                file.path = (*path).into();
+                file
+            })
+            .collect::<Vec<_>>();
+        ReviewSession::new(
+            domain::SessionSource::LocalComparison {
+                repository_root: std::path::PathBuf::from("/tmp/repository"),
+                base_sha: Arc::clone(&head_sha),
+                diff_base_sha: Arc::clone(&head_sha),
+                head_sha,
+            },
+            files.into(),
+        )
+        .unwrap()
+    }
+
+    /// The window opens before loading starts, so the view has to begin in a
+    /// state that has no session at all.
+    #[gpui::test]
+    fn a_session_view_starts_loading_then_becomes_ready(cx: &mut TestAppContext) {
+        cx.update(init);
+        let (view, cx) =
+            cx.add_window_view(|_window, cx| SessionView::loading("pull request #42", cx));
+
+        assert!(cx.read(|app| view.read(app).is_loading()));
+        assert!(cx.read(|app| view.read(app).failure().is_none()));
+
+        cx.update(|_window, app| {
+            view.update(app, |view, cx| {
+                view.set_stage(LoadStage::BuildingDiff.label(), cx);
+            });
+        });
+        assert!(cx.read(|app| view.read(app).is_loading()));
+
+        cx.update(|window, app| {
+            view.update(app, |view, cx| {
+                view.finish(
+                    Ok(repository_backed_session(&["src/review.rs"])),
+                    window,
+                    cx,
+                );
+            });
+        });
+
+        assert!(!cx.read(|app| view.read(app).is_loading()));
+        assert!(cx.read(|app| view.read(app).failure().is_none()));
+        // The diff takes focus, so its keybindings work without a click.
+        cx.dispatch_action(SelectNextLine);
+    }
+
+    #[gpui::test]
+    fn a_failed_load_shows_its_remediation_instead_of_a_session(cx: &mut TestAppContext) {
+        cx.update(init);
+        let (view, cx) =
+            cx.add_window_view(|_window, cx| SessionView::loading("pull request #42", cx));
+
+        let failure = SessionFailure::from_error(
+            "GitHub is not authenticated",
+            &std::io::Error::other("The token in GH_TOKEN is invalid."),
+        )
+        .with_remediation("Run `gh auth login`, then reopen the pull request.");
+        cx.update(|window, app| {
+            view.update(app, |view, cx| view.finish(Err(failure), window, cx));
+        });
+
+        assert!(!cx.read(|app| view.read(app).is_loading()));
+        let shown = cx.read(|app| view.read(app).failure().cloned()).unwrap();
+        assert_eq!(shown.summary, "GitHub is not authenticated");
+        assert!(shown.remediation.unwrap().contains("gh auth login"));
+        assert!(shown.detail.unwrap().contains("GH_TOKEN"));
+    }
+
+    /// A stage report can arrive after the load finished; it must not drag a
+    /// ready or failed view back to loading.
+    #[gpui::test]
+    fn a_late_stage_report_cannot_reopen_a_finished_session(cx: &mut TestAppContext) {
+        cx.update(init);
+        let (view, cx) =
+            cx.add_window_view(|_window, cx| SessionView::loading("pull request #42", cx));
+
+        cx.update(|window, app| {
+            view.update(app, |view, cx| {
+                view.finish(Err(SessionFailure::new("Could not load")), window, cx);
+            });
+        });
+        cx.update(|_window, app| {
+            view.update(app, |view, cx| {
+                view.set_stage(LoadStage::BuildingDiff.label(), cx);
+            });
+        });
+
+        assert!(!cx.read(|app| view.read(app).is_loading()));
+        assert!(cx.read(|app| view.read(app).failure().is_some()));
+    }
+
+    #[gpui::test]
+    fn a_conversation_load_failure_is_visible_on_a_ready_session(cx: &mut TestAppContext) {
+        cx.update(init);
+        let mut session = repository_backed_session(&["src/review.rs"]);
+        session.set_comment_load_failure(SessionFailure::new("GitHub's rate limit is exhausted"));
+
+        let (view, cx) = cx.add_window_view(|window, cx| ReviewView::new(session, window, cx));
+
+        // Rendered from the session, so the sidebar cannot silently show zero
+        // conversations as though there were none.
+        assert_eq!(
+            cx.read(|app| view
+                .read(app)
+                .session
+                .comment_load_failure()
+                .map(|failure| failure.summary.clone())),
+            Some("GitHub's rate limit is exhausted".to_owned()),
         );
     }
 

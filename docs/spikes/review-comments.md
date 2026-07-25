@@ -85,8 +85,8 @@ returned exactly the committed fixture.
 
 ## Current limitations
 
-- Comment fetching is another blocking call before the window opens, which makes
-  the synchronous loading path worse. This is now the most valuable thing to fix.
+- ~~Comment fetching is another blocking call before the window opens.~~ Fixed by
+  [async-session-loading.md](async-session-loading.md).
 - Threads render at full body length; there is no collapse, and a very long
   conversation makes a tall row.
 - Reactions, resolved state, review submission grouping, and pending reviews are
@@ -97,8 +97,6 @@ returned exactly the committed fixture.
 
 ## Next step
 
-Move session loading off the blocking path: open the window first, run Git and
-`gh` on a background executor behind a `Session` state machine
-(Opening → Loading → Ready → Failed), and surface the typed GitHub error
-categories from PLAN section 7 with remediation instead of terminal output. Local
-anchored drafts come after that, on top of the anchor model this spike landed.
+Session loading moved off the blocking path in
+[async-session-loading.md](async-session-loading.md). Local anchored drafts come
+next, on top of the anchor model this spike landed.
