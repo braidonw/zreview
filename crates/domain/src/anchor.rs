@@ -314,6 +314,7 @@ mod tests {
                 },
             ]
             .into(),
+            counts: crate::ChangeCounts::of(&lines),
             lines: lines.into(),
         }
     }
@@ -508,6 +509,7 @@ mod tests {
             status: FileStatus::Modified,
             is_binary: true,
             hunks: Arc::from([]),
+            counts: crate::ChangeCounts::default(),
             lines: Arc::from([]),
         };
         let index = index_for(std::slice::from_ref(&binary));

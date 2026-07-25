@@ -67,6 +67,29 @@ pub enum FileStatus {
     Unmerged,
 }
 
+/// How many lines a file adds and removes.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ChangeCounts {
+    pub additions: usize,
+    pub deletions: usize,
+}
+
+impl ChangeCounts {
+    /// Counts the additions and deletions in a set of diff lines.
+    #[must_use]
+    pub fn of(lines: &[DiffLine]) -> Self {
+        let mut counts = Self::default();
+        for line in lines {
+            match line.kind {
+                DiffLineKind::Addition => counts.additions += 1,
+                DiffLineKind::Deletion => counts.deletions += 1,
+                DiffLineKind::Context | DiffLineKind::NoNewlineMarker => {}
+            }
+        }
+        counts
+    }
+}
+
 /// A reviewable file. Lines are flat to make virtualized indexing constant-time.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DiffFile {
@@ -76,6 +99,12 @@ pub struct DiffFile {
     pub is_binary: bool,
     pub hunks: Arc<[DiffHunk]>,
     pub lines: Arc<[DiffLine]>,
+    /// Counted once when the file is built.
+    ///
+    /// The file sidebar draws these on every frame, and recomputing them meant
+    /// walking every line of every visible file — a 100,000-line file cost a
+    /// 100,000-element scan per frame while it was on screen.
+    pub counts: ChangeCounts,
 }
 
 impl DiffFile {
@@ -87,6 +116,50 @@ impl DiffFile {
     #[must_use]
     pub fn line(&self, index: usize) -> Option<&DiffLine> {
         self.lines.get(index)
+    }
+
+    /// The header of the hunk that begins at this row, if one does.
+    ///
+    /// Headers ride on the row that starts their hunk rather than occupying rows
+    /// of their own, so row indices stay equal to line indices. Anchors, drafts,
+    /// and comment threads are all keyed by row, and inserting header rows would
+    /// shift every one of them.
+    #[must_use]
+    pub fn hunk_header_at(&self, row: usize) -> Option<&Arc<str>> {
+        self.hunks
+            .binary_search_by_key(&row, |hunk| hunk.line_range.start)
+            .ok()
+            .map(|index| &self.hunks[index].header)
+    }
+
+    /// The hunk a row belongs to.
+    #[must_use]
+    pub fn hunk_at(&self, row: usize) -> Option<&DiffHunk> {
+        let candidate = self
+            .hunks
+            .partition_point(|hunk| hunk.line_range.start <= row)
+            .checked_sub(1)?;
+        self.hunks
+            .get(candidate)
+            .filter(|hunk| hunk.line_range.contains(&row))
+    }
+
+    /// Why this file shows no diff rows, when it shows none.
+    ///
+    /// A file with nothing to display used to render an empty black pane, which
+    /// looks identical to a bug.
+    #[must_use]
+    pub fn empty_reason(&self) -> Option<EmptyDiffReason> {
+        if !self.lines.is_empty() {
+            return None;
+        }
+        Some(if self.is_binary {
+            EmptyDiffReason::Binary
+        } else if matches!(self.status, FileStatus::Renamed | FileStatus::Copied) {
+            EmptyDiffReason::MovedWithoutChanges
+        } else {
+            EmptyDiffReason::NoLineChanges
+        })
     }
 
     /// Generates a large deterministic fixture without reading a repository.
@@ -152,7 +225,43 @@ impl DiffFile {
                 line_range: 0..line_count,
             }]
             .into(),
+            counts: ChangeCounts::of(&lines),
             lines: lines.into(),
+        }
+    }
+}
+
+/// Why a reviewed file has no rows to show.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum EmptyDiffReason {
+    /// Git reported the content as binary.
+    Binary,
+    /// Renamed or copied with identical content.
+    MovedWithoutChanges,
+    /// Something changed that is not line content, such as a file mode.
+    NoLineChanges,
+}
+
+impl EmptyDiffReason {
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Binary => "Binary file",
+            Self::MovedWithoutChanges => "Moved without content changes",
+            Self::NoLineChanges => "No line changes",
+        }
+    }
+
+    #[must_use]
+    pub const fn detail(self) -> &'static str {
+        match self {
+            Self::Binary => "ZReview does not render binary content yet.",
+            Self::MovedWithoutChanges => {
+                "The file's path changed but every line is identical, so there is nothing to diff."
+            }
+            Self::NoLineChanges => {
+                "Something outside the file's line content changed, such as its mode."
+            }
         }
     }
 }
@@ -518,6 +627,112 @@ mod tests {
         assert_eq!(file.lines[6].kind, DiffLineKind::Addition);
         assert_eq!(file.lines[6].old_line, None);
         assert!(file.lines[6].new_line.is_some());
+    }
+
+    /// A multi-hunk file used to show only the first hunk's header, pinned above
+    /// the whole scroll range.
+    #[test]
+    fn each_hunk_header_belongs_to_the_row_that_starts_it() {
+        let file = DiffFile {
+            path: "src/review.rs".into(),
+            old_path: None,
+            status: FileStatus::Modified,
+            is_binary: false,
+            hunks: vec![
+                DiffHunk {
+                    header: "@@ -10,2 +10,2 @@".into(),
+                    old_start: 10,
+                    new_start: 10,
+                    line_range: 0..2,
+                },
+                DiffHunk {
+                    header: "@@ -80,3 +80,3 @@".into(),
+                    old_start: 80,
+                    new_start: 80,
+                    line_range: 2..5,
+                },
+            ]
+            .into(),
+            counts: ChangeCounts::default(),
+            lines: vec![
+                DiffLine {
+                    kind: DiffLineKind::Context,
+                    old_line: Some(10),
+                    new_line: Some(10),
+                    text: "a".into(),
+                };
+                5
+            ]
+            .into(),
+        };
+
+        assert_eq!(
+            file.hunk_header_at(0).map(ToString::to_string),
+            Some("@@ -10,2 +10,2 @@".to_owned()),
+        );
+        assert!(file.hunk_header_at(1).is_none(), "only the starting row");
+        assert_eq!(
+            file.hunk_header_at(2).map(ToString::to_string),
+            Some("@@ -80,3 +80,3 @@".to_owned()),
+        );
+        assert!(file.hunk_header_at(9).is_none());
+
+        // Every row still knows which hunk it is in.
+        assert_eq!(file.hunk_at(1).unwrap().old_start, 10);
+        assert_eq!(file.hunk_at(4).unwrap().old_start, 80);
+        assert!(file.hunk_at(5).is_none(), "past the last hunk");
+    }
+
+    #[test]
+    fn change_counts_are_computed_once_from_the_lines() {
+        let file = DiffFile::demo(20);
+        let recounted = ChangeCounts::of(&file.lines);
+
+        assert_eq!(file.counts, recounted);
+        // The fixture repeats a deletion and two additions every twenty lines.
+        assert_eq!(file.counts.deletions, 1);
+        assert_eq!(file.counts.additions, 2);
+    }
+
+    #[test]
+    fn a_file_with_rows_has_no_empty_reason() {
+        assert!(DiffFile::demo(10).empty_reason().is_none());
+    }
+
+    /// Each of these used to render an identical empty black pane.
+    #[test]
+    fn files_with_nothing_to_show_say_why() {
+        let empty = |status, is_binary| DiffFile {
+            path: "image.bin".into(),
+            old_path: None,
+            status,
+            is_binary,
+            hunks: Arc::from([]),
+            counts: ChangeCounts::default(),
+            lines: Arc::from([]),
+        };
+
+        assert_eq!(
+            empty(FileStatus::Modified, true).empty_reason(),
+            Some(EmptyDiffReason::Binary),
+        );
+        assert_eq!(
+            empty(FileStatus::Renamed, false).empty_reason(),
+            Some(EmptyDiffReason::MovedWithoutChanges),
+        );
+        assert_eq!(
+            empty(FileStatus::Modified, false).empty_reason(),
+            Some(EmptyDiffReason::NoLineChanges),
+        );
+
+        for reason in [
+            EmptyDiffReason::Binary,
+            EmptyDiffReason::MovedWithoutChanges,
+            EmptyDiffReason::NoLineChanges,
+        ] {
+            assert!(!reason.label().is_empty());
+            assert!(!reason.detail().is_empty());
+        }
     }
 
     #[test]

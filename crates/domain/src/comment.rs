@@ -362,6 +362,7 @@ mod tests {
                 line_range: 0..2,
             }]
             .into(),
+            counts: crate::ChangeCounts::of(&lines),
             lines: lines.into(),
         }
     }

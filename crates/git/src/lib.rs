@@ -5,7 +5,7 @@ use std::{
     sync::Arc,
 };
 
-use domain::{DiffFile, DiffHunk, DiffLine, DiffLineKind, FileStatus};
+use domain::{ChangeCounts, DiffFile, DiffHunk, DiffLine, DiffLineKind, FileStatus};
 use thiserror::Error;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -332,6 +332,7 @@ fn load_file_diff(
         status: changed.status,
         is_binary,
         hunks: hunks.into(),
+        counts: ChangeCounts::of(&lines),
         lines: lines.into(),
     })
 }

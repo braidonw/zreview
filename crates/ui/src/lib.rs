@@ -3,9 +3,9 @@
 use std::sync::Arc;
 
 use domain::{
-    CommentThread, DiffAnchor, DiffFile, DiffLine, DiffLineKind, DraftComment, DraftSink, Drafts,
-    FileStatus, LoadStage, LoadedSession, PlacedComments, ReviewSession, SessionFailure,
-    SessionSource,
+    ChangeCounts, CommentThread, DiffAnchor, DiffFile, DiffLine, DiffLineKind, DraftComment,
+    DraftSink, Drafts, FileStatus, LoadStage, LoadedSession, PlacedComments, ReviewSession,
+    SessionFailure, SessionSource,
 };
 use gpui::{
     App, ClipboardItem, Context, Entity, EventEmitter, FocusHandle, Focusable, KeyBinding,
@@ -193,6 +193,8 @@ struct DiffRow<'a> {
     show_comment: bool,
     threads: &'a [CommentThread],
     draft: Option<&'a DraftComment>,
+    /// Set when a hunk begins at this row, so the header is drawn above it.
+    hunk_header: Option<&'a Arc<str>>,
 }
 
 /// What the diff view asks the session to do about drafts.
@@ -429,6 +431,7 @@ impl DiffView {
             show_comment,
             threads,
             draft,
+            hunk_header,
         } = row;
         // While the composer is open the draft is being edited in it, so showing
         // it read-only underneath as well would duplicate the same text.
@@ -460,6 +463,19 @@ impl DiffView {
             .flex()
             .flex_col()
             .bg(if selected { rgb(0x1e3a5f) } else { row_bg })
+            // Drawn above the first row of its hunk, so every hunk in a file is
+            // labelled rather than only the first.
+            .children(hunk_header.map(|header| {
+                div()
+                    .w_full()
+                    .h(px(ROW_HEIGHT))
+                    .px_3()
+                    .flex()
+                    .items_center()
+                    .bg(rgb(0x172554))
+                    .text_color(rgb(0x93c5fd))
+                    .child(SharedString::from(header.to_string()))
+            }))
             .child(
                 div()
                     .h(px(ROW_HEIGHT))
@@ -679,10 +695,14 @@ impl Render for DiffView {
             .unplaced_for_file(file_index)
             .cloned()
             .collect::<Vec<_>>();
-        let hunk_header = file.hunks.first().map_or_else(
-            || SharedString::from("No hunks"),
+        // Tracks the selection rather than being pinned to the first hunk, so it
+        // says where the reviewer actually is.
+        let current_hunk = file.hunk_at(selected_line).map_or_else(
+            || SharedString::from("—"),
             |hunk| SharedString::from(hunk.header.to_string()),
         );
+        let hunk_count = file.hunks.len();
+        let empty_reason = file.empty_reason();
 
         div()
             .id("diff-view")
@@ -723,11 +743,10 @@ impl Render for DiffView {
                             )
                             .child(div().text_color(rgb(0x94a3b8)).child(path)),
                     )
-                    .child(
-                        div()
-                            .text_color(rgb(0x94a3b8))
-                            .child(format!("{line_count} lines · GPUI virtualization spike")),
-                    ),
+                    .child(div().text_color(rgb(0x94a3b8)).child(format!(
+                        "{line_count} lines · {hunk_count} hunk{}",
+                        if hunk_count == 1 { "" } else { "s" }
+                    ))),
             )
             .child(
                 div()
@@ -738,30 +757,57 @@ impl Render for DiffView {
                     .items_center()
                     .bg(rgb(0x172554))
                     .text_color(rgb(0x93c5fd))
-                    .child(hunk_header),
+                    .child(current_hunk),
             )
             .child(
                 div()
                     .flex_1()
                     .min_h_0()
                     .flex()
-                    .child(
-                        list(self.list_state.clone(), move |index, _, _| {
-                            Self::render_diff_line(
-                                &DiffRow {
-                                    line: &file.lines[index],
-                                    index,
-                                    selected: selected_line == index,
-                                    show_comment: comment_line == Some(index),
-                                    threads: comments.threads_at(file_index, index),
-                                    draft: drafts.at(file_index, index),
-                                },
-                                &view,
-                                &comment_editor,
+                    // A file with no rows explains itself instead of rendering an
+                    // empty pane that is indistinguishable from a bug.
+                    .children(empty_reason.map(|reason| {
+                        div()
+                            .flex_1()
+                            .flex()
+                            .flex_col()
+                            .items_center()
+                            .justify_center()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .text_color(rgb(0xf8fafc))
+                                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                                    .child(reason.label()),
                             )
-                        })
-                        .flex_1(),
-                    )
+                            .child(
+                                div()
+                                    .max_w(px(420.0))
+                                    .text_xs()
+                                    .text_color(rgb(0x64748b))
+                                    .child(reason.detail()),
+                            )
+                    }))
+                    .when(empty_reason.is_none(), |pane| {
+                        pane.child(
+                            list(self.list_state.clone(), move |index, _, _| {
+                                Self::render_diff_line(
+                                    &DiffRow {
+                                        line: &file.lines[index],
+                                        index,
+                                        selected: selected_line == index,
+                                        show_comment: comment_line == Some(index),
+                                        threads: comments.threads_at(file_index, index),
+                                        draft: drafts.at(file_index, index),
+                                        hunk_header: file.hunk_header_at(index),
+                                    },
+                                    &view,
+                                    &comment_editor,
+                                )
+                            })
+                            .flex_1(),
+                        )
+                    })
                     .child(
                         div()
                             .w(px(230.0))
@@ -1058,14 +1104,11 @@ impl ReviewView {
             FileStatus::TypeChanged => ("T", rgb(0xf59e0b)),
             FileStatus::Unmerged => ("U", rgb(0xfb7185)),
         };
-        let (additions, deletions) =
-            file.lines
-                .iter()
-                .fold((0_usize, 0_usize), |counts, line| match line.kind {
-                    DiffLineKind::Addition => (counts.0 + 1, counts.1),
-                    DiffLineKind::Deletion => (counts.0, counts.1 + 1),
-                    DiffLineKind::Context | DiffLineKind::NoNewlineMarker => counts,
-                });
+        // Counted when the file was built, not per frame.
+        let ChangeCounts {
+            additions,
+            deletions,
+        } = file.counts;
         let path = SharedString::from(file.path.to_string());
         let view = review_view.clone();
 
@@ -1904,6 +1947,46 @@ mod tests {
         }
 
         assert!(cx.read(|app| view.read(app).session().drafts().is_empty()));
+    }
+
+    /// A file with nothing to render must not put the view in a state where
+    /// navigation misbehaves.
+    #[gpui::test]
+    fn a_file_with_no_rows_renders_without_breaking_navigation(cx: &mut TestAppContext) {
+        cx.update(init);
+        let binary = Arc::new(DiffFile {
+            path: "image.bin".into(),
+            old_path: None,
+            status: FileStatus::Modified,
+            is_binary: true,
+            hunks: Arc::from([]),
+            counts: ChangeCounts::default(),
+            lines: Arc::from([]),
+        });
+        assert_eq!(binary.empty_reason(), Some(domain::EmptyDiffReason::Binary));
+
+        let (view, cx) = cx.add_window_view(|window, cx| {
+            DiffView::new(
+                binary,
+                0,
+                Arc::new(PlacedComments::default()),
+                Arc::new(Drafts::default()),
+                window,
+                cx,
+            )
+        });
+        cx.update(|window, app| {
+            window.focus(&view.read(app).focus_handle(app));
+        });
+
+        // Navigating an empty file stays put rather than panicking on an index.
+        cx.dispatch_action(SelectNextLine);
+        cx.dispatch_action(SelectPreviousLine);
+        assert_eq!(cx.read(|app| view.read(app).selected_line()), 0);
+
+        // And there is no row to comment on.
+        cx.dispatch_action(ToggleComment);
+        assert_eq!(cx.read(|app| view.read(app).comment_line), Some(0));
     }
 
     /// Threads add height to a row inside the virtualized list, so rendering a
