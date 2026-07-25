@@ -7,6 +7,10 @@ use std::{
     sync::Arc,
 };
 
+mod anchor;
+
+pub use anchor::{AnchorError, AnchorIndex, AnchorLocation, DiffAnchor, DiffSide};
+
 /// The semantic role of one row in a unified diff.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DiffLineKind {
@@ -217,6 +221,7 @@ pub struct ReviewSession {
     files: Arc<[DiffFile]>,
     selected_file: usize,
     viewed_paths: BTreeSet<Arc<str>>,
+    anchors: Option<AnchorIndex>,
 }
 
 impl ReviewSession {
@@ -229,12 +234,25 @@ impl ReviewSession {
         if files.is_empty() {
             return Err(EmptyReviewSession);
         }
+        let anchors = source
+            .head_sha()
+            .map(|head_sha| AnchorIndex::new(&files, Arc::clone(head_sha)));
         Ok(Self {
             source,
             files,
             selected_file: 0,
             viewed_paths: BTreeSet::new(),
+            anchors,
         })
+    }
+
+    /// The anchor index for this snapshot.
+    ///
+    /// Absent for sources with no head commit, which therefore cannot carry
+    /// review comments.
+    #[must_use]
+    pub fn anchors(&self) -> Option<&AnchorIndex> {
+        self.anchors.as_ref()
     }
 
     #[must_use]
@@ -366,6 +384,37 @@ mod tests {
         };
         assert_eq!(local.diff_base_sha().unwrap().as_ref(), "d".repeat(40));
         assert_eq!(local.head_sha().unwrap().as_ref(), "h".repeat(40));
+    }
+
+    #[test]
+    fn a_repository_backed_session_anchors_its_rows() {
+        let head_sha = "h".repeat(40);
+        let source = SessionSource::LocalComparison {
+            repository_root: PathBuf::from("/tmp/repository"),
+            base_sha: "b".repeat(40).into(),
+            diff_base_sha: "d".repeat(40).into(),
+            head_sha: head_sha.clone().into(),
+        };
+        let mut file = DiffFile::demo(40);
+        file.path = "src/review.rs".into();
+        let session = ReviewSession::new(source, vec![file].into()).unwrap();
+
+        let anchors = session.anchors().expect("a local comparison has a head");
+        assert_eq!(anchors.head_sha().as_ref(), head_sha);
+
+        let anchor = anchors
+            .anchor_for_row(session.selected_file(), 6)
+            .expect("row 6 is an addition");
+        assert_eq!(anchor.side, DiffSide::Right);
+        assert_eq!(anchor.path.as_ref(), "src/review.rs");
+        assert_eq!(anchors.resolve(&anchor).unwrap().row, 6);
+    }
+
+    #[test]
+    fn a_demo_session_has_no_anchor_index() {
+        let session = ReviewSession::new(SessionSource::Demo, vec![DiffFile::demo(10)].into())
+            .expect("the demo has files");
+        assert!(session.anchors().is_none());
     }
 
     #[test]
