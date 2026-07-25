@@ -1787,6 +1787,22 @@ mod tests {
                 .push(format!("discard {} {}", anchor.path, anchor.line));
         }
 
+        fn save_summary(&self, _head_sha: &str, body: &str) {
+            self.calls.lock().unwrap().push(format!("summary {body}"));
+        }
+
+        fn clear_submitted(&self, _head_sha: &str, anchors: &[DiffAnchor]) {
+            let positions = anchors
+                .iter()
+                .map(|anchor| format!("{} {}", anchor.path, anchor.line))
+                .collect::<Vec<_>>()
+                .join(", ");
+            self.calls
+                .lock()
+                .unwrap()
+                .push(format!("clear submitted [{positions}]"));
+        }
+
         fn failure(&self) -> Option<String> {
             self.failure.clone()
         }

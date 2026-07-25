@@ -1,10 +1,11 @@
 use std::{
+    io::Write,
     path::{Path, PathBuf},
-    process::{Command, Output},
+    process::{Command, Output, Stdio},
     sync::Arc,
 };
 
-use domain::{DiffSide, LoadStage, ReviewComment};
+use domain::{DiffSide, LoadStage, ReviewComment, ReviewSubmission};
 use git::{ComparisonDiff, ComparisonMode, GitRemote};
 use serde::Deserialize;
 use thiserror::Error;
@@ -326,6 +327,98 @@ impl GithubClient {
         parse_review_comments(&stdout)
     }
 
+    /// Posts a review to a pull request.
+    ///
+    /// The head is re-read first and the submission refused if it moved: a review
+    /// pinned to a commit that is no longer the head would attach comments to code
+    /// the author has already replaced. Nothing local is touched here, so a
+    /// refusal or a failure leaves every draft where it was — the caller decides
+    /// what to forget, and only after this returns successfully.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`GithubError::HeadMoved`] when the pull request advanced past the
+    /// snapshot, or the usual categories when `gh` fails.
+    pub fn submit_review(
+        &self,
+        repository: &Path,
+        locator: &PullRequestLocator,
+        submission: &ReviewSubmission,
+    ) -> Result<SubmittedReview, GithubError> {
+        let current = self.fetch_metadata(repository, locator)?;
+        if current.head_sha != submission.head_sha {
+            return Err(GithubError::HeadMoved {
+                expected: submission.head_sha.to_string(),
+                actual: current.head_sha.to_string(),
+            });
+        }
+
+        let endpoint = format!(
+            "repos/{}/{}/pulls/{}/reviews",
+            locator.repository.owner, locator.repository.name, locator.number
+        );
+        let payload = review_payload(submission);
+        let stdout = self.api_post(repository, &endpoint, &payload)?;
+        let response: ApiReview = serde_json::from_slice(&stdout)?;
+
+        Ok(SubmittedReview {
+            id: response.id,
+            state: response.state,
+            url: response.html_url,
+        })
+    }
+
+    /// Runs one `gh api` POST, sending the body on stdin.
+    ///
+    /// The payload goes over stdin rather than as arguments so a comment body
+    /// cannot end up in a process listing, and so its size is not bounded by the
+    /// argument limit.
+    fn api_post(
+        &self,
+        repository: &Path,
+        endpoint: &str,
+        payload: &serde_json::Value,
+    ) -> Result<Vec<u8>, GithubError> {
+        let body = serde_json::to_vec(payload)?;
+        let mut child = Command::new(&self.gh_executable)
+            .current_dir(repository)
+            .args([
+                "api",
+                "--method",
+                "POST",
+                endpoint,
+                "--input",
+                "-",
+                "-H",
+                "Accept: application/vnd.github+json",
+                "-H",
+                "X-GitHub-Api-Version: 2022-11-28",
+            ])
+            .env("GH_PROMPT_DISABLED", "1")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|source| execution_error(repository, source))?;
+
+        child
+            .stdin
+            .take()
+            .ok_or_else(|| {
+                execution_error(
+                    repository,
+                    std::io::Error::other("gh stdin was not available"),
+                )
+            })?
+            .write_all(&body)
+            .map_err(|source| execution_error(repository, source))?;
+
+        let output = child
+            .wait_with_output()
+            .map_err(|source| execution_error(repository, source))?;
+        Ok(successful_output(output)?.stdout)
+    }
+
     /// Runs one `gh api` call and returns its stdout.
     ///
     /// Arguments are passed as an array so no shell is involved, and the REST API
@@ -410,6 +503,57 @@ struct ApiPullRequestRef {
 #[derive(Debug, Deserialize)]
 struct ApiRepository {
     full_name: String,
+}
+
+/// A review the forge accepted.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SubmittedReview {
+    pub id: u64,
+    pub state: String,
+    pub url: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ApiReview {
+    id: u64,
+    state: String,
+    html_url: String,
+}
+
+/// Builds the exact request body GitHub's create-review endpoint expects.
+///
+/// `commit_id` pins the review, so the forge itself rejects it if the head moved
+/// between the check above and this call. `event` is always present: omitting it
+/// would leave a pending review on the forge, which PLAN rules out.
+///
+/// `line` and `side` are used rather than the closing-down `position` parameter.
+fn review_payload(submission: &ReviewSubmission) -> serde_json::Value {
+    let comments = submission
+        .comments
+        .iter()
+        .map(|comment| {
+            serde_json::json!({
+                "path": comment.path.as_ref(),
+                "line": comment.line,
+                "side": comment.side.github_value(),
+                "body": comment.body,
+            })
+        })
+        .collect::<Vec<_>>();
+
+    let mut payload = serde_json::json!({
+        "commit_id": submission.head_sha.as_ref(),
+        "event": submission.event.github_value(),
+    });
+    // An approval may legitimately have no body, and sending an empty string is
+    // not the same as sending nothing.
+    if !submission.body.is_empty() {
+        payload["body"] = serde_json::Value::String(submission.body.clone());
+    }
+    if !comments.is_empty() {
+        payload["comments"] = serde_json::Value::Array(comments);
+    }
+    payload
 }
 
 #[derive(Debug, Deserialize)]
@@ -937,6 +1081,169 @@ mod tests {
 
     fn exit_status_one() -> std::process::ExitStatus {
         Command::new("sh").args(["-c", "exit 1"]).status().unwrap()
+    }
+
+    fn submission(event: domain::ReviewEvent, body: &str) -> ReviewSubmission {
+        ReviewSubmission {
+            head_sha: HEAD_SHA.into(),
+            event,
+            body: body.to_owned(),
+            comments: vec![
+                domain::SubmittableComment {
+                    path: "src/review.rs".into(),
+                    side: DiffSide::Right,
+                    line: 11,
+                    body: "needs a test".to_owned(),
+                },
+                domain::SubmittableComment {
+                    path: "src/review.rs".into(),
+                    side: DiffSide::Left,
+                    line: 6,
+                    body: "why was this removed?".to_owned(),
+                },
+            ],
+            excluded: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn the_payload_pins_the_head_and_uses_line_and_side() {
+        let payload = review_payload(&submission(domain::ReviewEvent::Comment, "Two notes."));
+
+        assert_eq!(payload["commit_id"], HEAD_SHA);
+        assert_eq!(payload["event"], "COMMENT");
+        assert_eq!(payload["body"], "Two notes.");
+
+        let comments = payload["comments"].as_array().unwrap();
+        assert_eq!(comments.len(), 2);
+        assert_eq!(comments[0]["path"], "src/review.rs");
+        assert_eq!(comments[0]["line"], 11);
+        assert_eq!(comments[0]["side"], "RIGHT");
+        assert_eq!(comments[0]["body"], "needs a test");
+        assert_eq!(comments[1]["side"], "LEFT");
+
+        // `position` is the parameter GitHub is retiring; it must not appear.
+        assert!(
+            comments
+                .iter()
+                .all(|comment| comment.get("position").is_none())
+        );
+    }
+
+    /// An approval with no body must send no `body` key at all: an empty string is
+    /// not the same as absent, and GitHub only permits the latter.
+    #[test]
+    fn an_approval_without_a_body_omits_the_key() {
+        let payload = review_payload(&submission(domain::ReviewEvent::Approve, ""));
+
+        assert_eq!(payload["event"], "APPROVE");
+        assert!(payload.get("body").is_none());
+    }
+
+    #[test]
+    fn a_review_with_no_inline_comments_omits_the_comments_key() {
+        let mut only_summary = submission(domain::ReviewEvent::Comment, "Just a note.");
+        only_summary.comments.clear();
+        let payload = review_payload(&only_summary);
+
+        assert!(payload.get("comments").is_none());
+        assert_eq!(payload["body"], "Just a note.");
+    }
+
+    #[test]
+    fn submitting_sends_the_payload_on_stdin_and_reads_the_response() {
+        let directory = TempDir::new().unwrap();
+        let gh = directory.path().join("gh");
+        let captured = directory.path().join("captured.json");
+        write_fake_submit_gh(&gh, &captured, HEAD_SHA);
+        let locator = PullRequestLocator {
+            repository: RepositorySlug::new("acme", "widgets"),
+            number: 42,
+        };
+
+        let submitted = GithubClient::new(&gh)
+            .submit_review(
+                directory.path(),
+                &locator,
+                &submission(domain::ReviewEvent::RequestChanges, "Two notes."),
+            )
+            .unwrap();
+
+        assert_eq!(submitted.id, 909);
+        assert_eq!(submitted.state, "CHANGES_REQUESTED");
+        assert!(submitted.url.contains("acme/widgets"));
+
+        // The body reached gh over stdin, not as an argument.
+        let sent: serde_json::Value =
+            serde_json::from_slice(&fs::read(&captured).unwrap()).unwrap();
+        assert_eq!(sent["event"], "REQUEST_CHANGES");
+        assert_eq!(sent["commit_id"], HEAD_SHA);
+        assert_eq!(sent["comments"].as_array().unwrap().len(), 2);
+    }
+
+    /// The guard that stops a review being attached to code the author has already
+    /// replaced.
+    #[test]
+    fn submitting_is_refused_when_the_head_has_moved() {
+        let directory = TempDir::new().unwrap();
+        let gh = directory.path().join("gh");
+        let captured = directory.path().join("captured.json");
+        // The pull request now reports a different head than the snapshot's.
+        write_fake_submit_gh(&gh, &captured, BASE_SHA);
+        let locator = PullRequestLocator {
+            repository: RepositorySlug::new("acme", "widgets"),
+            number: 42,
+        };
+
+        let error = GithubClient::new(&gh)
+            .submit_review(
+                directory.path(),
+                &locator,
+                &submission(domain::ReviewEvent::Comment, "Two notes."),
+            )
+            .unwrap_err();
+
+        assert!(
+            matches!(&error, GithubError::HeadMoved { expected, actual }
+                if expected == HEAD_SHA && actual == BASE_SHA),
+            "unexpected error: {error}",
+        );
+        assert!(error.remediation().unwrap().contains("Reload"));
+        // Nothing was posted.
+        assert!(!captured.exists(), "the review must not have been sent");
+    }
+
+    /// Answers the metadata read with `head_sha`, then records any POST body.
+    fn write_fake_submit_gh(path: &Path, captured: &Path, head_sha: &str) {
+        let body = format!(
+            r#"#!/bin/sh
+if [ "$1" = "auth" ]; then exit 0; fi
+if [ "$3" = "GET" ]; then
+cat <<'JSON'
+{{
+  "number": 42,
+  "title": "Improve the review flow",
+  "html_url": "https://github.com/acme/widgets/pull/42",
+  "state": "open",
+  "draft": false,
+  "base": {{"ref": "main", "sha": "{BASE_SHA}", "repo": {{"full_name": "acme/widgets"}}}},
+  "head": {{"ref": "feature/review", "sha": "{head_sha}", "repo": {{"full_name": "acme/widgets"}}}}
+}}
+JSON
+  exit 0
+fi
+if [ "$3" != "POST" ] || [ "$4" != "repos/acme/widgets/pulls/42/reviews" ]; then
+  echo "unexpected gh arguments: $*" >&2
+  exit 64
+fi
+cat > "{captured}"
+cat <<'JSON'
+{{"id": 909, "state": "CHANGES_REQUESTED", "html_url": "https://github.com/acme/widgets/pull/42#pullrequestreview-909"}}
+JSON
+"#,
+            captured = captured.display(),
+        );
+        write_executable(path, &body);
     }
 
     #[test]

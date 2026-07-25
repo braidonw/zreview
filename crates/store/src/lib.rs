@@ -23,7 +23,7 @@ use rusqlite::Connection;
 use thiserror::Error;
 
 /// The schema version this build expects.
-const SCHEMA_VERSION: i64 = 1;
+const SCHEMA_VERSION: i64 = 2;
 
 #[derive(Debug, Error)]
 pub enum StoreError {
@@ -130,6 +130,20 @@ impl DraftStore {
                 .map_err(StoreError::Migrate)?;
         }
 
+        if version < 2 {
+            self.connection
+                .execute_batch(
+                    "CREATE TABLE review_summaries (
+                        scope      TEXT    NOT NULL,
+                        head_sha   TEXT    NOT NULL,
+                        body       TEXT    NOT NULL,
+                        updated_at INTEGER NOT NULL,
+                        PRIMARY KEY (scope, head_sha)
+                    ) STRICT;",
+                )
+                .map_err(StoreError::Migrate)?;
+        }
+
         if version < SCHEMA_VERSION {
             self.connection
                 .pragma_update(None, "user_version", SCHEMA_VERSION)
@@ -214,6 +228,89 @@ impl DraftStore {
         Ok(())
     }
 
+    /// The saved review summary for a snapshot, if one was written.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::Read`] when the row cannot be read.
+    pub fn load_summary(&self, scope: &str, head_sha: &str) -> Result<Option<String>, StoreError> {
+        self.connection
+            .query_row(
+                "SELECT body FROM review_summaries WHERE scope = ?1 AND head_sha = ?2",
+                rusqlite::params![scope, head_sha],
+                |row| row.get(0),
+            )
+            .map_or_else(
+                |error| match error {
+                    rusqlite::Error::QueryReturnedNoRows => Ok(None),
+                    other => Err(StoreError::Read(other)),
+                },
+                |body: String| Ok(Some(body)),
+            )
+    }
+
+    /// Writes the review summary for a snapshot, replacing any earlier one.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::Write`] when the row cannot be written.
+    pub fn upsert_summary(
+        &self,
+        scope: &str,
+        head_sha: &str,
+        body: &str,
+    ) -> Result<(), StoreError> {
+        self.connection
+            .execute(
+                "INSERT INTO review_summaries (scope, head_sha, body, updated_at)
+                 VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT (scope, head_sha)
+                 DO UPDATE SET body = excluded.body, updated_at = excluded.updated_at",
+                rusqlite::params![scope, head_sha, body, epoch_seconds()],
+            )
+            .map_err(StoreError::Write)?;
+        Ok(())
+    }
+
+    /// Removes everything a submitted review consumed: its drafts and its summary.
+    ///
+    /// One transaction, so a crash midway cannot leave the summary behind without
+    /// the comments it belonged to.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::Write`] when the rows cannot be removed.
+    pub fn clear_submitted(
+        &mut self,
+        scope: &str,
+        head_sha: &str,
+        anchors: &[DiffAnchor],
+    ) -> Result<(), StoreError> {
+        let transaction = self.connection.transaction().map_err(StoreError::Write)?;
+        for anchor in anchors {
+            transaction
+                .execute(
+                    "DELETE FROM drafts
+                     WHERE scope = ?1 AND head_sha = ?2 AND path = ?3 AND side = ?4 AND line = ?5",
+                    rusqlite::params![
+                        scope,
+                        anchor.head_sha.as_ref(),
+                        anchor.path.as_ref(),
+                        anchor.side.github_value(),
+                        i64::from(anchor.line),
+                    ],
+                )
+                .map_err(StoreError::Write)?;
+        }
+        transaction
+            .execute(
+                "DELETE FROM review_summaries WHERE scope = ?1 AND head_sha = ?2",
+                rusqlite::params![scope, head_sha],
+            )
+            .map_err(StoreError::Write)?;
+        transaction.commit().map_err(StoreError::Write)
+    }
+
     /// Removes the draft at an anchor.
     ///
     /// # Errors
@@ -250,8 +347,21 @@ pub fn default_database_path() -> Result<PathBuf, StoreError> {
 }
 
 enum Command {
-    Upsert { anchor: DiffAnchor, body: String },
-    Delete { anchor: DiffAnchor },
+    Upsert {
+        anchor: DiffAnchor,
+        body: String,
+    },
+    Delete {
+        anchor: DiffAnchor,
+    },
+    Summary {
+        head_sha: String,
+        body: String,
+    },
+    ClearSubmitted {
+        head_sha: String,
+        anchors: Vec<DiffAnchor>,
+    },
 }
 
 /// Writes draft changes on its own thread.
@@ -277,11 +387,18 @@ impl DraftWriter {
         let thread = std::thread::Builder::new()
             .name("zreview-draft-writer".to_owned())
             .spawn(move || {
+                let mut store = store;
                 // Ends when the sender is dropped, which is how the writer stops.
                 for command in receiver {
                     let result = match &command {
                         Command::Upsert { anchor, body } => store.upsert(&scope, anchor, body),
                         Command::Delete { anchor } => store.delete(&scope, anchor),
+                        Command::Summary { head_sha, body } => {
+                            store.upsert_summary(&scope, head_sha, body)
+                        }
+                        Command::ClearSubmitted { head_sha, anchors } => {
+                            store.clear_submitted(&scope, head_sha, anchors)
+                        }
                     };
                     let mut recorded = lock(&thread_failure);
                     match result {
@@ -323,6 +440,20 @@ impl DraftSink for DraftWriter {
     fn discard(&self, anchor: &DiffAnchor) {
         self.send(Command::Delete {
             anchor: anchor.clone(),
+        });
+    }
+
+    fn save_summary(&self, head_sha: &str, body: &str) {
+        self.send(Command::Summary {
+            head_sha: head_sha.to_owned(),
+            body: body.to_owned(),
+        });
+    }
+
+    fn clear_submitted(&self, head_sha: &str, anchors: &[DiffAnchor]) {
+        self.send(Command::ClearSubmitted {
+            head_sha: head_sha.to_owned(),
+            anchors: anchors.to_vec(),
         });
     }
 

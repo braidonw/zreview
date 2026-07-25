@@ -31,6 +31,19 @@ pub trait DraftSink: Send + 'static {
     /// Records that the draft at an anchor is gone.
     fn discard(&self, anchor: &DiffAnchor);
 
+    /// Records the review summary for a snapshot.
+    ///
+    /// Keyed by head rather than by anchor, because the summary belongs to the
+    /// review as a whole rather than to any line.
+    fn save_summary(&self, head_sha: &str, body: &str);
+
+    /// Records that every draft at these anchors has been submitted and is no
+    /// longer local, along with the summary that went with them.
+    ///
+    /// Called only after a forge has accepted the review: until then the local
+    /// copy is the only copy.
+    fn clear_submitted(&self, head_sha: &str, anchors: &[DiffAnchor]);
+
     /// The most recent write failure, if writes are failing.
     fn failure(&self) -> Option<String>;
 }
@@ -112,6 +125,17 @@ impl Drafts {
     pub fn remove_at(&mut self, file: usize, row: usize) -> Option<DraftComment> {
         let key = self.by_row.remove(&(file, row))?;
         self.entries.remove(&key)
+    }
+
+    /// Removes an anchored draft by its anchor, keeping the row index consistent.
+    ///
+    /// Used after submission, when what to forget is known by position rather than
+    /// by row.
+    pub fn remove_anchored(&mut self, anchor: &DiffAnchor) -> Option<DraftComment> {
+        let key = DraftKey::of(anchor);
+        let removed = self.entries.remove(&key)?;
+        self.by_row.retain(|_, row_key| *row_key != key);
+        Some(removed)
     }
 
     /// Removes a stale draft by its old anchor, returning its text.

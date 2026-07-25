@@ -11,11 +11,16 @@ mod anchor;
 mod comment;
 mod draft;
 mod session;
+mod submission;
 
 pub use anchor::{AnchorError, AnchorIndex, AnchorLocation, DiffAnchor, DiffSide};
 pub use comment::{CommentThread, PlacedComments, ReviewComment, UnplacedReason, UnplacedThread};
 pub use draft::{DraftComment, DraftSink, Drafts};
 pub use session::{LoadStage, LoadedSession, SessionFailure};
+pub use submission::{
+    ExcludedDraft, ExclusionReason, ReviewEvent, ReviewSubmission, SubmissionRefused,
+    SubmittableComment,
+};
 
 /// The semantic role of one row in a unified diff.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -392,6 +397,7 @@ pub struct ReviewSession {
     comments: Arc<PlacedComments>,
     warnings: Vec<SessionFailure>,
     drafts: Arc<Drafts>,
+    summary: String,
 }
 
 impl ReviewSession {
@@ -416,7 +422,21 @@ impl ReviewSession {
             comments: Arc::new(PlacedComments::default()),
             warnings: Vec::new(),
             drafts: Arc::new(Drafts::default()),
+            summary: String::new(),
         })
+    }
+
+    /// The review body that accompanies the inline comments.
+    ///
+    /// GitHub requires one for a `COMMENT` or `REQUEST_CHANGES` review, and it is
+    /// the only place a remark that belongs to no single line can go.
+    #[must_use]
+    pub fn summary(&self) -> &str {
+        &self.summary
+    }
+
+    pub fn set_summary(&mut self, summary: impl Into<String>) {
+        self.summary = summary.into();
     }
 
     #[must_use]
@@ -499,6 +519,78 @@ impl ReviewSession {
     #[must_use]
     pub fn draft_at(&self, file: usize, row: usize) -> Option<&DraftComment> {
         self.drafts.at(file, row)
+    }
+
+    /// Assembles the review that submitting would post.
+    ///
+    /// Every draft is re-resolved against the snapshot as it is added, so a
+    /// position the forge would reject cannot reach the request even if the draft
+    /// was valid when it was written. Drafts that no longer resolve are returned
+    /// as excluded rather than dropped, because a reviewer who is told nothing
+    /// would believe they had submitted them.
+    ///
+    /// Building is separate from sending so the result can be shown to a human
+    /// first. Nothing here contacts a forge.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SubmissionRefused`] when the session is not a pull request, there
+    /// is nothing to say, or the event needs a summary that is missing.
+    pub fn prepare_submission(
+        &self,
+        event: ReviewEvent,
+    ) -> Result<ReviewSubmission, SubmissionRefused> {
+        let (Some(head_sha), Some(anchors)) = (self.source.head_sha(), self.anchors.as_ref())
+        else {
+            return Err(SubmissionRefused::NotSubmittable);
+        };
+
+        let mut comments = Vec::new();
+        let mut excluded = Vec::new();
+        for draft in self.drafts.iter() {
+            if anchors.resolve(&draft.anchor).is_ok() {
+                comments.push(SubmittableComment {
+                    path: Arc::clone(&draft.anchor.path),
+                    side: draft.anchor.side,
+                    line: draft.anchor.line,
+                    body: draft.body.clone(),
+                });
+            } else {
+                excluded.push(ExcludedDraft {
+                    draft: draft.clone(),
+                    reason: ExclusionReason::NotAnchored,
+                });
+            }
+        }
+
+        let body = self.summary.trim().to_owned();
+        if comments.is_empty() && body.is_empty() {
+            return Err(SubmissionRefused::Empty);
+        }
+        if event.requires_body() && body.is_empty() {
+            return Err(SubmissionRefused::BodyRequired(event));
+        }
+
+        Ok(ReviewSubmission {
+            head_sha: Arc::clone(head_sha),
+            event,
+            body,
+            comments,
+            excluded,
+        })
+    }
+
+    /// Forgets the drafts a forge has accepted, and the summary that went with
+    /// them.
+    ///
+    /// Called only after a successful response. Excluded drafts are deliberately
+    /// left alone: they were not posted, so they are still the only copy.
+    pub fn mark_submitted(&mut self, submission: &ReviewSubmission) {
+        let drafts = Arc::make_mut(&mut self.drafts);
+        for anchor in submission.submitted_anchors() {
+            drafts.remove_anchored(&anchor);
+        }
+        self.summary.clear();
     }
 
     /// Restores drafts written in an earlier session, reporting how many could no
@@ -1106,6 +1198,148 @@ mod tests {
 
         assert_eq!(session.draft_at(0, 0).unwrap().body, "an ordinary draft");
         assert_eq!(session.drafts().len(), 1);
+    }
+
+    #[test]
+    fn a_submission_carries_every_anchored_draft_and_the_summary() {
+        let mut session = anchored_session();
+        // Row 5 of the fixture is a deletion and row 6 an addition, so these are
+        // the same line number on opposite sides.
+        session.set_draft(0, 5, "why was this removed?");
+        session.set_draft(0, 6, "needs a test");
+        session.set_summary("  Close, two notes.  ");
+
+        let submission = session.prepare_submission(ReviewEvent::Comment).unwrap();
+
+        assert_eq!(submission.event, ReviewEvent::Comment);
+        assert_eq!(submission.head_sha.as_ref(), "h".repeat(40));
+        // Trimmed, since a body of whitespace is not a body.
+        assert_eq!(submission.body, "Close, two notes.");
+        // In reading order, which is how they will be posted.
+        assert_eq!(
+            submission
+                .comments
+                .iter()
+                .map(|comment| (comment.line, comment.side, comment.body.as_str()))
+                .collect::<Vec<_>>(),
+            [
+                (6, DiffSide::Left, "why was this removed?"),
+                (6, DiffSide::Right, "needs a test"),
+            ],
+        );
+        assert!(submission.excluded.is_empty());
+    }
+
+    /// A stale draft must never be silently posted at a position the forge would
+    /// reject, and must never be silently dropped either.
+    #[test]
+    fn a_stale_draft_is_excluded_from_the_submission_and_reported() {
+        let mut session = anchored_session();
+        session.set_draft(0, 6, "will be posted");
+        session.restore_drafts([(stale_anchor(), "will not be posted".to_owned())]);
+        session.set_summary("Some notes.");
+
+        let submission = session.prepare_submission(ReviewEvent::Comment).unwrap();
+
+        assert_eq!(submission.comments.len(), 1);
+        assert_eq!(submission.comments[0].body, "will be posted");
+        assert_eq!(submission.excluded.len(), 1);
+        assert_eq!(submission.excluded[0].draft.body, "will not be posted");
+        assert_eq!(submission.excluded[0].reason, ExclusionReason::NotAnchored);
+    }
+
+    #[test]
+    fn an_approval_needs_no_summary_but_the_other_events_do() {
+        let mut session = anchored_session();
+        session.set_draft(0, 6, "one note");
+
+        // GitHub accepts an approval with no body.
+        assert!(session.prepare_submission(ReviewEvent::Approve).is_ok());
+
+        assert_eq!(
+            session
+                .prepare_submission(ReviewEvent::Comment)
+                .unwrap_err(),
+            SubmissionRefused::BodyRequired(ReviewEvent::Comment),
+        );
+        assert_eq!(
+            session
+                .prepare_submission(ReviewEvent::RequestChanges)
+                .unwrap_err(),
+            SubmissionRefused::BodyRequired(ReviewEvent::RequestChanges),
+        );
+
+        session.set_summary("Two things.");
+        assert!(session.prepare_submission(ReviewEvent::Comment).is_ok());
+    }
+
+    #[test]
+    fn a_review_with_nothing_in_it_is_refused() {
+        let session = anchored_session();
+
+        for event in [
+            ReviewEvent::Comment,
+            ReviewEvent::Approve,
+            ReviewEvent::RequestChanges,
+        ] {
+            assert_eq!(
+                session.prepare_submission(event).unwrap_err(),
+                SubmissionRefused::Empty,
+                "an empty review should be refused for {event}",
+            );
+        }
+    }
+
+    /// A submission whose only drafts are stale would post nothing inline, so it
+    /// still needs a summary to be worth sending.
+    #[test]
+    fn a_submission_of_only_stale_drafts_needs_a_summary() {
+        let mut session = anchored_session();
+        session.restore_drafts([(stale_anchor(), "cannot be posted".to_owned())]);
+
+        assert_eq!(
+            session
+                .prepare_submission(ReviewEvent::Approve)
+                .unwrap_err(),
+            SubmissionRefused::Empty,
+        );
+
+        session.set_summary("Approving despite the stale note.");
+        let submission = session.prepare_submission(ReviewEvent::Approve).unwrap();
+        assert!(submission.comments.is_empty());
+        assert_eq!(submission.excluded.len(), 1);
+    }
+
+    #[test]
+    fn a_session_that_is_not_a_pull_request_cannot_be_submitted() {
+        let mut session =
+            ReviewSession::new(SessionSource::Demo, vec![DiffFile::demo(20)].into()).unwrap();
+        session.set_summary("Nowhere to send this.");
+
+        assert_eq!(
+            session
+                .prepare_submission(ReviewEvent::Comment)
+                .unwrap_err(),
+            SubmissionRefused::NotSubmittable,
+        );
+    }
+
+    /// Only what was actually posted is forgotten. An excluded draft is still the
+    /// only copy of its text.
+    #[test]
+    fn marking_submitted_forgets_the_posted_drafts_and_keeps_the_rest() {
+        let mut session = anchored_session();
+        session.set_draft(0, 6, "posted");
+        session.restore_drafts([(stale_anchor(), "not posted".to_owned())]);
+        session.set_summary("A summary.");
+        let submission = session.prepare_submission(ReviewEvent::Comment).unwrap();
+
+        session.mark_submitted(&submission);
+
+        assert!(session.draft_at(0, 6).is_none(), "the posted draft is gone");
+        assert_eq!(session.drafts().len(), 1, "the stale one remains");
+        assert_eq!(session.drafts().stale_count(), 1);
+        assert_eq!(session.summary(), "", "the summary went with the review");
     }
 
     #[test]
