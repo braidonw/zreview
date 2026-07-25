@@ -26,6 +26,11 @@ use globset::{Glob, GlobSetBuilder};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
+mod agent;
+pub mod material;
+
+pub use agent::{Agent, CodingAgent, DEFAULT_TIMEOUT};
+
 /// Guidance filenames looked for by convention, in the order they are reported.
 const CONVENTIONAL_NAMES: &[&str] = &[
     "AGENTS.md",

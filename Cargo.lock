@@ -4438,8 +4438,10 @@ dependencies = [
 name = "review"
 version = "0.1.0"
 dependencies = [
+ "domain",
  "globset",
  "serde",
+ "serde_json",
  "sha2 0.11.0",
  "tempfile",
  "thiserror 2.0.19",
