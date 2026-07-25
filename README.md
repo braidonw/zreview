@@ -75,7 +75,9 @@ A review is submitted as one batch, verified end to end against a real pull requ
 
 The comment field is a real multi-line text editor: a caret you can move, selection, grapheme-aware movement and deletion, cut/copy/paste, and input-method composition for languages that need it. Positioning the caret with the mouse is not supported yet — use the keyboard.
 
-It does not yet persist anything besides drafts and the summary, provide syntax highlighting, or run an AI review backend.
+Repository review guidance is discovered when a snapshot opens — `AGENTS.md`, `CLAUDE.md`, `CONTRIBUTING.md`, style guides, `.github/copilot-instructions.md`, nested per-directory instructions, path-scoped `.github/instructions/*.instructions.md`, and anything named by `.zreview.toml`. Discovery is read-only: it reads files and never executes anything, because finding a repository's guidance is not consent to run its commands. Every file found is reported with its scope, and every file skipped with the reason.
+
+It does not yet show the guidance panel, persist anything besides drafts and the summary, provide syntax highlighting, or run an AI review backend.
 
 ## License
 
