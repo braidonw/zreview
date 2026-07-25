@@ -92,8 +92,6 @@ that editor needed — and its limitations.
 - **Nothing has been submitted to a real pull request.** Every layer is tested
   against fakes and the payload is checked against the documented schema, but the
   first real `POST` has not happened. That is the one thing left to verify.
-- No multiline comment ranges, so a draft is always a single line. GitHub's
-  `start_line`/`start_side` are unused.
 - Submission cannot be cancelled once sending starts.
 - A submitted review does not appear in the diff as a published thread until the
   session is reopened.

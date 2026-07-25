@@ -53,6 +53,7 @@ impl ReviewComment {
             path: Arc::clone(&self.path),
             side: self.side,
             line: self.line?,
+            start_line: None,
             head_sha: Arc::clone(head_sha),
         })
     }

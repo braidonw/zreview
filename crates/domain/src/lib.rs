@@ -2,7 +2,7 @@ use std::{
     collections::BTreeSet,
     error::Error,
     fmt::{Display, Formatter},
-    ops::Range,
+    ops::{Range, RangeInclusive},
     path::PathBuf,
     sync::Arc,
 };
@@ -460,23 +460,60 @@ impl ReviewSession {
         anchors.anchor_for_row(self.files.get(file)?, row)
     }
 
+    /// The anchor covering a span of displayed rows.
+    ///
+    /// Collapses to a single-line anchor when the span is one row, so an ordinary
+    /// comment is never submitted as a one-line range.
+    #[must_use]
+    pub fn anchor_for_span(&self, file: usize, rows: RangeInclusive<usize>) -> Option<DiffAnchor> {
+        let anchors = self.anchors.as_ref()?;
+        anchors.anchor_for_rows(self.files.get(file)?, *rows.start(), *rows.end())
+    }
+
+    /// Creates or replaces the draft covering a span of displayed rows.
+    ///
+    /// The draft is keyed by the span's last line, which is where GitHub anchors a
+    /// range and where it is drawn — so turning a single-line draft into a range
+    /// edits the same draft rather than creating a second one beside it.
+    ///
+    /// Returns `false` when the span cannot carry a comment, including when its
+    /// ends fall in different hunks.
+    pub fn set_draft_over(
+        &mut self,
+        file: usize,
+        rows: RangeInclusive<usize>,
+        body: impl Into<String>,
+    ) -> bool {
+        let Some(anchor) = self.anchor_for_span(file, rows.clone()) else {
+            return false;
+        };
+        // A range must be submittable, not merely constructible.
+        if self
+            .anchors
+            .as_ref()
+            .is_none_or(|anchors| anchors.resolve(&anchor).is_err())
+        {
+            return false;
+        }
+
+        let body = body.into();
+        let end_row = *rows.end();
+        let drafts = Arc::make_mut(&mut self.drafts);
+        if body.trim().is_empty() {
+            drafts.remove_at(file, end_row);
+        } else {
+            drafts.insert(anchor, body, file, end_row);
+        }
+        true
+    }
+
     /// Creates or replaces the draft on a displayed row.
     ///
     /// An empty body removes the draft instead of storing a comment with nothing
     /// in it. Returns `false` when the row cannot carry a comment, which is the
     /// caller's signal not to offer a composer there at all.
     pub fn set_draft(&mut self, file: usize, row: usize, body: impl Into<String>) -> bool {
-        let Some(anchor) = self.anchor_for(file, row) else {
-            return false;
-        };
-        let body = body.into();
-        let drafts = Arc::make_mut(&mut self.drafts);
-        if body.trim().is_empty() {
-            drafts.remove_at(file, row);
-        } else {
-            drafts.insert(anchor, body, file, row);
-        }
-        true
+        self.set_draft_over(file, row..=row, body)
     }
 
     /// Discards the draft on a row, if there is one.
@@ -553,6 +590,13 @@ impl ReviewSession {
                     path: Arc::clone(&draft.anchor.path),
                     side: draft.anchor.side,
                     line: draft.anchor.line,
+                    // Only a genuine span becomes a range; a start equal to the
+                    // end would make GitHub reject an otherwise valid comment.
+                    start_line: draft
+                        .anchor
+                        .is_multiline()
+                        .then_some(draft.anchor.start_line)
+                        .flatten(),
                     body: draft.body.clone(),
                 });
             } else {
@@ -1076,6 +1120,7 @@ mod tests {
             path: "src/review.rs".into(),
             side: DiffSide::Right,
             line: 9_999,
+            start_line: None,
             head_sha: "h".repeat(40).into(),
         };
 
@@ -1111,6 +1156,7 @@ mod tests {
             path: "src/review.rs".into(),
             side: DiffSide::Right,
             line: 9_999,
+            start_line: None,
             head_sha: "h".repeat(40).into(),
         }
     }
@@ -1340,6 +1386,95 @@ mod tests {
         assert_eq!(session.drafts().len(), 1, "the stale one remains");
         assert_eq!(session.drafts().stale_count(), 1);
         assert_eq!(session.summary(), "", "the summary went with the review");
+    }
+
+    /// A range draft has to survive the whole path: created over a span, keyed at
+    /// its last row, and submitted with both range fields.
+    #[test]
+    fn a_range_draft_is_created_keyed_and_submitted_as_one_comment() {
+        let mut session = anchored_session();
+
+        // Rows 0..=4 of the fixture are context lines in one hunk, so the span is
+        // a right-side range.
+        assert!(session.set_draft_over(0, 0..=4, "this whole block needs a test"));
+
+        let draft = session
+            .draft_at(0, 4)
+            .expect("a range is keyed at its last row");
+        assert!(draft.anchor.is_multiline());
+        assert_eq!(draft.anchor.start_line, Some(1));
+        assert_eq!(draft.anchor.line, 5);
+        assert_eq!(session.drafts().len(), 1);
+
+        session.set_summary("One note.");
+        let submission = session.prepare_submission(ReviewEvent::Comment).unwrap();
+        assert_eq!(submission.comments.len(), 1);
+        assert_eq!(submission.comments[0].start_line, Some(1));
+        assert_eq!(submission.comments[0].line, 5);
+    }
+
+    /// Extending a selection over a line that already has a comment edits that
+    /// comment rather than creating a rival beside it.
+    #[test]
+    fn widening_a_draft_into_a_range_replaces_it() {
+        let mut session = anchored_session();
+        session.set_draft(0, 4, "just this line");
+
+        assert!(session.set_draft_over(0, 0..=4, "actually this whole block"));
+
+        assert_eq!(session.drafts().len(), 1, "one draft, now a range");
+        let draft = session.draft_at(0, 4).unwrap();
+        assert_eq!(draft.body, "actually this whole block");
+        assert!(draft.anchor.is_multiline());
+    }
+
+    #[test]
+    fn a_single_row_span_stays_a_single_line_draft() {
+        let mut session = anchored_session();
+        session.set_draft_over(0, 6..=6, "one line");
+
+        let draft = session.draft_at(0, 6).unwrap();
+        assert_eq!(draft.anchor.start_line, None);
+        assert!(!draft.anchor.is_multiline());
+    }
+
+    /// A span whose ends fall in different hunks is refused, not silently
+    /// truncated to something submittable.
+    #[test]
+    fn a_span_crossing_hunks_is_refused() {
+        let source = SessionSource::LocalComparison {
+            repository_root: PathBuf::from("/tmp/repository"),
+            base_sha: "b".repeat(40).into(),
+            diff_base_sha: "d".repeat(40).into(),
+            head_sha: "h".repeat(40).into(),
+        };
+        let mut file = DiffFile::demo(8);
+        file.path = "src/review.rs".into();
+        // Split the file into two hunks so a span can cross them.
+        file.hunks = vec![
+            DiffHunk {
+                header: "@@ -1,4 +1,4 @@".into(),
+                old_start: 1,
+                new_start: 1,
+                line_range: 0..4,
+            },
+            DiffHunk {
+                header: "@@ -40,4 +40,4 @@".into(),
+                old_start: 40,
+                new_start: 40,
+                line_range: 4..8,
+            },
+        ]
+        .into();
+        let mut session = ReviewSession::new(source, vec![file].into()).unwrap();
+
+        assert!(
+            !session.set_draft_over(0, 0..=4, "spans two hunks"),
+            "a span crossing hunks cannot be submitted, so it is refused",
+        );
+        assert!(session.drafts().is_empty());
+        // Either hunk on its own is fine.
+        assert!(session.set_draft_over(0, 0..=3, "within the first hunk"));
     }
 
     #[test]

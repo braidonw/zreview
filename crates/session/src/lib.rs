@@ -570,6 +570,7 @@ mod tests {
                         path: "feature.txt".into(),
                         side: domain::DiffSide::Right,
                         line: 1,
+                        start_line: None,
                         head_sha: "0".repeat(40).into(),
                     },
                     "written before the branch moved",

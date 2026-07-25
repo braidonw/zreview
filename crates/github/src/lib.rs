@@ -532,12 +532,19 @@ fn review_payload(submission: &ReviewSubmission) -> serde_json::Value {
         .comments
         .iter()
         .map(|comment| {
-            serde_json::json!({
+            let mut json = serde_json::json!({
                 "path": comment.path.as_ref(),
                 "line": comment.line,
                 "side": comment.side.github_value(),
                 "body": comment.body,
-            })
+            });
+            // GitHub requires both range fields together. The start side always
+            // matches, because a range across revisions is never built.
+            if let Some(start_line) = comment.start_line {
+                json["start_line"] = start_line.into();
+                json["start_side"] = comment.side.github_value().into();
+            }
+            json
         })
         .collect::<Vec<_>>();
 
@@ -1093,12 +1100,14 @@ mod tests {
                     path: "src/review.rs".into(),
                     side: DiffSide::Right,
                     line: 11,
+                    start_line: None,
                     body: "needs a test".to_owned(),
                 },
                 domain::SubmittableComment {
                     path: "src/review.rs".into(),
                     side: DiffSide::Left,
                     line: 6,
+                    start_line: None,
                     body: "why was this removed?".to_owned(),
                 },
             ],
@@ -1128,6 +1137,30 @@ mod tests {
                 .iter()
                 .all(|comment| comment.get("position").is_none())
         );
+        // No range on these, so neither range field is sent.
+        assert!(
+            comments
+                .iter()
+                .all(|comment| comment.get("start_line").is_none()
+                    && comment.get("start_side").is_none())
+        );
+    }
+
+    /// GitHub requires `start_line` and `start_side` together, and the start side
+    /// always matches because a range across revisions is never built.
+    #[test]
+    fn a_range_comment_sends_both_range_fields() {
+        let mut ranged = submission(domain::ReviewEvent::Comment, "One note.");
+        ranged.comments.truncate(1);
+        ranged.comments[0].start_line = Some(8);
+
+        let payload = review_payload(&ranged);
+        let comment = &payload["comments"][0];
+
+        assert_eq!(comment["start_line"], 8);
+        assert_eq!(comment["line"], 11);
+        assert_eq!(comment["side"], "RIGHT");
+        assert_eq!(comment["start_side"], "RIGHT");
     }
 
     /// An approval with no body must send no `body` key at all: an empty string is

@@ -39,7 +39,8 @@ Controls:
 
 - `j` / `↓`: select the next line
 - `k` / `↑`: select the previous line
-- `c`: open the inline comment editor on the selected line, loading any draft already there
+- `⇧J` / `⇧K`: extend the selection to comment on a range of lines
+- `c`: open the inline comment editor on the selected line or range, loading any draft already there
 - `esc`: dismiss the inline comment editor, keeping the draft
 - `⌘C`: copy the selected line
 - `⇧⌘J` / `⇧⌘K`: select the next or previous changed file
@@ -67,7 +68,7 @@ Existing GitHub review conversations are loaded and rendered read-only inside th
 
 The window opens before any Git or GitHub work starts. Loading runs on a background executor and reports its stage, and a failure is shown in the app with the next action to take — `gh auth login` for an unauthenticated CLI, a link for a missing one, and so on — rather than printed to a terminal you may not be watching. Only argument errors are still reported on the command line.
 
-Comments you write become local drafts anchored to the line they are on, saved as you type into a bundled SQLite database under `~/Library/Application Support/ZReview`. They come back when you reopen the same pull request, including drafts written before the branch was pushed to — those are kept, listed against their file, and can be moved onto a line in the current diff rather than being discarded.
+Comments you write become local drafts anchored to the line or range of lines they are on, saved as you type into a bundled SQLite database under `~/Library/Application Support/ZReview`. They come back when you reopen the same pull request, including drafts written before the branch was pushed to — those are kept, listed against their file, and can be moved onto a line in the current diff rather than being discarded.
 
 A review is submitted as one batch. The bottom bar holds the summary and the three events — comment, approve, request changes — each of which opens a confirmation showing every inline comment, the summary, the pinned head commit, and anything that will *not* be posted. Nothing reaches GitHub until you approve that panel. The head is re-read first and the submission refused if the pull request moved on, and a failure leaves every draft exactly where it was.
 

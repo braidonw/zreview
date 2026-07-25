@@ -28,6 +28,19 @@ one.
 Drafts are ordered by path then line: the order a reviewer reads, and the order a
 submission should list them in.
 
+A draft may cover a range of lines. `⇧J`/`⇧K` extends the selection and the
+composer opens over it; the draft is keyed by the range's *last* line, which is
+where GitHub anchors a range and where it is drawn — so widening an existing
+comment into a range edits that comment rather than leaving a rival beside it. A
+one-row span stays a single-line draft, because sending `start_line == line` would
+have GitHub reject an otherwise valid comment.
+
+A range must be submittable, not merely selectable. Both ends must anchor on the
+same side, and both must sit in the same hunk: line numbers run contiguously within
+a hunk on each side, so matching hunks is what guarantees every line between them
+is in the diff too, which is GitHub's requirement. A span that fails either test is
+refused rather than quietly truncated to something that would go through.
+
 ## Never losing text
 
 A draft restored from an earlier session may no longer resolve. The diff genuinely
@@ -106,6 +119,9 @@ line, and came back non-stale on reopen with no warnings.
 
 ## Current limitations
 
+- A range cannot straddle both revisions. GitHub allows a separate `start_side`,
+  but a comment whose start and end are on different sides is far easier to create
+  by accident than to mean, so it is not offered.
 - Re-anchoring is one draft at a time, from the file's panel, and only onto the
   currently selected row. There is no way to move several at once.
 - The composer is still the prototype editor: append and backspace, no cursor, no

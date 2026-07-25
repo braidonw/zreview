@@ -71,8 +71,10 @@ impl Display for ReviewEvent {
 pub struct SubmittableComment {
     pub path: Arc<str>,
     pub side: DiffSide,
-    /// 1-based line on `side`.
+    /// 1-based line on `side`; the last line of a range.
     pub line: u32,
+    /// First line of a range, absent for a single-line comment.
+    pub start_line: Option<u32>,
     pub body: String,
 }
 
@@ -126,6 +128,7 @@ impl ReviewSubmission {
                 path: Arc::clone(&comment.path),
                 side: comment.side,
                 line: comment.line,
+                start_line: comment.start_line,
                 head_sha: Arc::clone(&self.head_sha),
             })
             .collect()
@@ -226,12 +229,14 @@ mod tests {
                     path: "src/a.rs".into(),
                     side: DiffSide::Right,
                     line: 4,
+                    start_line: None,
                     body: "one".to_owned(),
                 },
                 SubmittableComment {
                     path: "src/b.rs".into(),
                     side: DiffSide::Left,
                     line: 9,
+                    start_line: None,
                     body: "two".to_owned(),
                 },
             ],

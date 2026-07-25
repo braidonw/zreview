@@ -58,20 +58,54 @@ impl Display for DiffSide {
 
 /// A GitHub-submittable position in a reviewed file, pinned to one snapshot.
 ///
-/// Single-line only: PLAN defers multiline ranges until the single-line model is
-/// proven, so there is deliberately no `start_line` field to leave unvalidated.
-///
 /// `path` is always the file's path at head, which is what GitHub expects even
 /// for [`DiffSide::Left`] comments on a renamed file.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct DiffAnchor {
     pub path: Arc<str>,
     pub side: DiffSide,
-    /// 1-based line number on `side`.
+    /// 1-based line number on `side`. For a range, its last line — which is where
+    /// GitHub anchors the comment and where it is drawn.
     pub line: u32,
+    /// First line of a multi-line range.
+    ///
+    /// Always on the same side as `line` and never greater than it. Ranges that
+    /// straddle both sides are not offered: GitHub allows a separate `start_side`,
+    /// but a comment whose start and end are on different revisions is far easier
+    /// to create by accident than to mean.
+    pub start_line: Option<u32>,
     /// The head commit this anchor was created against. An anchor from an
     /// earlier head must never be silently reused against a newer one.
     pub head_sha: Arc<str>,
+}
+
+impl DiffAnchor {
+    /// An anchor on one line.
+    #[must_use]
+    pub fn single(path: Arc<str>, side: DiffSide, line: u32, head_sha: Arc<str>) -> Self {
+        Self {
+            path,
+            side,
+            line,
+            start_line: None,
+            head_sha,
+        }
+    }
+
+    /// Whether this anchor covers more than one line.
+    ///
+    /// A range whose start equals its end is a single line, not a one-line range,
+    /// so it reports `false` and submits without range fields.
+    #[must_use]
+    pub fn is_multiline(&self) -> bool {
+        self.start_line.is_some_and(|start| start < self.line)
+    }
+
+    /// The lines this anchor covers, first to last.
+    #[must_use]
+    pub fn line_span(&self) -> std::ops::RangeInclusive<u32> {
+        self.start_line.unwrap_or(self.line).min(self.line)..=self.line
+    }
 }
 
 /// Where a resolved anchor lands in the rendered session.
@@ -96,6 +130,15 @@ pub enum AnchorError {
         side: DiffSide,
         line: u32,
     },
+    /// A range that ends before it starts.
+    InvertedRange { start_line: u32, line: u32 },
+    /// A range whose ends fall in different hunks, so the lines between them are
+    /// not all part of the diff.
+    RangeCrossesHunks {
+        path: Arc<str>,
+        start_line: u32,
+        line: u32,
+    },
 }
 
 impl Display for AnchorError {
@@ -112,6 +155,18 @@ impl Display for AnchorError {
                 formatter,
                 "{path} {side} line {line} is not a displayed diff line"
             ),
+            Self::InvertedRange { start_line, line } => write!(
+                formatter,
+                "a comment range cannot start at line {start_line} and end at {line}"
+            ),
+            Self::RangeCrossesHunks {
+                path,
+                start_line,
+                line,
+            } => write!(
+                formatter,
+                "{path} lines {start_line} to {line} span more than one hunk, so the lines between them are not all in the diff"
+            ),
         }
     }
 }
@@ -125,6 +180,9 @@ struct FileAnchors {
     left: HashMap<u32, usize>,
     /// Head-revision line number to displayed row.
     right: HashMap<u32, usize>,
+    /// Which hunk each displayed row belongs to, so a range can be checked for
+    /// staying inside one.
+    hunk_of_row: Vec<usize>,
 }
 
 /// Bidirectional map between displayed diff rows and GitHub anchors, for exactly
@@ -148,7 +206,15 @@ impl AnchorIndex {
                 file: file_index,
                 left: HashMap::new(),
                 right: HashMap::new(),
+                hunk_of_row: vec![usize::MAX; file.lines.len()],
             };
+            for (hunk_index, hunk) in file.hunks.iter().enumerate() {
+                for row in hunk.line_range.clone() {
+                    if let Some(slot) = anchors.hunk_of_row.get_mut(row) {
+                        *slot = hunk_index;
+                    }
+                }
+            }
             for (row, line) in file.lines.iter().enumerate() {
                 if let Some(old_line) = line.old_line {
                     anchors.left.insert(old_line, row);
@@ -207,12 +273,12 @@ impl AnchorIndex {
             DiffLineKind::NoNewlineMarker => return None,
         };
 
-        Some(DiffAnchor {
-            path: file.path.clone(),
+        Some(DiffAnchor::single(
+            file.path.clone(),
             side,
-            line: number,
-            head_sha: Arc::clone(&self.head_sha),
-        })
+            number,
+            Arc::clone(&self.head_sha),
+        ))
     }
 
     /// Validates an anchor against this snapshot and locates its displayed row.
@@ -243,16 +309,81 @@ impl AnchorIndex {
             DiffSide::Right => &file.right,
         };
 
-        rows.get(&anchor.line)
-            .map(|row| AnchorLocation {
-                file: file.file,
-                row: *row,
-            })
+        let row = *rows
+            .get(&anchor.line)
             .ok_or_else(|| AnchorError::LineNotInDiff {
                 path: Arc::clone(&anchor.path),
                 side: anchor.side,
                 line: anchor.line,
-            })
+            })?;
+
+        // A range must start no later than it ends, and both ends must sit in the
+        // same hunk. Line numbers run contiguously within a hunk on each side, so
+        // matching hunks is enough to know every line between them is displayed
+        // too — which is what GitHub requires of a range.
+        if let Some(start_line) = anchor.start_line
+            && start_line != anchor.line
+        {
+            if start_line > anchor.line {
+                return Err(AnchorError::InvertedRange {
+                    start_line,
+                    line: anchor.line,
+                });
+            }
+            let start_row = *rows
+                .get(&start_line)
+                .ok_or_else(|| AnchorError::LineNotInDiff {
+                    path: Arc::clone(&anchor.path),
+                    side: anchor.side,
+                    line: start_line,
+                })?;
+            if file.hunk_of_row.get(start_row) != file.hunk_of_row.get(row) {
+                return Err(AnchorError::RangeCrossesHunks {
+                    path: Arc::clone(&anchor.path),
+                    start_line,
+                    line: anchor.line,
+                });
+            }
+        }
+
+        Ok(AnchorLocation {
+            file: file.file,
+            row,
+        })
+    }
+
+    /// The anchor covering two displayed rows, ordered so the earlier row starts
+    /// the range.
+    ///
+    /// Returns `None` unless both rows can carry a comment on the same side, which
+    /// is what makes a range submittable.
+    #[must_use]
+    pub fn anchor_for_rows(
+        &self,
+        file: &DiffFile,
+        first_row: usize,
+        second_row: usize,
+    ) -> Option<DiffAnchor> {
+        let (start_row, end_row) = if first_row <= second_row {
+            (first_row, second_row)
+        } else {
+            (second_row, first_row)
+        };
+        let end = self.anchor_for_row(file, end_row)?;
+        if start_row == end_row {
+            return Some(end);
+        }
+
+        // Both ends must anchor on the same side; a range across revisions is not
+        // offered.
+        let start = self.anchor_for_row(file, start_row)?;
+        if start.side != end.side {
+            return None;
+        }
+        Some(DiffAnchor {
+            start_line: Some(start.line),
+            ..end
+        })
     }
 
     /// Whether this anchor may become an inline GitHub review comment.
@@ -379,6 +510,7 @@ mod tests {
             path: "src/review.rs".into(),
             side: DiffSide::Left,
             line: 11,
+            start_line: None,
             head_sha: HEAD.into(),
         }));
 
@@ -387,6 +519,7 @@ mod tests {
             path: "src/review.rs".into(),
             side: DiffSide::Right,
             line: 81,
+            start_line: None,
             head_sha: HEAD.into(),
         }));
         let error = index
@@ -394,6 +527,7 @@ mod tests {
                 path: "src/review.rs".into(),
                 side: DiffSide::Left,
                 line: 81,
+                start_line: None,
                 head_sha: HEAD.into(),
             })
             .unwrap_err();
@@ -418,6 +552,7 @@ mod tests {
                     path: "src/review.rs".into(),
                     side,
                     line: 10,
+                    start_line: None,
                     head_sha: HEAD.into(),
                 }),
                 "context line should be anchorable on {side}"
@@ -437,6 +572,7 @@ mod tests {
                 path: "src/review.rs".into(),
                 side: DiffSide::Right,
                 line: 40,
+                start_line: None,
                 head_sha: HEAD.into(),
             })
             .unwrap_err();
@@ -457,6 +593,7 @@ mod tests {
                 path: "src/review.rs".into(),
                 side: DiffSide::Right,
                 line: 10,
+                start_line: None,
                 head_sha: OTHER_HEAD.into(),
             })
             .unwrap_err();
@@ -480,6 +617,7 @@ mod tests {
                 path: "src/untouched.rs".into(),
                 side: DiffSide::Right,
                 line: 10,
+                start_line: None,
                 head_sha: HEAD.into(),
             })
             .unwrap_err();
@@ -521,11 +659,150 @@ mod tests {
                 path: "image.bin".into(),
                 side: DiffSide::Right,
                 line: 1,
+                start_line: None,
                 head_sha: HEAD.into(),
             })
             .unwrap_err();
         // The file is under review; it simply has no commentable line.
         assert!(matches!(error, AnchorError::LineNotInDiff { .. }));
+    }
+
+    #[test]
+    fn a_range_within_one_hunk_resolves_to_its_last_row() {
+        let file = two_hunk_file();
+        let index = index_for(std::slice::from_ref(&file));
+
+        // Rows 0..=3 are the first hunk: context 10, deletion 11, addition 11,
+        // context 12. A right-side range over the context lines spans 10 to 12.
+        let anchor = index.anchor_for_rows(&file, 0, 3).unwrap();
+        assert_eq!(anchor.side, DiffSide::Right);
+        assert_eq!(anchor.start_line, Some(10));
+        assert_eq!(anchor.line, 12);
+        assert!(anchor.is_multiline());
+        assert_eq!(anchor.line_span().collect::<Vec<_>>(), [10, 11, 12]);
+
+        // It anchors where GitHub anchors it: the last line.
+        assert_eq!(
+            index.resolve(&anchor).unwrap(),
+            AnchorLocation { file: 0, row: 3 },
+        );
+    }
+
+    /// Selecting upwards must produce the same range as selecting downwards.
+    #[test]
+    fn a_range_is_ordered_however_it_was_selected() {
+        let file = two_hunk_file();
+        let index = index_for(std::slice::from_ref(&file));
+
+        assert_eq!(
+            index.anchor_for_rows(&file, 3, 0),
+            index.anchor_for_rows(&file, 0, 3),
+        );
+    }
+
+    /// A one-row span is an ordinary comment, not a one-line range: sending
+    /// `start_line == line` would have GitHub reject it.
+    #[test]
+    fn a_single_row_span_is_not_a_range() {
+        let file = two_hunk_file();
+        let index = index_for(std::slice::from_ref(&file));
+
+        let anchor = index.anchor_for_rows(&file, 0, 0).unwrap();
+        assert_eq!(anchor.start_line, None);
+        assert!(!anchor.is_multiline());
+    }
+
+    /// The lines between the ends have to be in the diff too, which is only
+    /// guaranteed inside a single hunk.
+    #[test]
+    fn a_range_across_two_hunks_is_rejected() {
+        let file = two_hunk_file();
+        let index = index_for(std::slice::from_ref(&file));
+
+        // Row 0 is in the first hunk, row 4 in the second.
+        let anchor = index.anchor_for_rows(&file, 0, 4).unwrap();
+        let error = index.resolve(&anchor).unwrap_err();
+
+        assert!(
+            matches!(
+                error,
+                AnchorError::RangeCrossesHunks {
+                    start_line: 10,
+                    line: 80,
+                    ..
+                }
+            ),
+            "unexpected error: {error:?}",
+        );
+        assert!(error.to_string().contains("more than one hunk"));
+    }
+
+    /// A deletion anchors left and an addition right, so a span covering both has
+    /// no single side to submit against.
+    #[test]
+    fn a_range_across_both_sides_is_not_offered() {
+        let file = two_hunk_file();
+        let index = index_for(std::slice::from_ref(&file));
+
+        // Row 1 is a deletion (left) and row 2 an addition (right).
+        assert!(index.anchor_for_rows(&file, 1, 2).is_none());
+    }
+
+    #[test]
+    fn a_range_cannot_end_before_it_starts() {
+        let file = two_hunk_file();
+        let index = index_for(std::slice::from_ref(&file));
+
+        let error = index
+            .resolve(&DiffAnchor {
+                path: "src/review.rs".into(),
+                side: DiffSide::Right,
+                line: 10,
+                start_line: Some(12),
+                head_sha: HEAD.into(),
+            })
+            .unwrap_err();
+
+        assert_eq!(
+            error,
+            AnchorError::InvertedRange {
+                start_line: 12,
+                line: 10,
+            },
+        );
+    }
+
+    #[test]
+    fn a_range_starting_outside_the_diff_is_rejected() {
+        let file = two_hunk_file();
+        let index = index_for(std::slice::from_ref(&file));
+
+        let error = index
+            .resolve(&DiffAnchor {
+                path: "src/review.rs".into(),
+                side: DiffSide::Right,
+                line: 12,
+                // Line 5 is before the first hunk.
+                start_line: Some(5),
+                head_sha: HEAD.into(),
+            })
+            .unwrap_err();
+
+        assert!(matches!(error, AnchorError::LineNotInDiff { line: 5, .. }));
+    }
+
+    /// A range spanning a row that cannot carry a comment still resolves, because
+    /// its own ends are valid and the lines between are inside the hunk.
+    #[test]
+    fn a_range_may_cover_rows_that_are_not_themselves_anchorable() {
+        let file = two_hunk_file();
+        let index = index_for(std::slice::from_ref(&file));
+
+        // Rows 4..=5 in the second hunk, which also contains a marker row at 6.
+        let anchor = index.anchor_for_rows(&file, 4, 5).unwrap();
+        assert_eq!(anchor.start_line, Some(80));
+        assert_eq!(anchor.line, 81);
+        assert!(index.resolve(&anchor).is_ok());
     }
 
     #[test]

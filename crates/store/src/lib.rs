@@ -23,7 +23,7 @@ use rusqlite::Connection;
 use thiserror::Error;
 
 /// The schema version this build expects.
-const SCHEMA_VERSION: i64 = 2;
+const SCHEMA_VERSION: i64 = 3;
 
 #[derive(Debug, Error)]
 pub enum StoreError {
@@ -144,6 +144,14 @@ impl DraftStore {
                 .map_err(StoreError::Migrate)?;
         }
 
+        if version < 3 {
+            // Nullable: a single-line draft has no range, and every draft written
+            // before this column existed is one.
+            self.connection
+                .execute_batch("ALTER TABLE drafts ADD COLUMN start_line INTEGER;")
+                .map_err(StoreError::Migrate)?;
+        }
+
         if version < SCHEMA_VERSION {
             self.connection
                 .pragma_update(None, "user_version", SCHEMA_VERSION)
@@ -167,7 +175,7 @@ impl DraftStore {
         let mut statement = self
             .connection
             .prepare(
-                "SELECT head_sha, path, side, line, body FROM drafts
+                "SELECT head_sha, path, side, line, body, start_line FROM drafts
                  WHERE scope = ?1
                  ORDER BY path, line, side",
             )
@@ -181,19 +189,21 @@ impl DraftStore {
                     row.get::<_, String>(2)?,
                     row.get::<_, i64>(3)?,
                     row.get::<_, String>(4)?,
+                    row.get::<_, Option<i64>>(5)?,
                 ))
             })
             .map_err(StoreError::Read)?;
 
         let mut drafts = Vec::new();
         for row in rows {
-            let (head_sha, path, side, line, body) = row.map_err(StoreError::Read)?;
+            let (head_sha, path, side, line, body, start_line) = row.map_err(StoreError::Read)?;
             let side = DiffSide::from_github(&side).ok_or(StoreError::UnknownSide(side))?;
             drafts.push((
                 DiffAnchor {
                     path: path.into(),
                     side,
                     line: line.try_into().unwrap_or(u32::MAX),
+                    start_line: start_line.and_then(|start| u32::try_from(start).ok()),
                     head_sha: head_sha.into(),
                 },
                 body,
@@ -210,10 +220,14 @@ impl DraftStore {
     pub fn upsert(&self, scope: &str, anchor: &DiffAnchor, body: &str) -> Result<(), StoreError> {
         self.connection
             .execute(
-                "INSERT INTO drafts (scope, head_sha, path, side, line, body, updated_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                "INSERT INTO drafts
+                     (scope, head_sha, path, side, line, body, updated_at, start_line)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
                  ON CONFLICT (scope, head_sha, path, side, line)
-                 DO UPDATE SET body = excluded.body, updated_at = excluded.updated_at",
+                 DO UPDATE SET
+                     body = excluded.body,
+                     updated_at = excluded.updated_at,
+                     start_line = excluded.start_line",
                 rusqlite::params![
                     scope,
                     anchor.head_sha.as_ref(),
@@ -222,6 +236,7 @@ impl DraftStore {
                     i64::from(anchor.line),
                     body,
                     epoch_seconds(),
+                    anchor.start_line.map(i64::from),
                 ],
             )
             .map_err(StoreError::Write)?;
@@ -499,6 +514,7 @@ mod tests {
             path: path.into(),
             side,
             line,
+            start_line: None,
             head_sha: head_sha.into(),
         }
     }
@@ -691,6 +707,38 @@ mod tests {
         let loaded = DraftStore::open(&path).unwrap().load(SCOPE).unwrap();
         assert_eq!(loaded.len(), 1);
         assert_eq!(loaded[0].1, "need");
+    }
+
+    #[test]
+    fn a_range_survives_storage() {
+        let store = DraftStore::open_in_memory().unwrap();
+        let mut ranged = anchor("src/review.rs", 12, DiffSide::Right, HEAD);
+        ranged.start_line = Some(10);
+
+        store.upsert(SCOPE, &ranged, "this block").unwrap();
+
+        let loaded = store.load(SCOPE).unwrap();
+        assert_eq!(loaded[0].0.start_line, Some(10));
+        assert_eq!(loaded[0].0.line, 12);
+        assert!(loaded[0].0.is_multiline());
+    }
+
+    /// Narrowing a range back to one line must clear the stored start, not leave a
+    /// range behind on the same key.
+    #[test]
+    fn rewriting_a_range_as_a_single_line_clears_the_start() {
+        let store = DraftStore::open_in_memory().unwrap();
+        let mut ranged = anchor("src/review.rs", 12, DiffSide::Right, HEAD);
+        ranged.start_line = Some(10);
+        store.upsert(SCOPE, &ranged, "this block").unwrap();
+
+        let single = anchor("src/review.rs", 12, DiffSide::Right, HEAD);
+        store.upsert(SCOPE, &single, "just this line").unwrap();
+
+        let loaded = store.load(SCOPE).unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].0.start_line, None);
+        assert_eq!(loaded[0].1, "just this line");
     }
 
     #[test]

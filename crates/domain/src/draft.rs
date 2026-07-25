@@ -204,6 +204,7 @@ mod tests {
             path: path.into(),
             side,
             line,
+            start_line: None,
             head_sha: "a".repeat(40).into(),
         }
     }

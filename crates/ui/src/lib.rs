@@ -19,6 +19,8 @@ actions!(
     [
         SelectNextLine,
         SelectPreviousLine,
+        ExtendSelectionDown,
+        ExtendSelectionUp,
         ToggleComment,
         CloseComment,
         CopySelectedLine,
@@ -50,6 +52,10 @@ pub fn init(cx: &mut App) {
         KeyBinding::new("down", SelectNextLine, Some(DIFF_CONTEXT)),
         KeyBinding::new("k", SelectPreviousLine, Some(DIFF_CONTEXT)),
         KeyBinding::new("up", SelectPreviousLine, Some(DIFF_CONTEXT)),
+        KeyBinding::new("shift-j", ExtendSelectionDown, Some(DIFF_CONTEXT)),
+        KeyBinding::new("shift-down", ExtendSelectionDown, Some(DIFF_CONTEXT)),
+        KeyBinding::new("shift-k", ExtendSelectionUp, Some(DIFF_CONTEXT)),
+        KeyBinding::new("shift-up", ExtendSelectionUp, Some(DIFF_CONTEXT)),
         KeyBinding::new("c", ToggleComment, Some(DIFF_CONTEXT)),
         KeyBinding::new("cmd-c", CopySelectedLine, Some(DIFF_CONTEXT)),
         KeyBinding::new("cmd-shift-j", SelectNextFile, Some(SESSION_CONTEXT)),
@@ -200,6 +206,8 @@ struct DiffRow<'a> {
     draft: Option<&'a DraftComment>,
     /// Set when a hunk begins at this row, so the header is drawn above it.
     hunk_header: Option<&'a Arc<str>>,
+    /// Whether this row is inside the span a comment would cover.
+    in_selection: bool,
 }
 
 /// What the diff view asks the session to do about drafts.
@@ -207,8 +215,12 @@ struct DiffRow<'a> {
 /// The diff view renders a read-only snapshot and never mutates the session
 /// directly, so the session stays the single owner of draft state.
 pub enum DiffViewEvent {
-    /// The composer's text for a row changed.
-    DraftEdited { row: usize, body: String },
+    /// The composer's text changed. `rows` is the span it covers, which is one row
+    /// for an ordinary comment.
+    DraftEdited {
+        rows: std::ops::RangeInclusive<usize>,
+        body: String,
+    },
     /// The reviewer discarded a row's draft.
     DraftDiscarded { row: usize },
     /// A stale draft should move onto a row in the current diff.
@@ -223,7 +235,14 @@ pub struct DiffView {
     drafts: Arc<Drafts>,
     list_state: ListState,
     selected_line: usize,
-    comment_line: Option<usize>,
+    /// Where a multi-line selection began, when one is being extended.
+    ///
+    /// The selection runs between this and `selected_line` in either direction, so
+    /// a reviewer can grow it upwards or downwards from where they started.
+    selection_anchor: Option<usize>,
+    /// The span the open composer covers, frozen when it opened so moving the
+    /// cursor afterwards does not silently re-target the draft.
+    comment_rows: Option<std::ops::RangeInclusive<usize>>,
     comment_editor: Entity<CommentEditor>,
     /// Held so the composer's edits keep reaching this view.
     _editor_subscription: Subscription,
@@ -245,11 +264,11 @@ impl DiffView {
         let item_count = file.line_count();
         let comment_editor = cx.new(CommentEditor::new);
         let subscription = cx.subscribe(&comment_editor, |this, editor, _: &CommentEdited, cx| {
-            let Some(row) = this.comment_line else {
+            let Some(rows) = this.comment_rows.clone() else {
                 return;
             };
             let body = editor.read(cx).content().to_owned();
-            cx.emit(DiffViewEvent::DraftEdited { row, body });
+            cx.emit(DiffViewEvent::DraftEdited { rows, body });
         });
 
         Self {
@@ -259,7 +278,8 @@ impl DiffView {
             drafts,
             list_state: ListState::new(item_count, ListAlignment::Top, px(ROW_HEIGHT)),
             selected_line: 0,
-            comment_line: None,
+            selection_anchor: None,
+            comment_rows: None,
             comment_editor,
             _editor_subscription: subscription,
             focus_handle: cx.focus_handle(),
@@ -286,15 +306,57 @@ impl DiffView {
         self.file = file;
         self.file_index = file_index;
         self.selected_line = 0;
-        self.comment_line = None;
+        self.selection_anchor = None;
+        self.comment_rows = None;
         self.comment_editor.update(cx, CommentEditor::clear);
         cx.notify();
     }
 
+    /// Moves the cursor, abandoning any range being built.
     fn select(&mut self, index: usize, cx: &mut Context<Self>) {
+        self.selection_anchor = None;
+        self.move_cursor(index, cx);
+    }
+
+    fn move_cursor(&mut self, index: usize, cx: &mut Context<Self>) {
         self.selected_line = index.min(self.file.line_count().saturating_sub(1));
         self.list_state.scroll_to_reveal_item(self.selected_line);
         cx.notify();
+    }
+
+    /// The rows a comment would cover: just the cursor, or the range being built.
+    fn selected_rows(&self) -> std::ops::RangeInclusive<usize> {
+        match self.selection_anchor {
+            Some(anchor) if anchor <= self.selected_line => anchor..=self.selected_line,
+            Some(anchor) => self.selected_line..=anchor,
+            None => self.selected_line..=self.selected_line,
+        }
+    }
+
+    /// Grows the selection from wherever it started.
+    fn extend_selection(&mut self, to: usize, cx: &mut Context<Self>) {
+        if self.selection_anchor.is_none() {
+            self.selection_anchor = Some(self.selected_line);
+        }
+        self.move_cursor(to, cx);
+    }
+
+    fn extend_selection_down(
+        &mut self,
+        _: &ExtendSelectionDown,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.extend_selection(self.selected_line.saturating_add(1), cx);
+    }
+
+    fn extend_selection_up(
+        &mut self,
+        _: &ExtendSelectionUp,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.extend_selection(self.selected_line.saturating_sub(1), cx);
     }
 
     fn select_next_line(&mut self, _: &SelectNextLine, _: &mut Window, cx: &mut Context<Self>) {
@@ -311,22 +373,32 @@ impl DiffView {
     }
 
     fn toggle_comment(&mut self, _: &ToggleComment, window: &mut Window, cx: &mut Context<Self>) {
-        if self.comment_line == Some(self.selected_line) {
-            self.comment_line = None;
+        if self.comment_rows.as_ref() == Some(&self.selected_rows()) {
+            self.comment_rows = None;
             window.focus(&self.focus_handle);
         } else {
-            self.open_composer(self.selected_line, window, cx);
+            self.open_composer(self.selected_rows(), window, cx);
         }
         self.list_state.scroll_to_reveal_item(self.selected_line);
         cx.notify();
     }
 
-    /// Opens the composer on a row, showing that row's draft if it has one.
-    fn open_composer(&mut self, row: usize, window: &mut Window, cx: &mut Context<Self>) {
-        self.comment_line = Some(row);
+    /// Opens the composer over a span, showing the draft already there if any.
+    ///
+    /// A range's draft lives at its last row, which is also where a single-line
+    /// draft on that row would live — so extending a selection over an existing
+    /// comment edits it rather than starting a rival.
+    fn open_composer(
+        &mut self,
+        rows: std::ops::RangeInclusive<usize>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let end_row = *rows.end();
+        self.comment_rows = Some(rows);
         let existing = self
             .drafts
-            .at(self.file_index, row)
+            .at(self.file_index, end_row)
             .map(|draft| draft.body.clone())
             .unwrap_or_default();
         self.comment_editor
@@ -337,7 +409,7 @@ impl DiffView {
 
     /// Discards the row's draft and closes the composer.
     fn discard_draft(&mut self, row: usize, window: &mut Window, cx: &mut Context<Self>) {
-        self.comment_line = None;
+        self.comment_rows = None;
         self.comment_editor.update(cx, CommentEditor::clear);
         window.focus(&self.focus_handle);
         cx.emit(DiffViewEvent::DraftDiscarded { row });
@@ -347,7 +419,7 @@ impl DiffView {
     /// Dismisses the composer. Bound to `escape` in the composer's own context,
     /// since `c` is now reserved for typing while the composer has focus.
     fn close_comment(&mut self, _: &CloseComment, window: &mut Window, cx: &mut Context<Self>) {
-        if self.comment_line.take().is_some() {
+        if self.comment_rows.take().is_some() {
             window.focus(&self.focus_handle);
             cx.notify();
         }
@@ -439,6 +511,7 @@ impl DiffView {
             threads,
             draft,
             hunk_header,
+            in_selection,
         } = row;
         // While the composer is open the draft is being edited in it, so showing
         // it read-only underneath as well would duplicate the same text.
@@ -469,7 +542,14 @@ impl DiffView {
             .w_full()
             .flex()
             .flex_col()
-            .bg(if selected { rgb(0x1e3a5f) } else { row_bg })
+            .bg(if selected {
+                rgb(0x1e3a5f)
+            } else if in_selection {
+                // A range under construction is visible without looking selected.
+                rgb(0x162a44)
+            } else {
+                row_bg
+            })
             // Drawn above the first row of its hunk, so every hunk in a file is
             // labelled rather than only the first.
             .children(hunk_header.map(|header| {
@@ -561,7 +641,8 @@ impl DiffView {
                                     cx.stop_propagation();
                                     comment_view.update(cx, |this, cx| {
                                         this.selected_line = index;
-                                        this.open_composer(index, window, cx);
+                                        this.selection_anchor = None;
+                                        this.open_composer(index..=index, window, cx);
                                         cx.notify();
                                     });
                                 })
@@ -644,7 +725,7 @@ impl DiffView {
                                 .on_mouse_down(MouseButton::Left, move |_, window, cx| {
                                     cx.stop_propagation();
                                     close_view.update(cx, |this, cx| {
-                                        this.comment_line = None;
+                                        this.comment_rows = None;
                                         window.focus(&this.focus_handle);
                                         cx.notify();
                                     });
@@ -700,7 +781,8 @@ impl Render for DiffView {
             .cloned()
             .collect::<Vec<_>>();
         let selected_line = self.selected_line;
-        let comment_line = self.comment_line;
+        let comment_rows = self.comment_rows.clone();
+        let selected_rows = self.selected_rows();
         let view = cx.entity();
         // The list closure takes `view`; the side panel needs its own handle.
         let panel_view = view.clone();
@@ -727,6 +809,8 @@ impl Render for DiffView {
             .track_focus(&self.focus_handle)
             .on_action(cx.listener(Self::select_next_line))
             .on_action(cx.listener(Self::select_previous_line))
+            .on_action(cx.listener(Self::extend_selection_down))
+            .on_action(cx.listener(Self::extend_selection_up))
             .on_action(cx.listener(Self::toggle_comment))
             .on_action(cx.listener(Self::close_comment))
             .on_action(cx.listener(Self::copy_selected_line))
@@ -813,7 +897,10 @@ impl Render for DiffView {
                                         line: &file.lines[index],
                                         index,
                                         selected: selected_line == index,
-                                        show_comment: comment_line == Some(index),
+                                        show_comment: comment_rows
+                                            .as_ref()
+                                            .is_some_and(|rows| *rows.end() == index),
+                                        in_selection: selected_rows.contains(&index),
                                         threads: comments.threads_at(file_index, index),
                                         draft: drafts.at(file_index, index),
                                         hunk_header: file.hunk_header_at(index),
@@ -1090,22 +1177,24 @@ impl ReviewView {
             return;
         }
 
-        let row = match event {
-            DiffViewEvent::DraftEdited { row, .. } | DiffViewEvent::DraftDiscarded { row } => *row,
+        let rows = match event {
+            DiffViewEvent::DraftEdited { rows, .. } => rows.clone(),
+            DiffViewEvent::DraftDiscarded { row } => *row..=*row,
             DiffViewEvent::DraftReanchored { .. } => return,
         };
         // The anchor is read before the change so a discarded draft still reports
-        // which position it was removed from.
-        let Some(anchor) = self.session.anchor_for(file, row) else {
+        // which position it was removed from. It covers the whole span, so a range
+        // is persisted and cleared as one comment.
+        let Some(anchor) = self.session.anchor_for_span(file, rows.clone()) else {
             return;
         };
 
         match event {
             DiffViewEvent::DraftEdited { body, .. } => {
-                self.session.set_draft(file, row, body.clone());
+                self.session.set_draft_over(file, rows, body.clone());
             }
             DiffViewEvent::DraftDiscarded { .. } | DiffViewEvent::DraftReanchored { .. } => {
-                self.session.clear_draft(file, row);
+                self.session.clear_draft(file, *rows.end());
             }
         }
 
@@ -2093,7 +2182,10 @@ mod tests {
         cx.dispatch_action(ToggleComment);
         cx.simulate_input("hello");
 
-        assert_eq!(cx.read(|app| view.read(app).comment_line), Some(1));
+        assert_eq!(
+            cx.read(|app| view.read(app).comment_rows.clone()),
+            Some(1..=1)
+        );
         assert_eq!(
             cx.read(|app| view.read(app).comment_editor.read(app).content.clone()),
             "hello",
@@ -2130,7 +2222,10 @@ mod tests {
         );
         // Typing must not have navigated the diff or dismissed the composer.
         assert_eq!(cx.read(|app| view.read(app).selected_line()), 0);
-        assert_eq!(cx.read(|app| view.read(app).comment_line), Some(0));
+        assert_eq!(
+            cx.read(|app| view.read(app).comment_rows.clone()),
+            Some(0..=0)
+        );
     }
 
     #[gpui::test]
@@ -2156,7 +2251,7 @@ mod tests {
         assert_eq!(cx.read(|app| view.read(app).selected_line()), 0);
 
         cx.simulate_keystrokes("escape");
-        assert_eq!(cx.read(|app| view.read(app).comment_line), None);
+        assert_eq!(cx.read(|app| view.read(app).comment_rows.clone()), None);
 
         // With the composer gone, the same key navigates again.
         cx.simulate_input("j");
@@ -2453,6 +2548,66 @@ mod tests {
                 .map(|warning| warning.summary.clone())),
             Some("GitHub's rate limit is exhausted".to_owned()),
         );
+    }
+
+    /// Extending the selection and commenting produces one range draft, not
+    /// several single-line ones.
+    #[gpui::test]
+    fn shift_navigation_builds_a_range_comment(cx: &mut TestAppContext) {
+        cx.update(init);
+        let session = repository_backed_session(&["src/review.rs"]);
+        let (view, cx) = cx.add_window_view(|window, cx| ReviewView::new(session, window, cx));
+        cx.update(|window, app| {
+            let focus = view.read(app).diff_view.read(app).focus_handle.clone();
+            window.focus(&focus);
+        });
+
+        // Rows 0..=2 are context lines in the fixture's single hunk.
+        cx.simulate_keystrokes("shift-j");
+        cx.simulate_keystrokes("shift-j");
+        assert_eq!(
+            cx.read(|app| view.read(app).diff_view.read(app).selected_rows()),
+            0..=2,
+        );
+
+        cx.dispatch_action(ToggleComment);
+        cx.simulate_input("this block");
+
+        let draft = cx
+            .read(|app| view.read(app).session().draft_at(0, 2).cloned())
+            .expect("the draft is keyed at the span's last row");
+        assert_eq!(draft.body, "this block");
+        assert!(draft.anchor.is_multiline());
+        assert_eq!(draft.anchor.start_line, Some(1));
+        assert_eq!(draft.anchor.line, 3);
+        assert_eq!(cx.read(|app| view.read(app).session().drafts().len()), 1);
+    }
+
+    /// Plain navigation after extending must abandon the range rather than leave it
+    /// quietly attached to the next comment.
+    #[gpui::test]
+    fn moving_without_shift_collapses_the_selection(cx: &mut TestAppContext) {
+        cx.update(init);
+        let session = repository_backed_session(&["src/review.rs"]);
+        let (view, cx) = cx.add_window_view(|window, cx| ReviewView::new(session, window, cx));
+        cx.update(|window, app| {
+            let focus = view.read(app).diff_view.read(app).focus_handle.clone();
+            window.focus(&focus);
+        });
+
+        cx.simulate_keystrokes("shift-j");
+        cx.simulate_keystrokes("j");
+        assert_eq!(
+            cx.read(|app| view.read(app).diff_view.read(app).selected_rows()),
+            2..=2,
+        );
+
+        cx.dispatch_action(ToggleComment);
+        cx.simulate_input("one line");
+        let draft = cx
+            .read(|app| view.read(app).session().draft_at(0, 2).cloned())
+            .unwrap();
+        assert!(!draft.anchor.is_multiline());
     }
 
     /// The point of the whole path: what is typed becomes a draft anchored to the
@@ -2886,6 +3041,7 @@ mod tests {
             path: "src/review.rs".into(),
             side: domain::DiffSide::Right,
             line: 9_999,
+            start_line: None,
             head_sha: "a".repeat(40).into(),
         };
         session.restore_drafts([(stale.clone(), "written last week".to_owned())]);
@@ -2980,7 +3136,10 @@ mod tests {
 
         // And there is no row to comment on.
         cx.dispatch_action(ToggleComment);
-        assert_eq!(cx.read(|app| view.read(app).comment_line), Some(0));
+        assert_eq!(
+            cx.read(|app| view.read(app).comment_rows.clone()),
+            Some(0..=0)
+        );
     }
 
     /// Threads add height to a row inside the virtualized list, so rendering a
@@ -3073,8 +3232,8 @@ mod tests {
 
         assert_eq!(cx.read(|app| view.read(app).selected_file_index()), 0);
         assert_eq!(
-            cx.read(|app| view.read(app).diff_view.read(app).comment_line),
-            Some(0),
+            cx.read(|app| view.read(app).diff_view.read(app).comment_rows.clone()),
+            Some(0..=0),
         );
 
         // Dismissing the composer hands file navigation back.
