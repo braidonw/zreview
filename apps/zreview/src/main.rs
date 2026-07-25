@@ -74,6 +74,7 @@ fn load_local_session(arguments: &[String]) -> Result<ReviewSession, String> {
     let source = SessionSource::LocalComparison {
         repository_root: comparison.repository_root,
         base_sha: comparison.base_sha,
+        diff_base_sha: comparison.diff_base_sha,
         head_sha: comparison.head_sha,
     };
 
@@ -105,7 +106,9 @@ fn load_pull_request_session(arguments: &[String]) -> Result<ReviewSession, Stri
         url: metadata.url.into(),
         base_ref: metadata.base_ref.into(),
         head_ref: metadata.head_ref.into(),
-        base_sha: metadata.base_sha,
+        base_sha: comparison.base_sha,
+        recorded_base_sha: metadata.base_sha,
+        diff_base_sha: comparison.diff_base_sha,
         head_sha: metadata.head_sha,
     };
 

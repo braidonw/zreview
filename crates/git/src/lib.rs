@@ -21,6 +21,12 @@ pub struct ComparisonDiff {
     pub repository_root: PathBuf,
     pub base_sha: Arc<str>,
     pub head_sha: Arc<str>,
+    /// The commit the patches were actually generated against.
+    ///
+    /// Equals `base_sha` in [`ComparisonMode::Direct`] and the merge base in
+    /// [`ComparisonMode::MergeBase`]. Anchors and findings must be keyed to this
+    /// commit rather than to `base_sha`, which can be an unrelated branch tip.
+    pub diff_base_sha: Arc<str>,
     pub files: Arc<[DiffFile]>,
 }
 
@@ -99,6 +105,7 @@ pub fn load_comparison(
         repository_root,
         base_sha: base_sha.into(),
         head_sha: head_sha.into(),
+        diff_base_sha: diff_base.into(),
         files: files.into(),
     })
 }
@@ -619,6 +626,8 @@ mod tests {
             load_comparison(repository.path(), &base, "HEAD", ComparisonMode::Direct).unwrap();
 
         assert_eq!(comparison.files.len(), 4);
+        assert_eq!(comparison.base_sha.as_ref(), base);
+        assert_eq!(comparison.diff_base_sha.as_ref(), base);
         let renamed = comparison
             .files
             .iter()
@@ -640,6 +649,67 @@ mod tests {
             .unwrap();
         assert!(binary.is_binary);
         assert!(binary.lines.is_empty());
+    }
+
+    /// A base branch that advances after the feature branch forked must not
+    /// contribute its own commits to the review.
+    #[test]
+    fn merge_base_mode_ignores_commits_added_to_the_base_branch() {
+        let repository = TempDir::new().unwrap();
+        git(
+            repository.path(),
+            ["init", "--quiet", "--initial-branch=main"],
+        );
+        git(repository.path(), ["config", "user.name", "ZReview Test"]);
+        git(
+            repository.path(),
+            ["config", "user.email", "zreview@example.invalid"],
+        );
+
+        fs::write(repository.path().join("shared.txt"), "fork point\n").unwrap();
+        git(repository.path(), ["add", "."]);
+        git(repository.path(), ["commit", "--quiet", "-m", "fork point"]);
+        let fork_point = git_output(repository.path(), ["rev-parse", "HEAD"]);
+
+        git(repository.path(), ["checkout", "--quiet", "-b", "feature"]);
+        fs::write(repository.path().join("feature.txt"), "feature work\n").unwrap();
+        git(repository.path(), ["add", "."]);
+        git(repository.path(), ["commit", "--quiet", "-m", "feature"]);
+
+        git(repository.path(), ["checkout", "--quiet", "main"]);
+        fs::write(repository.path().join("unrelated.txt"), "base moved on\n").unwrap();
+        git(repository.path(), ["add", "."]);
+        git(repository.path(), ["commit", "--quiet", "-m", "base moves"]);
+        let base_tip = git_output(repository.path(), ["rev-parse", "HEAD"]);
+
+        let comparison = load_comparison(
+            repository.path(),
+            "main",
+            "feature",
+            ComparisonMode::MergeBase,
+        )
+        .unwrap();
+
+        assert_eq!(comparison.base_sha.as_ref(), base_tip);
+        assert_eq!(comparison.diff_base_sha.as_ref(), fork_point);
+        let paths = comparison
+            .files
+            .iter()
+            .map(|file| file.path.to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(paths, ["feature.txt"]);
+
+        // The same revisions compared directly would wrongly report the base
+        // branch's own commit as a change to review.
+        let direct =
+            load_comparison(repository.path(), "main", "feature", ComparisonMode::Direct).unwrap();
+        assert_eq!(direct.diff_base_sha.as_ref(), base_tip);
+        assert!(
+            direct
+                .files
+                .iter()
+                .any(|file| file.path.as_ref() == "unrelated.txt")
+        );
     }
 
     fn git<I, S>(repository: &Path, args: I)

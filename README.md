@@ -31,13 +31,16 @@ cargo run -p zreview -- pr /path/to/repository 123
 cargo run -p zreview -- pr /path/to/repository https://github.com/acme/widgets/pull/123
 ```
 
-ZReview reads metadata with `gh api`, fetches the base and `refs/pull/<number>/head` into `refs/zreview/...`, verifies both fetched SHAs, and then renders the local merge-base comparison. User branches and `FETCH_HEAD` are not changed.
+ZReview reads metadata with `gh api`, fetches the base branch and `refs/pull/<number>/head` into `refs/zreview/...`, verifies the fetched head against the API response, and then renders the local merge-base comparison. User branches and `FETCH_HEAD` are not changed.
+
+The comparison is taken against the merge base of the current base branch tip and the head, which is what GitHub's own "Files changed" view shows. GitHub's recorded `base.sha` is pinned when a PR is created or synchronized and drifts as the base branch advances, so it is kept as provenance only and never defines the comparison.
 
 Controls:
 
 - `j` / `↓`: select the next line
 - `k` / `↑`: select the previous line
-- `c`: open or close the inline comment editor
+- `c`: open the inline comment editor
+- `esc`: dismiss the inline comment editor
 - `⌘C`: copy the selected line
 - `⇧⌘J` / `⇧⌘K`: select the next or previous changed file
 - `⇧⌘V`: toggle the selected file's viewed state

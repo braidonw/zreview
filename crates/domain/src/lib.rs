@@ -153,6 +153,7 @@ pub enum SessionSource {
     LocalComparison {
         repository_root: PathBuf,
         base_sha: Arc<str>,
+        diff_base_sha: Arc<str>,
         head_sha: Arc<str>,
     },
     GitHubPullRequest {
@@ -164,9 +165,38 @@ pub enum SessionSource {
         url: Arc<str>,
         base_ref: Arc<str>,
         head_ref: Arc<str>,
+        /// The base branch tip the comparison was taken against.
         base_sha: Arc<str>,
+        /// GitHub's recorded `base.sha`, kept as provenance only. It is pinned
+        /// when the PR is created or synchronized and drifts as the base branch
+        /// advances, so it never defines the comparison.
+        recorded_base_sha: Arc<str>,
+        diff_base_sha: Arc<str>,
         head_sha: Arc<str>,
     },
+}
+
+impl SessionSource {
+    /// The commit every anchor, finding, and draft in this session is keyed to.
+    #[must_use]
+    pub fn diff_base_sha(&self) -> Option<&Arc<str>> {
+        match self {
+            Self::Demo => None,
+            Self::LocalComparison { diff_base_sha, .. }
+            | Self::GitHubPullRequest { diff_base_sha, .. } => Some(diff_base_sha),
+        }
+    }
+
+    /// The head commit under review.
+    #[must_use]
+    pub fn head_sha(&self) -> Option<&Arc<str>> {
+        match self {
+            Self::Demo => None,
+            Self::LocalComparison { head_sha, .. } | Self::GitHubPullRequest { head_sha, .. } => {
+                Some(head_sha)
+            }
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -321,6 +351,21 @@ mod tests {
         assert!(session.select_previous_file());
         assert!(!session.toggle_selected_viewed());
         assert_eq!(session.viewed_count(), 0);
+    }
+
+    #[test]
+    fn only_repository_backed_sources_can_be_anchored() {
+        assert!(SessionSource::Demo.diff_base_sha().is_none());
+        assert!(SessionSource::Demo.head_sha().is_none());
+
+        let local = SessionSource::LocalComparison {
+            repository_root: PathBuf::from("/tmp/repository"),
+            base_sha: "b".repeat(40).into(),
+            diff_base_sha: "d".repeat(40).into(),
+            head_sha: "h".repeat(40).into(),
+        };
+        assert_eq!(local.diff_base_sha().unwrap().as_ref(), "d".repeat(40));
+        assert_eq!(local.head_sha().unwrap().as_ref(), "h".repeat(40));
     }
 
     #[test]

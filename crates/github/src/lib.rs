@@ -91,12 +91,10 @@ pub enum GithubError {
     #[error("GitHub returned base repository {actual}, expected {expected}")]
     UnexpectedRepository { expected: String, actual: String },
 
-    #[error("the PR {side} changed while it was loading (expected {expected}, fetched {actual})")]
-    SnapshotMoved {
-        side: &'static str,
-        expected: String,
-        actual: String,
-    },
+    #[error(
+        "the pull request was updated while it was loading (expected head {expected}, fetched {actual})"
+    )]
+    HeadMoved { expected: String, actual: String },
 
     #[error(transparent)]
     Git(#[from] git::GitError),
@@ -139,10 +137,10 @@ impl GithubClient {
         let remote = select_remote(&remotes, &metadata.repository)
             .ok_or_else(|| GithubError::NoMatchingRemote(metadata.repository.full_name()))?;
 
-        fetch_snapshot(&root, remote, &metadata)?;
+        let base_tip_sha = fetch_snapshot(&root, remote, &metadata)?;
         let comparison = git::load_comparison(
             &root,
-            &metadata.base_sha,
+            &base_tip_sha,
             &metadata.head_sha,
             ComparisonMode::MergeBase,
         )?;
@@ -397,11 +395,23 @@ fn validate_sha(value: &str) -> Result<(), String> {
     }
 }
 
+/// Fetches the PR head and its base branch into namespaced refs.
+///
+/// Returns the base branch tip that was actually fetched. GitHub's `base.sha` is
+/// pinned when a pull request is created or synchronized and does not follow the
+/// base branch, so it is recorded as provenance but is never used as the
+/// comparison base. The reviewable change is the merge base of the current base
+/// branch tip and the head, which is also what GitHub's own "Files changed" view
+/// shows.
+///
+/// Only the head is verified against the API response: a head that no longer
+/// matches means the PR was pushed to while it was loading, which would silently
+/// change what is under review.
 fn fetch_snapshot(
     repository: &Path,
     remote: &str,
     metadata: &PullRequestMetadata,
-) -> Result<(), GithubError> {
+) -> Result<String, GithubError> {
     let namespace = format!(
         "refs/zreview/github/{}/{}/pull/{}",
         ref_component(&metadata.repository.owner),
@@ -416,27 +426,15 @@ fn fetch_snapshot(
     ];
     git::fetch_refspecs(repository, remote, &refspecs)?;
 
-    verify_fetched_sha(repository, "base", &base_destination, &metadata.base_sha)?;
-    verify_fetched_sha(repository, "head", &head_destination, &metadata.head_sha)?;
-    Ok(())
-}
-
-fn verify_fetched_sha(
-    repository: &Path,
-    side: &'static str,
-    reference: &str,
-    expected: &str,
-) -> Result<(), GithubError> {
-    let actual = git::resolve_commit(repository, reference)?;
-    if actual == expected {
-        Ok(())
-    } else {
-        Err(GithubError::SnapshotMoved {
-            side,
-            expected: expected.to_owned(),
-            actual,
-        })
+    let head_sha = git::resolve_commit(repository, &head_destination)?;
+    if head_sha != metadata.head_sha.as_ref() {
+        return Err(GithubError::HeadMoved {
+            expected: metadata.head_sha.to_string(),
+            actual: head_sha,
+        });
     }
+
+    Ok(git::resolve_commit(repository, &base_destination)?)
 }
 
 fn ref_component(value: &str) -> String {
@@ -577,6 +575,127 @@ mod tests {
                 ["rev-parse", "refs/zreview/github/acme/widgets/pull/42/head"],
             ),
             head_sha,
+        );
+    }
+
+    /// GitHub pins `base.sha` when a PR is created or synchronized, so on any
+    /// active repository it lags the real base branch tip. Loading must still
+    /// succeed and must review only the PR's own commits.
+    #[test]
+    fn loads_a_pr_whose_recorded_base_sha_has_been_left_behind() {
+        let source = TempDir::new().unwrap();
+        git(source.path(), ["init", "--quiet", "--initial-branch=main"]);
+        git(source.path(), ["config", "user.name", "ZReview Test"]);
+        git(
+            source.path(),
+            ["config", "user.email", "zreview@example.invalid"],
+        );
+        fs::write(source.path().join("shared.txt"), "fork point\n").unwrap();
+        git(source.path(), ["add", "."]);
+        git(source.path(), ["commit", "--quiet", "-m", "fork point"]);
+        // What GitHub will report as base.sha, captured before main moves on.
+        let recorded_base_sha = git_output(source.path(), ["rev-parse", "HEAD"]);
+
+        git(
+            source.path(),
+            ["checkout", "--quiet", "-b", "feature/review"],
+        );
+        fs::write(source.path().join("feature.txt"), "feature work\n").unwrap();
+        git(source.path(), ["add", "."]);
+        git(source.path(), ["commit", "--quiet", "-m", "feature"]);
+        let head_sha = git_output(source.path(), ["rev-parse", "HEAD"]);
+        git(
+            source.path(),
+            ["update-ref", "refs/pull/42/head", &head_sha],
+        );
+
+        git(source.path(), ["checkout", "--quiet", "main"]);
+        fs::write(source.path().join("unrelated.txt"), "base moved on\n").unwrap();
+        git(source.path(), ["add", "."]);
+        git(source.path(), ["commit", "--quiet", "-m", "base moves"]);
+        let base_tip_sha = git_output(source.path(), ["rev-parse", "HEAD"]);
+        assert_ne!(recorded_base_sha, base_tip_sha);
+
+        let target = TempDir::new().unwrap();
+        git(target.path(), ["init", "--quiet"]);
+        let github_url = "https://github.com/acme/widgets.git";
+        git(target.path(), ["remote", "add", "origin", github_url]);
+        git(
+            target.path(),
+            [
+                "config",
+                &format!("url.{}.insteadOf", source.path().display()),
+                github_url,
+            ],
+        );
+
+        let gh = target.path().join("fake-gh");
+        write_fake_gh(&gh, &recorded_base_sha, &head_sha);
+        let result = GithubClient::new(&gh)
+            .load_pull_request(target.path(), &PullRequestSelector::Number(42))
+            .unwrap();
+
+        // Provenance keeps GitHub's value; the comparison uses the real tip.
+        assert_eq!(result.metadata.base_sha.as_ref(), recorded_base_sha);
+        assert_eq!(result.comparison.base_sha.as_ref(), base_tip_sha);
+        assert_eq!(result.comparison.diff_base_sha.as_ref(), recorded_base_sha);
+
+        // The base branch's own commit is not part of the review.
+        let paths = result
+            .comparison
+            .files
+            .iter()
+            .map(|file| file.path.to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(paths, ["feature.txt"]);
+    }
+
+    #[test]
+    fn rejects_a_head_that_moved_while_loading() {
+        let source = TempDir::new().unwrap();
+        git(source.path(), ["init", "--quiet", "--initial-branch=main"]);
+        git(source.path(), ["config", "user.name", "ZReview Test"]);
+        git(
+            source.path(),
+            ["config", "user.email", "zreview@example.invalid"],
+        );
+        fs::write(source.path().join("review.txt"), "base\n").unwrap();
+        git(source.path(), ["add", "."]);
+        git(source.path(), ["commit", "--quiet", "-m", "base"]);
+        let base_sha = git_output(source.path(), ["rev-parse", "HEAD"]);
+        fs::write(source.path().join("review.txt"), "base\nhead\n").unwrap();
+        git(source.path(), ["add", "."]);
+        git(source.path(), ["commit", "--quiet", "-m", "head"]);
+        let actual_head = git_output(source.path(), ["rev-parse", "HEAD"]);
+        git(
+            source.path(),
+            ["update-ref", "refs/pull/42/head", &actual_head],
+        );
+
+        let target = TempDir::new().unwrap();
+        git(target.path(), ["init", "--quiet"]);
+        let github_url = "https://github.com/acme/widgets.git";
+        git(target.path(), ["remote", "add", "origin", github_url]);
+        git(
+            target.path(),
+            [
+                "config",
+                &format!("url.{}.insteadOf", source.path().display()),
+                github_url,
+            ],
+        );
+
+        // The API reports a head that the remote no longer has.
+        let gh = target.path().join("fake-gh");
+        write_fake_gh(&gh, &base_sha, HEAD_SHA);
+        let error = GithubClient::new(&gh)
+            .load_pull_request(target.path(), &PullRequestSelector::Number(42))
+            .unwrap_err();
+
+        assert!(
+            matches!(&error, GithubError::HeadMoved { expected, actual }
+                if expected == HEAD_SHA && *actual == actual_head),
+            "unexpected error: {error}"
         );
     }
 

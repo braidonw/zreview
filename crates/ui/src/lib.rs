@@ -15,6 +15,7 @@ actions!(
         SelectNextLine,
         SelectPreviousLine,
         ToggleComment,
+        CloseComment,
         CopySelectedLine,
     ]
 );
@@ -31,17 +32,25 @@ fn short_sha(value: &str) -> &str {
     value.get(..7).unwrap_or(value)
 }
 
+/// `CommentEditor` renders inside `DiffView`, so a bare `DiffView` predicate also
+/// matches while the composer is focused — which would make `j`, `k`, and `c`
+/// impossible to type into a review comment. Negating the composer's context
+/// excludes it, because GPUI evaluates `!` against the whole focus path.
+const DIFF_CONTEXT: &str = "DiffView && !CommentEditor";
+const SESSION_CONTEXT: &str = "ReviewSession && !CommentEditor";
+
 pub fn init(cx: &mut App) {
     cx.bind_keys([
-        KeyBinding::new("j", SelectNextLine, Some("DiffView")),
-        KeyBinding::new("down", SelectNextLine, Some("DiffView")),
-        KeyBinding::new("k", SelectPreviousLine, Some("DiffView")),
-        KeyBinding::new("up", SelectPreviousLine, Some("DiffView")),
-        KeyBinding::new("c", ToggleComment, Some("DiffView")),
-        KeyBinding::new("cmd-c", CopySelectedLine, Some("DiffView")),
-        KeyBinding::new("cmd-shift-j", SelectNextFile, Some("ReviewSession")),
-        KeyBinding::new("cmd-shift-k", SelectPreviousFile, Some("ReviewSession")),
-        KeyBinding::new("cmd-shift-v", ToggleViewed, Some("ReviewSession")),
+        KeyBinding::new("j", SelectNextLine, Some(DIFF_CONTEXT)),
+        KeyBinding::new("down", SelectNextLine, Some(DIFF_CONTEXT)),
+        KeyBinding::new("k", SelectPreviousLine, Some(DIFF_CONTEXT)),
+        KeyBinding::new("up", SelectPreviousLine, Some(DIFF_CONTEXT)),
+        KeyBinding::new("c", ToggleComment, Some(DIFF_CONTEXT)),
+        KeyBinding::new("cmd-c", CopySelectedLine, Some(DIFF_CONTEXT)),
+        KeyBinding::new("cmd-shift-j", SelectNextFile, Some(SESSION_CONTEXT)),
+        KeyBinding::new("cmd-shift-k", SelectPreviousFile, Some(SESSION_CONTEXT)),
+        KeyBinding::new("cmd-shift-v", ToggleViewed, Some(SESSION_CONTEXT)),
+        KeyBinding::new("escape", CloseComment, Some("CommentEditor")),
     ]);
 }
 
@@ -219,6 +228,15 @@ impl DiffView {
         cx.notify();
     }
 
+    /// Dismisses the composer. Bound to `escape` in the composer's own context,
+    /// since `c` is now reserved for typing while the composer has focus.
+    fn close_comment(&mut self, _: &CloseComment, window: &mut Window, cx: &mut Context<Self>) {
+        if self.comment_line.take().is_some() {
+            window.focus(&self.focus_handle);
+            cx.notify();
+        }
+    }
+
     fn copy_selected_line(&mut self, _: &CopySelectedLine, _: &mut Window, cx: &mut Context<Self>) {
         if let Some(line) = self.file.line(self.selected_line) {
             cx.write_to_clipboard(ClipboardItem::new_string(line.text.to_string()));
@@ -391,6 +409,7 @@ impl Render for DiffView {
             .on_action(cx.listener(Self::select_next_line))
             .on_action(cx.listener(Self::select_previous_line))
             .on_action(cx.listener(Self::toggle_comment))
+            .on_action(cx.listener(Self::close_comment))
             .on_action(cx.listener(Self::copy_selected_line))
             .size_full()
             .flex()
@@ -783,6 +802,51 @@ mod tests {
         );
     }
 
+    /// The composer renders inside `DiffView`, so navigation bindings used to
+    /// swallow every `j`, `k`, and `c` typed into a review comment — and `c`
+    /// closed the composer mid-sentence.
+    #[gpui::test]
+    fn comment_editor_receives_keys_that_the_diff_binds(cx: &mut TestAppContext) {
+        cx.update(init);
+        let file = Arc::new(DiffFile::demo(100));
+        let (view, cx) = cx.add_window_view(|window, cx| DiffView::new(file, window, cx));
+
+        cx.update(|window, app| {
+            window.focus(&view.read(app).focus_handle(app));
+        });
+        cx.dispatch_action(ToggleComment);
+        cx.simulate_input("jerky code");
+
+        assert_eq!(
+            cx.read(|app| view.read(app).comment_editor.read(app).content.clone()),
+            "jerky code",
+        );
+        // Typing must not have navigated the diff or dismissed the composer.
+        assert_eq!(cx.read(|app| view.read(app).selected_line()), 0);
+        assert_eq!(cx.read(|app| view.read(app).comment_line), Some(0));
+    }
+
+    #[gpui::test]
+    fn escape_dismisses_the_comment_editor_and_restores_navigation(cx: &mut TestAppContext) {
+        cx.update(init);
+        let file = Arc::new(DiffFile::demo(100));
+        let (view, cx) = cx.add_window_view(|window, cx| DiffView::new(file, window, cx));
+
+        cx.update(|window, app| {
+            window.focus(&view.read(app).focus_handle(app));
+        });
+        cx.dispatch_action(ToggleComment);
+        cx.simulate_input("k");
+        assert_eq!(cx.read(|app| view.read(app).selected_line()), 0);
+
+        cx.simulate_keystrokes("escape");
+        assert_eq!(cx.read(|app| view.read(app).comment_line), None);
+
+        // With the composer gone, the same key navigates again.
+        cx.simulate_input("j");
+        assert_eq!(cx.read(|app| view.read(app).selected_line()), 1);
+    }
+
     #[gpui::test]
     fn switches_files_and_tracks_viewed_state(cx: &mut TestAppContext) {
         cx.update(init);
@@ -807,5 +871,37 @@ mod tests {
             cx.read(|app| { view.read(app).diff_view.read(app).file.path.to_string() }),
             "src/second.rs",
         );
+    }
+
+    /// Switching files resets the composer, so file navigation must not fire
+    /// while a comment is being written either.
+    #[gpui::test]
+    fn file_navigation_does_not_fire_while_composing(cx: &mut TestAppContext) {
+        cx.update(init);
+        let mut first = DiffFile::demo(20);
+        first.path = "src/first.rs".into();
+        let mut second = DiffFile::demo(30);
+        second.path = "src/second.rs".into();
+        let session =
+            ReviewSession::new(domain::SessionSource::Demo, vec![first, second].into()).unwrap();
+        let (view, cx) = cx.add_window_view(|window, cx| ReviewView::new(session, window, cx));
+
+        cx.update(|window, app| {
+            let focus = view.read(app).diff_view.read(app).focus_handle.clone();
+            window.focus(&focus);
+        });
+        cx.dispatch_action(ToggleComment);
+        cx.simulate_keystrokes("cmd-shift-j");
+
+        assert_eq!(cx.read(|app| view.read(app).selected_file_index()), 0);
+        assert_eq!(
+            cx.read(|app| view.read(app).diff_view.read(app).comment_line),
+            Some(0),
+        );
+
+        // Dismissing the composer hands file navigation back.
+        cx.simulate_keystrokes("escape");
+        cx.simulate_keystrokes("cmd-shift-j");
+        assert_eq!(cx.read(|app| view.read(app).selected_file_index()), 1);
     }
 }
