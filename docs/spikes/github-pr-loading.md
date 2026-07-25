@@ -70,9 +70,9 @@ No live GitHub credentials or network access are required by the test suite.
 - github.com only; GitHub Enterprise Server is deferred.
 - Number-only lookup prefers `origin`; fork ambiguity requires a full PR URL.
 - Metadata loading is synchronous before the GPUI window opens. It should move into an async session-loading state before production.
-- Existing review comments, checks, reviewers, and review submission are not implemented yet.
+- Checks, reviewers, and review submission are not implemented yet.
 - Repository fetches are a trust-sensitive operation and need an explicit repository trust/confirmation UX.
 
 ## Next step
 
-Load existing GitHub review comments and model local draft comments with GitHub-valid `path`/`line`/`side` anchors. Keep drafts local; review submission comes after draft persistence and stale-head validation.
+Existing review comments are covered by [review-comments.md](review-comments.md), which also carries the anchor model local drafts will build on.

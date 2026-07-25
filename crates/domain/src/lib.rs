@@ -224,6 +224,7 @@ pub struct ReviewSession {
     selected_file: usize,
     viewed_paths: BTreeSet<Arc<str>>,
     anchors: Option<AnchorIndex>,
+    comments: Arc<PlacedComments>,
 }
 
 impl ReviewSession {
@@ -245,7 +246,35 @@ impl ReviewSession {
             selected_file: 0,
             viewed_paths: BTreeSet::new(),
             anchors,
+            comments: Arc::new(PlacedComments::default()),
         })
+    }
+
+    /// Places published review comments against this snapshot and reports how
+    /// many threads resulted.
+    ///
+    /// A session with no head commit cannot anchor comments and places none, so a
+    /// zero return is the caller's signal that nothing was shown.
+    pub fn set_review_comments(&mut self, comments: Vec<ReviewComment>) -> usize {
+        let placed = self
+            .anchors
+            .as_ref()
+            .map_or_else(PlacedComments::default, |anchors| {
+                PlacedComments::new(comments, anchors)
+            });
+        let count = placed.thread_count();
+        self.comments = Arc::new(placed);
+        count
+    }
+
+    #[must_use]
+    pub fn comments(&self) -> &PlacedComments {
+        &self.comments
+    }
+
+    #[must_use]
+    pub fn shared_comments(&self) -> Arc<PlacedComments> {
+        Arc::clone(&self.comments)
     }
 
     /// The anchor index for this snapshot.

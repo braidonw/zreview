@@ -58,7 +58,11 @@ cargo test --workspace
 
 Local comparisons are loaded through the `git` executable without a shell, external diff drivers, or text-conversion filters. The parser supports multiple hunks, additions, deletions, renames, copies, binary detection, unusual UTF-8 names, missing-final-newline markers, and direct or merge-base comparison modes.
 
-The UI includes a virtualized changed-file sidebar with status, line counts, keyboard navigation, in-memory viewed state, and pinned GitHub PR source metadata. It does not yet load existing GitHub review threads, submit reviews, persist state, provide syntax highlighting, or run an AI review backend. The comment field is a minimal keyboard-input prototype used to validate focus and variable-height virtualized rows; it will be replaced by an IME-aware production editor.
+The UI includes a virtualized changed-file sidebar with status, line counts, keyboard navigation, in-memory viewed state, and pinned GitHub PR source metadata.
+
+Existing GitHub review conversations are loaded and rendered read-only inside the diff. Replies are collapsed into threads and each thread is anchored to the line its opening comment sits on, using the same `path`/`side`/`line` model GitHub submission requires. A thread GitHub reports without a usable position — outdated, whole-file, or outside a displayed hunk — is listed against its file with the reason instead of being dropped. Replying to and resolving threads are deliberately out of scope for the MVP.
+
+It does not yet submit reviews, persist state, provide syntax highlighting, or run an AI review backend. The comment field is a minimal keyboard-input prototype used to validate focus and variable-height virtualized rows; it will be replaced by an IME-aware production editor.
 
 ## License
 

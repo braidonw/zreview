@@ -2,7 +2,10 @@
 
 use std::sync::Arc;
 
-use domain::{DiffFile, DiffLine, DiffLineKind, FileStatus, ReviewSession, SessionSource};
+use domain::{
+    CommentThread, DiffFile, DiffLine, DiffLineKind, FileStatus, PlacedComments, ReviewSession,
+    SessionSource,
+};
 use gpui::{
     App, ClipboardItem, Context, Entity, FocusHandle, Focusable, KeyBinding, KeyDownEvent,
     ListAlignment, ListState, MouseButton, Render, SharedString, Window, actions, div, list,
@@ -158,8 +161,20 @@ impl Render for CommentEditor {
     }
 }
 
+/// Everything one virtualized diff row needs to draw itself.
+struct DiffRow<'a> {
+    line: &'a DiffLine,
+    index: usize,
+    selected: bool,
+    show_comment: bool,
+    threads: &'a [CommentThread],
+}
+
 pub struct DiffView {
     file: Arc<DiffFile>,
+    /// Index of `file` in the session, which is how threads are keyed.
+    file_index: usize,
+    comments: Arc<PlacedComments>,
     list_state: ListState,
     selected_line: usize,
     comment_line: Option<usize>,
@@ -169,10 +184,18 @@ pub struct DiffView {
 
 impl DiffView {
     #[must_use]
-    pub fn new(file: Arc<DiffFile>, _window: &mut Window, cx: &mut Context<Self>) -> Self {
+    pub fn new(
+        file: Arc<DiffFile>,
+        file_index: usize,
+        comments: Arc<PlacedComments>,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let item_count = file.line_count();
         Self {
             file,
+            file_index,
+            comments,
             list_state: ListState::new(item_count, ListAlignment::Top, px(ROW_HEIGHT)),
             selected_line: 0,
             comment_line: None,
@@ -186,9 +209,10 @@ impl DiffView {
         self.selected_line
     }
 
-    fn set_file(&mut self, file: Arc<DiffFile>, cx: &mut Context<Self>) {
+    fn set_file(&mut self, file: Arc<DiffFile>, file_index: usize, cx: &mut Context<Self>) {
         self.list_state = ListState::new(file.line_count(), ListAlignment::Top, px(ROW_HEIGHT));
         self.file = file;
+        self.file_index = file_index;
         self.selected_line = 0;
         self.comment_line = None;
         self.comment_editor.update(cx, CommentEditor::clear);
@@ -243,15 +267,85 @@ impl DiffView {
         }
     }
 
+    /// Renders one published thread read-only beneath the row it is anchored to.
+    ///
+    /// Replying to and resolving threads are deliberately out of the MVP, so this
+    /// never offers an action that would post to GitHub.
+    fn render_thread(thread: &CommentThread) -> gpui::AnyElement {
+        let replies = thread.reply_count();
+
+        div()
+            // Comment ids are unique across the forge, so they key the element
+            // without colliding between rows.
+            .id(("thread", thread.id()))
+            .w_full()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .p_2()
+            .rounded_md()
+            .border_l_2()
+            .border_color(rgb(0x818cf8))
+            .bg(rgb(0x131c31))
+            .children(thread.comments().iter().map(|comment| {
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .child(
+                        div()
+                            .flex()
+                            .gap_2()
+                            .items_center()
+                            .text_xs()
+                            .child(
+                                div()
+                                    .text_color(rgb(0xc7d2fe))
+                                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                                    .child(SharedString::from(comment.author.to_string())),
+                            )
+                            .child(
+                                div()
+                                    .text_color(rgb(0x64748b))
+                                    .child(SharedString::from(comment.created_at.to_string())),
+                            )
+                            .when(comment.is_multiline(), |header| {
+                                header.child(div().text_color(rgb(0x64748b)).child(format!(
+                                    "lines {}–{}",
+                                    comment.start_line.unwrap_or_default(),
+                                    comment.line.unwrap_or_default(),
+                                )))
+                            }),
+                    )
+                    .child(
+                        div()
+                            .text_sm()
+                            .text_color(rgb(0xcbd5e1))
+                            .child(SharedString::from(comment.body.to_string())),
+                    )
+            }))
+            .when(replies > 0, |thread| {
+                thread.child(div().text_xs().text_color(rgb(0x64748b)).child(format!(
+                    "{replies} repl{}",
+                    if replies == 1 { "y" } else { "ies" }
+                )))
+            })
+            .into_any()
+    }
+
     #[allow(clippy::too_many_lines)]
     fn render_diff_line(
-        line: &DiffLine,
-        index: usize,
-        selected: bool,
-        show_comment: bool,
+        row: &DiffRow<'_>,
         view: &Entity<Self>,
         comment_editor: &Entity<CommentEditor>,
     ) -> gpui::AnyElement {
+        let &DiffRow {
+            line,
+            index,
+            selected,
+            show_comment,
+            threads,
+        } = row;
         let (row_bg, marker_color) = match line.kind {
             DiffLineKind::Context => (rgb(0x0f172a), rgb(0x64748b)),
             DiffLineKind::Addition => (rgb(0x10281d), rgb(0x4ade80)),
@@ -315,6 +409,18 @@ impl DiffView {
                             .text_color(rgb(0xdbeafe))
                             .child(text),
                     )
+                    .when(!threads.is_empty(), |row| {
+                        row.child(
+                            div()
+                                .mr_2()
+                                .px_1()
+                                .rounded_sm()
+                                .bg(rgb(0x312e81))
+                                .text_xs()
+                                .text_color(rgb(0xc7d2fe))
+                                .child(format!("{}", threads.len())),
+                        )
+                    })
                     .when(selected && !show_comment, |row| {
                         row.child(
                             div()
@@ -343,6 +449,18 @@ impl DiffView {
                         )
                     }),
             )
+            .when(!threads.is_empty(), |row| {
+                row.child(
+                    div()
+                        .ml(px(GUTTER_WIDTH * 2.0 + 20.0))
+                        .mr_3()
+                        .py_2()
+                        .flex()
+                        .flex_col()
+                        .gap_2()
+                        .children(threads.iter().map(Self::render_thread)),
+                )
+            })
             .when(show_comment, |row| {
                 row.child(
                     div()
@@ -391,12 +509,19 @@ impl Render for DiffView {
     #[allow(clippy::too_many_lines)]
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let file = self.file.clone();
+        let file_index = self.file_index;
+        let comments = Arc::clone(&self.comments);
         let selected_line = self.selected_line;
         let comment_line = self.comment_line;
         let view = cx.entity();
         let comment_editor = self.comment_editor.clone();
         let path = SharedString::from(file.path.to_string());
         let line_count = file.line_count();
+        let thread_count = comments.thread_count_for_file(file_index);
+        let unplaced = comments
+            .unplaced_for_file(file_index)
+            .cloned()
+            .collect::<Vec<_>>();
         let hunk_header = file.hunks.first().map_or_else(
             || SharedString::from("No hunks"),
             |hunk| SharedString::from(hunk.header.to_string()),
@@ -465,12 +590,14 @@ impl Render for DiffView {
                     .flex()
                     .child(
                         list(self.list_state.clone(), move |index, _, _| {
-                            let line = &file.lines[index];
                             Self::render_diff_line(
-                                line,
-                                index,
-                                selected_line == index,
-                                comment_line == Some(index),
+                                &DiffRow {
+                                    line: &file.lines[index],
+                                    index,
+                                    selected: selected_line == index,
+                                    show_comment: comment_line == Some(index),
+                                    threads: comments.threads_at(file_index, index),
+                                },
                                 &view,
                                 &comment_editor,
                             )
@@ -493,22 +620,59 @@ impl Render for DiffView {
                                 div()
                                     .text_color(rgb(0xf8fafc))
                                     .font_weight(gpui::FontWeight::SEMIBOLD)
-                                    .child("Prototype controls"),
+                                    .child("Conversations"),
                             )
-                            .child("j / ↓  Next line")
-                            .child("k / ↑  Previous line")
-                            .child("c      Toggle comment")
-                            .child("⌘C     Copy selected line")
-                            .child(format!("Selected row: {}", selected_line + 1))
                             .child(
                                 div()
-                                    .mt_4()
                                     .text_xs()
-                                    .text_color(rgb(0x64748b))
+                                    .child(format!("{thread_count} on a diff line")),
+                            )
+                            // Threads GitHub reports without a usable position
+                            // would otherwise be invisible, so they are listed
+                            // against the file with the reason they cannot be
+                            // shown inline.
+                            .when(!unplaced.is_empty(), |panel| {
+                                panel
                                     .child(
-                                        "The comment field is intentionally minimal; this spike validates focus and variable-height rows.",
-                                    ),
-                            ),
+                                        div()
+                                            .mt_2()
+                                            .text_xs()
+                                            .text_color(rgb(0xfbbf24))
+                                            .child(format!("{} not on a line", unplaced.len())),
+                                    )
+                                    .children(unplaced.iter().map(|unplaced| {
+                                        let root = unplaced.thread.root();
+                                        div()
+                                            .p_2()
+                                            .rounded_md()
+                                            .bg(rgb(0x131c31))
+                                            .flex()
+                                            .flex_col()
+                                            .gap_1()
+                                            .child(
+                                                div()
+                                                    .text_xs()
+                                                    .text_color(rgb(0xfbbf24))
+                                                    .child(unplaced.reason.to_string()),
+                                            )
+                                            .child(
+                                                div().text_xs().text_color(rgb(0xc7d2fe)).child(
+                                                    SharedString::from(root.author.to_string()),
+                                                ),
+                                            )
+                                            .child(
+                                                div().text_xs().text_color(rgb(0xcbd5e1)).child(
+                                                    SharedString::from(root.body.to_string()),
+                                                ),
+                                            )
+                                    }))
+                            })
+                            .child(div().mt_4().text_xs().text_color(rgb(0x64748b)).child(
+                                format!(
+                                    "Row {} · j/k move · c comment · esc close",
+                                    selected_line + 1
+                                ),
+                            )),
                     ),
             )
     }
@@ -524,10 +688,13 @@ impl ReviewView {
     #[must_use]
     pub fn new(session: ReviewSession, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let selected_file = Arc::new(session.selected_file().clone());
+        let selected_index = session.selected_file_index();
+        let comments = session.shared_comments();
         let file_count = session.files().len();
         Self {
             session,
-            diff_view: cx.new(|cx| DiffView::new(selected_file, window, cx)),
+            diff_view: cx
+                .new(|cx| DiffView::new(selected_file, selected_index, comments, window, cx)),
             file_list_state: ListState::new(file_count, ListAlignment::Top, px(36.0)),
         }
     }
@@ -541,7 +708,7 @@ impl ReviewView {
         if self.session.select_file(index) {
             let file = Arc::new(self.session.selected_file().clone());
             self.diff_view
-                .update(cx, |view, cx| view.set_file(file, cx));
+                .update(cx, |view, cx| view.set_file(file, index, cx));
             self.file_list_state.scroll_to_reveal_item(index);
         }
         let focus_handle = self.diff_view.read(cx).focus_handle.clone();
@@ -586,6 +753,7 @@ impl ReviewView {
         index: usize,
         selected: bool,
         viewed: bool,
+        threads: usize,
         review_view: &Entity<Self>,
     ) -> gpui::AnyElement {
         let (status, status_color) = match file.status {
@@ -641,6 +809,17 @@ impl ReviewView {
                     .text_color(rgb(0xcbd5e1))
                     .child(path),
             )
+            .when(threads > 0, |row| {
+                row.child(
+                    div()
+                        .px_1()
+                        .rounded_sm()
+                        .bg(rgb(0x312e81))
+                        .text_xs()
+                        .text_color(rgb(0xc7d2fe))
+                        .child(format!("{threads}")),
+                )
+            })
             .when(file.is_binary, |row| {
                 row.child(div().text_xs().text_color(rgb(0x64748b)).child("binary"))
             })
@@ -684,6 +863,8 @@ impl Render for ReviewView {
             .collect::<Vec<_>>();
         let viewed_count = self.session.viewed_count();
         let file_count = files.len();
+        let comments = self.session.shared_comments();
+        let total_threads = comments.thread_count();
         let (source_label, source_title) = match self.session.source() {
             SessionSource::Demo => (
                 SharedString::from("Generated fixture"),
@@ -755,7 +936,7 @@ impl Render for ReviewView {
                                     .child(source_title),
                             )
                             .child(div().text_xs().text_color(rgb(0x64748b)).child(format!(
-                                "{file_count} files · {viewed_count} viewed · ⇧⌘J/K · ⇧⌘V"
+                                "{file_count} files · {viewed_count} viewed · {total_threads} conversations"
                             ))),
                     )
                     .child(
@@ -765,6 +946,7 @@ impl Render for ReviewView {
                                 index,
                                 selected == index,
                                 viewed[index],
+                                comments.thread_count_for_file(index),
                                 &review_view,
                             )
                         })
@@ -784,7 +966,9 @@ mod tests {
     fn renders_and_navigates_a_large_diff(cx: &mut TestAppContext) {
         cx.update(init);
         let file = Arc::new(DiffFile::demo(100_000));
-        let (view, cx) = cx.add_window_view(|window, cx| DiffView::new(file, window, cx));
+        let (view, cx) = cx.add_window_view(|window, cx| {
+            DiffView::new(file, 0, Arc::new(PlacedComments::default()), window, cx)
+        });
 
         cx.update(|window, app| {
             window.focus(&view.read(app).focus_handle(app));
@@ -809,7 +993,9 @@ mod tests {
     fn comment_editor_receives_keys_that_the_diff_binds(cx: &mut TestAppContext) {
         cx.update(init);
         let file = Arc::new(DiffFile::demo(100));
-        let (view, cx) = cx.add_window_view(|window, cx| DiffView::new(file, window, cx));
+        let (view, cx) = cx.add_window_view(|window, cx| {
+            DiffView::new(file, 0, Arc::new(PlacedComments::default()), window, cx)
+        });
 
         cx.update(|window, app| {
             window.focus(&view.read(app).focus_handle(app));
@@ -830,7 +1016,9 @@ mod tests {
     fn escape_dismisses_the_comment_editor_and_restores_navigation(cx: &mut TestAppContext) {
         cx.update(init);
         let file = Arc::new(DiffFile::demo(100));
-        let (view, cx) = cx.add_window_view(|window, cx| DiffView::new(file, window, cx));
+        let (view, cx) = cx.add_window_view(|window, cx| {
+            DiffView::new(file, 0, Arc::new(PlacedComments::default()), window, cx)
+        });
 
         cx.update(|window, app| {
             window.focus(&view.read(app).focus_handle(app));
@@ -870,6 +1058,74 @@ mod tests {
         assert_eq!(
             cx.read(|app| { view.read(app).diff_view.read(app).file.path.to_string() }),
             "src/second.rs",
+        );
+    }
+
+    /// Threads add height to a row inside the virtualized list, so rendering a
+    /// session that has them must not disturb navigation or the composer.
+    #[gpui::test]
+    fn renders_existing_threads_inside_the_virtualized_diff(cx: &mut TestAppContext) {
+        cx.update(init);
+        let mut file = DiffFile::demo(200);
+        file.path = "src/review.rs".into();
+        let head_sha: Arc<str> = "a".repeat(40).into();
+        let source = domain::SessionSource::LocalComparison {
+            repository_root: std::path::PathBuf::from("/tmp/repository"),
+            base_sha: Arc::clone(&head_sha),
+            diff_base_sha: Arc::clone(&head_sha),
+            head_sha: Arc::clone(&head_sha),
+        };
+        let mut session = ReviewSession::new(source, vec![file].into()).unwrap();
+
+        // Row 6 of the demo fixture is an addition on new line 6, plus a reply.
+        let anchored = |id: u64, in_reply_to_id: Option<u64>| domain::ReviewComment {
+            id,
+            author: "reviewer".into(),
+            body: "needs a test".into(),
+            path: "src/review.rs".into(),
+            side: domain::DiffSide::Right,
+            line: Some(6),
+            start_line: None,
+            in_reply_to_id,
+            is_file_level: false,
+            created_at: "2026-07-25T00:00:00Z".into(),
+            url: "https://github.com/acme/widgets/pull/1".into(),
+        };
+        let mut outdated = anchored(3, None);
+        outdated.line = None;
+        let placed =
+            session.set_review_comments(vec![anchored(1, None), anchored(2, Some(1)), outdated]);
+        assert_eq!(placed, 2, "one anchored thread and one outdated");
+        assert_eq!(session.comments().threads_at(0, 6).len(), 1);
+        assert_eq!(session.comments().unplaced().len(), 1);
+
+        let (view, cx) = cx.add_window_view(|window, cx| ReviewView::new(session, window, cx));
+        cx.update(|window, app| {
+            let focus = view.read(app).diff_view.read(app).focus_handle.clone();
+            window.focus(&focus);
+        });
+
+        // Scroll onto the commented row and open a composer beside the thread.
+        for _ in 0..6 {
+            cx.dispatch_action(SelectNextLine);
+        }
+        cx.dispatch_action(ToggleComment);
+        cx.simulate_input("also check the edge case");
+
+        assert_eq!(
+            cx.read(|app| view.read(app).diff_view.read(app).selected_line()),
+            6,
+        );
+        assert_eq!(
+            cx.read(|app| view
+                .read(app)
+                .diff_view
+                .read(app)
+                .comment_editor
+                .read(app)
+                .content
+                .clone()),
+            "also check the edge case",
         );
     }
 

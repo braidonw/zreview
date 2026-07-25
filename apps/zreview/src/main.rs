@@ -2,7 +2,7 @@ use std::{env, path::Path, process::ExitCode};
 
 use domain::{DiffFile, FileStatus, ReviewSession, SessionSource};
 use git::{ComparisonMode, load_comparison};
-use github::{GithubClient, PullRequestSelector};
+use github::{GithubClient, PullRequestLocator, PullRequestSelector};
 use gpui::{
     App, AppContext, Application, Bounds, Focusable, WindowBounds, WindowOptions, px, size,
 };
@@ -92,11 +92,17 @@ fn load_pull_request_session(arguments: &[String]) -> Result<ReviewSession, Stri
         _ => return Err("expected a PR number/URL and an optional repository path".to_owned()),
     };
     let selector = parse_pull_request_selector(selector)?;
-    let pull_request = GithubClient::default()
+    let client = GithubClient::default();
+    let pull_request = client
         .load_pull_request(&repository, &selector)
         .map_err(|error| error.to_string())?;
     let metadata = pull_request.metadata;
     let comparison = pull_request.comparison;
+    let number = metadata.number;
+    let locator = PullRequestLocator {
+        repository: metadata.repository.clone(),
+        number,
+    };
     let source = SessionSource::GitHubPullRequest {
         repository_root: comparison.repository_root,
         owner: metadata.repository.owner.into(),
@@ -112,12 +118,19 @@ fn load_pull_request_session(arguments: &[String]) -> Result<ReviewSession, Stri
         head_sha: metadata.head_sha,
     };
 
-    ReviewSession::new(source, comparison.files).map_err(|_| {
-        format!(
-            "pull request #{} contains no changed files",
-            metadata.number
-        )
-    })
+    let mut session = ReviewSession::new(source, comparison.files)
+        .map_err(|_| format!("pull request #{number} contains no changed files"))?;
+
+    // Existing conversations are part of the review, but a PR is still worth
+    // reading without them, so a failure here is reported rather than fatal.
+    match client.fetch_review_comments(&repository, &locator) {
+        Ok(comments) => {
+            session.set_review_comments(comments);
+        }
+        Err(error) => eprintln!("zreview: could not load existing review comments: {error}"),
+    }
+
+    Ok(session)
 }
 
 fn parse_pull_request_selector(value: &str) -> Result<PullRequestSelector, String> {
