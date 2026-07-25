@@ -1,0 +1,73 @@
+# Enforces the licensing boundary PLAN section 3 depends on.
+#
+# ZReview is dual MIT/Apache-2.0 and must stay linkable that way. Zed's `gpui` is
+# Apache-2.0 and fine to depend on, but Zed's `ui` crate is GPL-3.0-or-later, so
+# a strong-copyleft dependency appearing here is the specific failure this guards
+# against. `cargo deny check` in CI is what makes that boundary enforced rather
+# than merely intended.
+
+[graph]
+# Only the platforms ZReview is built for. Checking every target would demand
+# licence decisions for crates that are never compiled, such as UEFI and Windows
+# backends pulled in by conditional dependencies.
+targets = ["aarch64-apple-darwin", "x86_64-apple-darwin"]
+all-features = true
+
+[licenses]
+# Anything not listed is a build failure, so a new copyleft dependency cannot
+# arrive unnoticed.
+allow = [
+    "MIT",
+    "MIT-0",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "0BSD",
+    "CC0-1.0",
+    "Unlicense",
+    "Unicode-3.0",
+    "BSL-1.0",
+    "NCSA",
+    # Weak, file-level copyleft. Reached only through gpui's font discovery
+    # (option-ext, via dirs -> zed-font-kit) and it does not extend to code that
+    # merely links it. Recorded here as a deliberate decision, and one of the
+    # items PLAN wants confirmed by legal review before distribution.
+    "MPL-2.0",
+]
+# Fail on a dependency whose licence cannot be determined at all.
+unused-allowed-license = "allow"
+confidence-threshold = 0.9
+
+[bans]
+# GPUI's tree brings several versions of common crates. Enforcing one version
+# each would be a fight with an upstream we pin deliberately.
+multiple-versions = "allow"
+wildcards = "deny"
+# Workspace crates depend on each other by path with no version requirement,
+# which is not the unpinned-external-dependency problem this check is for.
+allow-wildcard-paths = true
+
+# GPUI is pre-1.0 and its own README warns that breaking changes are common, so
+# it is pinned exactly. Anything that quietly widened that would defeat the pin.
+[[bans.deny]]
+name = "gpui"
+wrappers = ["ui", "zreview"]
+
+[advisories]
+version = 2
+yanked = "deny"
+# Security advisories always fail. Unmaintained ones are scoped to crates this
+# workspace chose: GPUI's tree currently carries six (rustybuzz, ttf-parser,
+# async-std, paste, proc-macro-error2, rustls-pemfile), none of them
+# vulnerabilities and none with a safe upgrade available to us. Failing CI on
+# those would make it permanently red over something only an upstream can fix,
+# while still leaving us blind to a crate we add ourselves — this way round, the
+# check stays actionable.
+unmaintained = "workspace"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"

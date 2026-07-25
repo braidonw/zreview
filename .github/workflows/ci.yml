@@ -1,0 +1,60 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# A newer push to the same branch makes the older run redundant.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # Fail on a warning that only appears in CI rather than letting it accumulate.
+  RUSTFLAGS: -D warnings
+
+jobs:
+  check:
+    # ZReview is macOS-only and GPUI needs a macOS platform layer, so this is the
+    # only host the workspace can actually be built and tested on.
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # No toolchain version here on purpose: rust-toolchain.toml is the single
+      # pin, and rustup installs from it on the first cargo invocation.
+      - name: Show toolchain
+        run: |
+          rustup show active-toolchain
+          cargo --version
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Formatting
+        run: cargo fmt --all --check
+
+      # --all-targets so tests and benches are linted too, not just the library.
+      - name: Lints
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+      # --locked so a stale committed Cargo.lock fails here rather than silently
+      # resolving to different versions than were reviewed.
+      - name: Tests
+        run: cargo test --workspace --locked
+
+  deny:
+    # Reads Cargo.lock and crate metadata only, so it does not need the macOS
+    # platform layer and runs on the cheaper host. deny.toml restricts the graph
+    # to the Apple targets ZReview ships.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Enforces the licensing boundary PLAN section 3 depends on: ZReview must
+      # stay dual MIT/Apache-2.0, and Zed's GPL `ui` crate must never arrive as a
+      # dependency. Also covers security advisories, yanked crates, and sources.
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check

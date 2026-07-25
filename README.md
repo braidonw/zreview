@@ -49,10 +49,13 @@ Controls:
 ## Validate
 
 ```bash
-cargo fmt --check
-cargo clippy --workspace --all-targets -- -D warnings
-cargo test --workspace
+cargo fmt --all --check
+cargo clippy --workspace --all-targets --locked -- -D warnings
+cargo test --workspace --locked
+cargo deny check
 ```
+
+CI runs the first three on macOS and `cargo deny check` on Linux. `cargo deny` needs `cargo install cargo-deny` locally.
 
 ## Current scope
 
@@ -71,3 +74,7 @@ It does not yet submit reviews, re-anchor a stale draft, persist anything beside
 ## License
 
 Licensed under either Apache-2.0 or MIT, at your option.
+
+`deny.toml` enforces that boundary in CI: every dependency licence must be on an explicit allow list, so a strong-copyleft crate — Zed's GPL-3.0 `ui` crate being the specific one to keep out — cannot arrive unnoticed. Zed's `gpui` itself is Apache-2.0 and fine to depend on.
+
+One deliberate exception is recorded there: `option-ext` is MPL-2.0 and reaches the binary through `gpui`'s font discovery. MPL-2.0 is file-level copyleft that does not extend to code merely linking it, but it is not strictly permissive, and it is one of the items PLAN wants confirmed by legal review before distribution.

@@ -5,6 +5,9 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
+# Internal to the application; the crate names here are not reserved on crates.io
+# and nothing outside this workspace depends on them.
+publish = false
 
 [lints]
 workspace = true
