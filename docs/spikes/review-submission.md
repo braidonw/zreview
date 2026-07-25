@@ -87,11 +87,26 @@ that editor needed — and its limitations.
 - the domain rules: what is included, what is excluded, every refusal, and that
   marking submitted forgets only what was posted.
 
-## Current limitations
+## Verified against a real pull request
 
-- **Nothing has been submitted to a real pull request.** Every layer is tested
-  against fakes and the payload is checked against the documented schema, but the
-  first real `POST` has not happened. That is the one thing left to verify.
+Submitted to a private repository's PR #164 through the ordinary code path — load,
+draft, prepare, submit — and checked against what GitHub stored:
+
+- the review recorded as `COMMENTED` with `commit_id` pinned to the snapshot head;
+- a single-line comment stored as `line: 9, side: RIGHT, start_line: null`;
+- a range comment stored as `line: 11, start_line: 10, side: RIGHT,
+  start_side: RIGHT`, both `subject_type: line`;
+- reloading the pull request afterwards returned both as anchored threads with
+  nothing unplaced — the single-line one back on the row it was written on, and the
+  range on its end row, which is where GitHub anchors it.
+
+The diff pipeline was checked against the same repository at the same time: file
+lists identical to GitHub's "Files changed" for pull requests of 1, 7, 25 and 43
+files, and hunk headers and per-file addition/deletion counts identical for every
+file in one of them. Two of its pull requests had a drifted `base.sha`, which is
+the case the original loading bug refused outright.
+
+## Current limitations
 - Submission cannot be cancelled once sending starts.
 - A submitted review does not appear in the diff as a published thread until the
   session is reopened.
