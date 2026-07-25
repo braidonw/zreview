@@ -15,7 +15,7 @@ Prove that permissively licensed GPUI can support ZReview's central interaction:
 - The selected source line can be copied with Command-C.
 - A focused comment composer can be inserted into a row without changing the list's item count.
 
-The comment composer is intentionally minimal. It validates focus, typing, paste, newline input, and changing row height. It is not yet an IME-aware production editor.
+The comment composer was intentionally minimal here, validating focus, typing, paste, newline input, and changing row height. It has since been replaced by a real editor — see [comment-editor.md](comment-editor.md).
 
 ## Automated coverage
 

@@ -42,7 +42,8 @@ Controls:
 - `⇧J` / `⇧K`: extend the selection to comment on a range of lines
 - `c`: open the inline comment editor on the selected line or range, loading any draft already there
 - `esc`: dismiss the inline comment editor, keeping the draft
-- `⌘C`: copy the selected line
+- `⌘C`: copy the selected diff line
+- In the comment field: arrows, `⇧`-arrows, `home`/`end`, `⌘A`, `⌘C`/`⌘X`/`⌘V`, `enter` for a new line
 - `⇧⌘J` / `⇧⌘K`: select the next or previous changed file
 - `⇧⌘V`: toggle the selected file's viewed state
 - Mouse: select files or diff rows and use the selected row's **Comment** button
@@ -72,7 +73,9 @@ Comments you write become local drafts anchored to the line or range of lines th
 
 A review is submitted as one batch. The bottom bar holds the summary and the three events — comment, approve, request changes — each of which opens a confirmation showing every inline comment, the summary, the pinned head commit, and anything that will *not* be posted. Nothing reaches GitHub until you approve that panel. The head is re-read first and the submission refused if the pull request moved on, and a failure leaves every draft exactly where it was.
 
-It does not yet persist anything besides drafts and the summary, provide syntax highlighting, or run an AI review backend. The comment field is a minimal keyboard-input prototype used to validate focus and variable-height virtualized rows; it will be replaced by an IME-aware production editor.
+The comment field is a real multi-line text editor: a caret you can move, selection, grapheme-aware movement and deletion, cut/copy/paste, and input-method composition for languages that need it. Positioning the caret with the mouse is not supported yet — use the keyboard.
+
+It does not yet persist anything besides drafts and the summary, provide syntax highlighting, or run an AI review backend.
 
 ## License
 

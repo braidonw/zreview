@@ -1,5 +1,9 @@
 #![allow(clippy::unreadable_literal)]
 
+mod text;
+
+pub use text::TextBuffer;
+
 use std::sync::Arc;
 
 use domain::{
@@ -9,9 +13,9 @@ use domain::{
     SubmissionOutcome,
 };
 use gpui::{
-    App, ClipboardItem, Context, Entity, EventEmitter, FocusHandle, Focusable, KeyBinding,
-    KeyDownEvent, ListAlignment, ListState, MouseButton, Render, SharedString, Subscription,
-    Window, actions, div, list, prelude::*, px, rgb,
+    App, ClipboardItem, Context, ElementInputHandler, Entity, EntityInputHandler, EventEmitter,
+    FocusHandle, Focusable, KeyBinding, ListAlignment, ListState, MouseButton, Render,
+    SharedString, Subscription, Window, actions, div, list, prelude::*, px, rgb,
 };
 
 actions!(
@@ -29,6 +33,28 @@ actions!(
 actions!(
     review_session,
     [SelectNextFile, SelectPreviousFile, ToggleViewed]
+);
+actions!(
+    comment_editor,
+    [
+        MoveLeft,
+        MoveRight,
+        MoveUp,
+        MoveDown,
+        MoveLineStart,
+        MoveLineEnd,
+        SelectCharLeft,
+        SelectCharRight,
+        SelectLineUp,
+        SelectLineDown,
+        SelectAllText,
+        DeleteBackward,
+        DeleteForward,
+        InsertNewline,
+        CopySelection,
+        CutSelection,
+        PasteText,
+    ]
 );
 
 const ROW_HEIGHT: f32 = 24.0;
@@ -62,6 +88,27 @@ pub fn init(cx: &mut App) {
         KeyBinding::new("cmd-shift-k", SelectPreviousFile, Some(SESSION_CONTEXT)),
         KeyBinding::new("cmd-shift-v", ToggleViewed, Some(SESSION_CONTEXT)),
         KeyBinding::new("escape", CloseComment, Some("CommentEditor")),
+        // The composer is a real text field, so it needs the bindings a reviewer
+        // will reach for without thinking.
+        KeyBinding::new("left", MoveLeft, Some("CommentEditor")),
+        KeyBinding::new("right", MoveRight, Some("CommentEditor")),
+        KeyBinding::new("up", MoveUp, Some("CommentEditor")),
+        KeyBinding::new("down", MoveDown, Some("CommentEditor")),
+        KeyBinding::new("home", MoveLineStart, Some("CommentEditor")),
+        KeyBinding::new("end", MoveLineEnd, Some("CommentEditor")),
+        KeyBinding::new("cmd-left", MoveLineStart, Some("CommentEditor")),
+        KeyBinding::new("cmd-right", MoveLineEnd, Some("CommentEditor")),
+        KeyBinding::new("shift-left", SelectCharLeft, Some("CommentEditor")),
+        KeyBinding::new("shift-right", SelectCharRight, Some("CommentEditor")),
+        KeyBinding::new("shift-up", SelectLineUp, Some("CommentEditor")),
+        KeyBinding::new("shift-down", SelectLineDown, Some("CommentEditor")),
+        KeyBinding::new("cmd-a", SelectAllText, Some("CommentEditor")),
+        KeyBinding::new("backspace", DeleteBackward, Some("CommentEditor")),
+        KeyBinding::new("delete", DeleteForward, Some("CommentEditor")),
+        KeyBinding::new("enter", InsertNewline, Some("CommentEditor")),
+        KeyBinding::new("cmd-c", CopySelection, Some("CommentEditor")),
+        KeyBinding::new("cmd-x", CutSelection, Some("CommentEditor")),
+        KeyBinding::new("cmd-v", PasteText, Some("CommentEditor")),
     ]);
 }
 
@@ -71,12 +118,12 @@ pub fn init(cx: &mut App) {
 /// which is what makes the text survive a crash.
 pub struct CommentEdited;
 
-/// A deliberately small text-entry control for the virtualization spike.
+/// A multi-line text field for writing a review comment.
 ///
-/// It proves that a focused, variable-height child can live inside the list.
-/// Production review comments will replace this with a full IME-aware editor.
+/// Editing rules live in [`TextBuffer`] so they can be tested without a window;
+/// this type is key dispatch, drawing, and the platform input-method bridge.
 pub struct CommentEditor {
-    content: String,
+    text: TextBuffer,
     focus_handle: FocusHandle,
 }
 
@@ -89,14 +136,13 @@ impl CommentEditor {
 
     fn with_content(content: String, cx: &mut Context<Self>) -> Self {
         Self {
-            content,
+            text: TextBuffer::new(content),
             focus_handle: cx.focus_handle(),
         }
     }
 
     fn clear(&mut self, cx: &mut Context<Self>) {
-        self.content.clear();
-        cx.notify();
+        self.load(String::new(), cx);
     }
 
     /// Loads existing text without reporting it as an edit.
@@ -104,51 +150,269 @@ impl CommentEditor {
     /// Opening the composer on a line that already has a draft has to show that
     /// draft, and echoing it back as a change would be a pointless write.
     fn load(&mut self, content: String, cx: &mut Context<Self>) {
-        self.content = content;
+        self.text.set_content(content);
         cx.notify();
     }
 
     #[must_use]
     fn content(&self) -> &str {
-        &self.content
+        self.text.content()
     }
 
-    fn on_key_down(&mut self, event: &KeyDownEvent, _window: &mut Window, cx: &mut Context<Self>) {
-        let keystroke = &event.keystroke;
-        let handled = match keystroke.key.as_str() {
-            "backspace" => {
-                self.content.pop();
-                true
-            }
-            "enter" => {
-                self.content.push('\n');
-                true
-            }
-            "v" if keystroke.modifiers.platform => {
-                if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
-                    self.content.push_str(&text);
-                }
-                true
-            }
-            _ if !keystroke.modifiers.control
-                && !keystroke.modifiers.platform
-                && !keystroke.modifiers.function =>
-            {
-                if let Some(text) = keystroke.key_char.as_deref() {
-                    self.content.push_str(text);
-                    true
-                } else {
-                    false
-                }
-            }
-            _ => false,
-        };
+    /// Reports an edit and redraws. Moving the caret changes no text, so it only
+    /// redraws and does not come through here.
+    fn edited(cx: &mut Context<Self>) {
+        cx.emit(CommentEdited);
+        cx.notify();
+    }
 
-        if handled {
-            cx.stop_propagation();
-            cx.emit(CommentEdited);
-            cx.notify();
+    fn move_left(&mut self, _: &MoveLeft, _: &mut Window, cx: &mut Context<Self>) {
+        self.text.move_left();
+        cx.notify();
+    }
+
+    fn move_right(&mut self, _: &MoveRight, _: &mut Window, cx: &mut Context<Self>) {
+        self.text.move_right();
+        cx.notify();
+    }
+
+    fn move_up(&mut self, _: &MoveUp, _: &mut Window, cx: &mut Context<Self>) {
+        self.text.move_up();
+        cx.notify();
+    }
+
+    fn move_down(&mut self, _: &MoveDown, _: &mut Window, cx: &mut Context<Self>) {
+        self.text.move_down();
+        cx.notify();
+    }
+
+    fn move_line_start(&mut self, _: &MoveLineStart, _: &mut Window, cx: &mut Context<Self>) {
+        self.text.move_line_start();
+        cx.notify();
+    }
+
+    fn move_line_end(&mut self, _: &MoveLineEnd, _: &mut Window, cx: &mut Context<Self>) {
+        self.text.move_line_end();
+        cx.notify();
+    }
+
+    fn select_char_left(&mut self, _: &SelectCharLeft, _: &mut Window, cx: &mut Context<Self>) {
+        self.text.select_left();
+        cx.notify();
+    }
+
+    fn select_char_right(&mut self, _: &SelectCharRight, _: &mut Window, cx: &mut Context<Self>) {
+        self.text.select_right();
+        cx.notify();
+    }
+
+    fn select_line_up(&mut self, _: &SelectLineUp, _: &mut Window, cx: &mut Context<Self>) {
+        self.text.select_up();
+        cx.notify();
+    }
+
+    fn select_line_down(&mut self, _: &SelectLineDown, _: &mut Window, cx: &mut Context<Self>) {
+        self.text.select_down();
+        cx.notify();
+    }
+
+    fn select_all_text(&mut self, _: &SelectAllText, _: &mut Window, cx: &mut Context<Self>) {
+        self.text.select_all();
+        cx.notify();
+    }
+
+    fn delete_backward(&mut self, _: &DeleteBackward, _: &mut Window, cx: &mut Context<Self>) {
+        self.text.backspace();
+        Self::edited(cx);
+    }
+
+    fn delete_forward(&mut self, _: &DeleteForward, _: &mut Window, cx: &mut Context<Self>) {
+        self.text.delete_forward();
+        Self::edited(cx);
+    }
+
+    fn insert_newline(&mut self, _: &InsertNewline, _: &mut Window, cx: &mut Context<Self>) {
+        self.text.insert("\n");
+        Self::edited(cx);
+    }
+
+    fn copy_selection(&mut self, _: &CopySelection, _: &mut Window, cx: &mut Context<Self>) {
+        if !self.text.selected_text().is_empty() {
+            cx.write_to_clipboard(ClipboardItem::new_string(
+                self.text.selected_text().to_owned(),
+            ));
         }
+    }
+
+    fn cut_selection(&mut self, _: &CutSelection, _: &mut Window, cx: &mut Context<Self>) {
+        if self.text.selected_text().is_empty() {
+            return;
+        }
+        cx.write_to_clipboard(ClipboardItem::new_string(
+            self.text.selected_text().to_owned(),
+        ));
+        self.text.insert("");
+        Self::edited(cx);
+    }
+
+    fn paste_text(&mut self, _: &PasteText, _: &mut Window, cx: &mut Context<Self>) {
+        if let Some(pasted) = cx.read_from_clipboard().and_then(|item| item.text()) {
+            self.text.insert(&pasted);
+            Self::edited(cx);
+        }
+    }
+
+    /// Draws one line, splitting it so the caret and any selection are visible.
+    ///
+    /// Positions come from the buffer rather than from measured glyphs, so the
+    /// caret sits between spans instead of at an exact pixel. That is enough to
+    /// edit by; precise mouse positioning needs shaped-line hit testing.
+    fn render_line(&self, line: &str, line_start: usize, focused: bool) -> gpui::Div {
+        let line_range = line_start..line_start + line.len();
+        let selection = self.text.selection();
+        let selected = selection.start.max(line_range.start)..selection.end.min(line_range.end);
+        let cursor = self.text.cursor();
+
+        // Split the line at the caret and at each end of the selection, so each
+        // piece is uniformly plain or highlighted.
+        let mut boundaries = vec![selected.start, selected.end, cursor, line_range.end];
+        boundaries.retain(|boundary| {
+            (line_range.start..=line_range.end).contains(boundary) && *boundary > line_range.start
+        });
+        boundaries.sort_unstable();
+        boundaries.dedup();
+
+        let mut row = div().flex().items_center().min_h(px(18.0));
+        let mut at = line_range.start;
+        for boundary in boundaries {
+            let highlighted = !selected.is_empty() && at >= selected.start && at < selected.end;
+            let span = &line[at - line_range.start..boundary - line_range.start];
+            if !span.is_empty() {
+                row = row.child(
+                    div()
+                        .when(highlighted, |piece| piece.bg(rgb(0x1d4ed8)))
+                        .child(SharedString::from(span.to_owned())),
+                );
+            }
+            at = boundary;
+            if boundary == cursor && focused {
+                row = row.child(Self::caret());
+            }
+        }
+        // A caret at the very start of the line has no span before it.
+        if cursor == line_range.start && focused {
+            row = div()
+                .flex()
+                .items_center()
+                .min_h(px(18.0))
+                .child(Self::caret())
+                .child(div().flex().items_center().children(vec![row]));
+        }
+        row
+    }
+
+    fn caret() -> gpui::Div {
+        div()
+            .w(px(1.5))
+            .h(px(16.0))
+            .bg(rgb(0xf8fafc))
+            .flex_shrink_0()
+    }
+}
+
+impl EntityInputHandler for CommentEditor {
+    fn text_for_range(
+        &mut self,
+        range_utf16: std::ops::Range<usize>,
+        adjusted: &mut Option<std::ops::Range<usize>>,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<String> {
+        let range = self.text.range_from_utf16(&range_utf16);
+        *adjusted = Some(self.text.range_to_utf16(&range));
+        Some(self.text.content()[range].to_owned())
+    }
+
+    fn selected_text_range(
+        &mut self,
+        _ignore_disabled: bool,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<gpui::UTF16Selection> {
+        Some(gpui::UTF16Selection {
+            range: self.text.range_to_utf16(&self.text.selection()),
+            reversed: false,
+        })
+    }
+
+    fn marked_text_range(
+        &self,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<std::ops::Range<usize>> {
+        self.text
+            .marked()
+            .map(|marked| self.text.range_to_utf16(&marked))
+    }
+
+    fn unmark_text(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        self.text.unmark();
+        cx.notify();
+    }
+
+    fn replace_text_in_range(
+        &mut self,
+        range_utf16: Option<std::ops::Range<usize>>,
+        text: &str,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match range_utf16 {
+            Some(range) => {
+                let range = self.text.range_from_utf16(&range);
+                self.text.replace(range, text);
+            }
+            None => self.text.insert(text),
+        }
+        Self::edited(cx);
+    }
+
+    fn replace_and_mark_text_in_range(
+        &mut self,
+        range_utf16: Option<std::ops::Range<usize>>,
+        text: &str,
+        new_selection_utf16: Option<std::ops::Range<usize>>,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let range = range_utf16.map(|range| self.text.range_from_utf16(&range));
+        self.text.replace_and_mark(range, text, new_selection_utf16);
+        // Composing counts as editing: an in-progress composition is text the
+        // reviewer would not want to lose to a crash.
+        Self::edited(cx);
+    }
+
+    fn bounds_for_range(
+        &mut self,
+        _range_utf16: std::ops::Range<usize>,
+        element_bounds: gpui::Bounds<gpui::Pixels>,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<gpui::Bounds<gpui::Pixels>> {
+        // The field's own bounds, so a candidate window appears beside the
+        // composer. Placing it exactly at the caret needs shaped-line metrics.
+        Some(element_bounds)
+    }
+
+    fn character_index_for_point(
+        &mut self,
+        _point: gpui::Point<gpui::Pixels>,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<usize> {
+        // Mouse positioning is not supported yet; the caret is moved with the
+        // keyboard.
+        None
     }
 }
 
@@ -159,40 +423,91 @@ impl Focusable for CommentEditor {
 }
 
 impl Render for CommentEditor {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let display: SharedString = if self.content.is_empty() {
-            "Write a review comment…".into()
-        } else {
-            format!("{}│", self.content.replace('\n', " ↵ ")).into()
-        };
-        let is_empty = self.content.is_empty();
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let focused = self.focus_handle.is_focused(window);
         let focus_handle = self.focus_handle.clone();
+        let entity = cx.entity();
+        let handler_focus = self.focus_handle.clone();
+
+        let mut line_start = 0;
+        let lines = self
+            .text
+            .lines()
+            .map(|line| {
+                let rendered = self.render_line(line, line_start, focused);
+                line_start += line.len() + 1;
+                rendered
+            })
+            .collect::<Vec<_>>();
 
         div()
             .id("comment-editor")
             .key_context("CommentEditor")
             .track_focus(&self.focus_handle)
-            .on_key_down(cx.listener(Self::on_key_down))
+            .on_action(cx.listener(Self::move_left))
+            .on_action(cx.listener(Self::move_right))
+            .on_action(cx.listener(Self::move_up))
+            .on_action(cx.listener(Self::move_down))
+            .on_action(cx.listener(Self::move_line_start))
+            .on_action(cx.listener(Self::move_line_end))
+            .on_action(cx.listener(Self::select_char_left))
+            .on_action(cx.listener(Self::select_char_right))
+            .on_action(cx.listener(Self::select_line_up))
+            .on_action(cx.listener(Self::select_line_down))
+            .on_action(cx.listener(Self::select_all_text))
+            .on_action(cx.listener(Self::delete_backward))
+            .on_action(cx.listener(Self::delete_forward))
+            .on_action(cx.listener(Self::insert_newline))
+            .on_action(cx.listener(Self::copy_selection))
+            .on_action(cx.listener(Self::cut_selection))
+            .on_action(cx.listener(Self::paste_text))
             .on_mouse_down(MouseButton::Left, move |_, window, cx| {
                 window.focus(&focus_handle);
                 cx.stop_propagation();
             })
-            .h(px(58.0))
+            .min_h(px(58.0))
             .w_full()
             .px_3()
             .py_2()
             .rounded_md()
             .border_1()
-            .border_color(rgb(0x3b82f6))
-            .bg(rgb(0x111827))
-            .text_color(if is_empty {
-                rgb(0x6b7280)
+            .border_color(if focused {
+                rgb(0x3b82f6)
             } else {
-                rgb(0xe5e7eb)
+                rgb(0x334155)
             })
+            .bg(rgb(0x111827))
+            .text_color(rgb(0xe5e7eb))
             .text_sm()
             .cursor_text()
-            .child(display)
+            .flex()
+            .flex_col()
+            // Installs the platform input handler during paint, which is what makes
+            // dead keys, accents, and input-method composition work at all.
+            .child(
+                gpui::canvas(
+                    |_bounds, _window, _cx| {},
+                    // Installed during paint, which is where GPUI requires it.
+                    move |bounds, (), window, cx| {
+                        window.handle_input(
+                            &handler_focus,
+                            ElementInputHandler::new(bounds, entity),
+                            cx,
+                        );
+                    },
+                )
+                .absolute()
+                .size_full(),
+            )
+            .children(if self.text.is_empty() && !focused {
+                vec![
+                    div()
+                        .text_color(rgb(0x6b7280))
+                        .child("Write a review comment…"),
+                ]
+            } else {
+                lines
+            })
     }
 }
 
@@ -2187,7 +2502,7 @@ mod tests {
             Some(1..=1)
         );
         assert_eq!(
-            cx.read(|app| view.read(app).comment_editor.read(app).content.clone()),
+            cx.read(|app| view.read(app).comment_editor.read(app).content().to_owned()),
             "hello",
         );
     }
@@ -2217,7 +2532,7 @@ mod tests {
         cx.simulate_input("jerky code");
 
         assert_eq!(
-            cx.read(|app| view.read(app).comment_editor.read(app).content.clone()),
+            cx.read(|app| view.read(app).comment_editor.read(app).content().to_owned()),
             "jerky code",
         );
         // Typing must not have navigated the diff or dismissed the composer.
@@ -2547,6 +2862,146 @@ mod tests {
                 .first()
                 .map(|warning| warning.summary.clone())),
             Some("GitHub's rate limit is exhausted".to_owned()),
+        );
+    }
+
+    fn open_composer_on(
+        cx: &mut TestAppContext,
+    ) -> (Entity<ReviewView>, &mut gpui::VisualTestContext) {
+        let session = repository_backed_session(&["src/review.rs"]);
+        let (view, cx) = cx.add_window_view(|window, cx| ReviewView::new(session, window, cx));
+        cx.update(|window, app| {
+            let focus = view.read(app).diff_view.read(app).focus_handle.clone();
+            window.focus(&focus);
+        });
+        cx.dispatch_action(ToggleComment);
+        (view, cx)
+    }
+
+    fn composed_text(view: &Entity<ReviewView>, cx: &mut gpui::VisualTestContext) -> String {
+        cx.read(|app| {
+            view.read(app)
+                .diff_view
+                .read(app)
+                .comment_editor
+                .read(app)
+                .content()
+                .to_owned()
+        })
+    }
+
+    /// The old composer could only append and backspace, so a typo in the middle
+    /// of a comment could not be fixed.
+    #[gpui::test]
+    fn the_caret_can_be_moved_and_text_inserted_mid_word(cx: &mut TestAppContext) {
+        cx.update(init);
+        let (view, cx) = open_composer_on(cx);
+
+        cx.simulate_input("helo world");
+        // Back to just after "hel".
+        for _ in 0..7 {
+            cx.simulate_keystrokes("left");
+        }
+        cx.simulate_input("l");
+
+        assert_eq!(composed_text(&view, cx), "hello world");
+    }
+
+    #[gpui::test]
+    fn a_selection_is_replaced_by_what_is_typed(cx: &mut TestAppContext) {
+        cx.update(init);
+        let (view, cx) = open_composer_on(cx);
+
+        cx.simulate_input("hello world");
+        for _ in 0..5 {
+            cx.simulate_keystrokes("shift-left");
+        }
+        cx.simulate_input("there");
+
+        assert_eq!(composed_text(&view, cx), "hello there");
+    }
+
+    #[gpui::test]
+    fn select_all_then_typing_replaces_everything(cx: &mut TestAppContext) {
+        cx.update(init);
+        let (view, cx) = open_composer_on(cx);
+
+        cx.simulate_input("first attempt");
+        cx.simulate_keystrokes("cmd-a");
+        cx.simulate_input("second");
+
+        assert_eq!(composed_text(&view, cx), "second");
+    }
+
+    #[gpui::test]
+    fn a_comment_can_span_several_lines(cx: &mut TestAppContext) {
+        cx.update(init);
+        let (view, cx) = open_composer_on(cx);
+
+        cx.simulate_input("first");
+        cx.simulate_keystrokes("enter");
+        cx.simulate_input("second");
+
+        assert_eq!(composed_text(&view, cx), "first\nsecond");
+
+        // Vertical movement lands on the line above, not at the start of the text.
+        cx.simulate_keystrokes("up");
+        cx.simulate_input("!");
+        assert_eq!(composed_text(&view, cx), "first!\nsecond");
+    }
+
+    #[gpui::test]
+    fn home_and_end_move_within_the_line(cx: &mut TestAppContext) {
+        cx.update(init);
+        let (view, cx) = open_composer_on(cx);
+
+        cx.simulate_input("one");
+        cx.simulate_keystrokes("enter");
+        cx.simulate_input("two");
+        cx.simulate_keystrokes("home");
+        cx.simulate_input("[");
+
+        assert_eq!(composed_text(&view, cx), "one\n[two");
+    }
+
+    #[gpui::test]
+    fn cut_and_paste_move_the_selection(cx: &mut TestAppContext) {
+        cx.update(init);
+        let (view, cx) = open_composer_on(cx);
+
+        cx.simulate_input("keep move");
+        // Selects " move", the space included.
+        for _ in 0..5 {
+            cx.simulate_keystrokes("shift-left");
+        }
+        cx.simulate_keystrokes("cmd-x");
+        assert_eq!(composed_text(&view, cx), "keep");
+
+        cx.simulate_keystrokes("cmd-v");
+        cx.simulate_keystrokes("cmd-v");
+        assert_eq!(composed_text(&view, cx), "keep move move");
+    }
+
+    /// Every edit path has to reach the draft, not just plain typing.
+    #[gpui::test]
+    fn editing_with_the_keyboard_updates_the_stored_draft(cx: &mut TestAppContext) {
+        cx.update(init);
+        let (view, cx) = open_composer_on(cx);
+
+        cx.simulate_input("helo");
+        cx.simulate_keystrokes("left");
+        cx.simulate_input("l");
+        cx.simulate_keystrokes("cmd-a");
+        cx.simulate_keystrokes("backspace");
+        cx.simulate_input("done");
+
+        assert_eq!(
+            cx.read(|app| view
+                .read(app)
+                .session()
+                .draft_at(0, 0)
+                .map(|d| d.body.clone())),
+            Some("done".to_owned()),
         );
     }
 
@@ -3204,8 +3659,8 @@ mod tests {
                 .read(app)
                 .comment_editor
                 .read(app)
-                .content
-                .clone()),
+                .content()
+                .to_owned()),
             "also check the edge case",
         );
     }

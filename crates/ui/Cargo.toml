@@ -12,6 +12,9 @@ publish = false
 [dependencies]
 domain.workspace = true
 gpui.workspace = true
+# Grapheme boundaries, so a caret cannot land inside an emoji and deleting one
+# character does not leave a broken cluster.
+unicode-segmentation = "1.12"
 
 [dev-dependencies]
 gpui = { workspace = true, features = ["test-support"] }

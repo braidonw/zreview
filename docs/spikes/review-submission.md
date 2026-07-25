@@ -97,7 +97,8 @@ that editor needed — and its limitations.
   session is reopened.
 - Approving with unaddressed stale drafts is allowed, with the confirmation
   listing them. Whether that should be a harder stop is a product question.
-- The summary uses the prototype editor: append and backspace only.
+- The summary shares the comment editor, so it inherits its limitations — notably
+  no mouse caret positioning. See [comment-editor.md](comment-editor.md).
 
 ## Next step
 

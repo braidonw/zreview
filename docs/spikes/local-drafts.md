@@ -124,8 +124,8 @@ line, and came back non-stale on reopen with no warnings.
   by accident than to mean, so it is not offered.
 - Re-anchoring is one draft at a time, from the file's panel, and only onto the
   currently selected row. There is no way to move several at once.
-- The composer is still the prototype editor: append and backspace, no cursor, no
-  selection, no IME. Editing a long draft is genuinely awkward.
+- ~~The composer is still the prototype editor.~~ Replaced; see
+  [comment-editor.md](comment-editor.md).
 - ~~Nothing is submitted anywhere yet.~~ See
   [review-submission.md](review-submission.md).
 - A draft is written on every keystroke rather than on a short debounce as PLAN
