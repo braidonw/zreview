@@ -206,6 +206,8 @@ pub enum DiffViewEvent {
     DraftEdited { row: usize, body: String },
     /// The reviewer discarded a row's draft.
     DraftDiscarded { row: usize },
+    /// A stale draft should move onto a row in the current diff.
+    DraftReanchored { stale: DiffAnchor, row: usize },
 }
 
 pub struct DiffView {
@@ -684,9 +686,19 @@ impl Render for DiffView {
         let comments = Arc::clone(&self.comments);
         let drafts = Arc::clone(&self.drafts);
         let draft_count = self.drafts.for_path(&self.file.path).count();
+        // Stale drafts have no row, so the panel is the only place their text can
+        // appear — and the only place the reviewer can act on it.
+        let stale_drafts = self
+            .drafts
+            .stale()
+            .filter(|draft| draft.anchor.path == self.file.path)
+            .cloned()
+            .collect::<Vec<_>>();
         let selected_line = self.selected_line;
         let comment_line = self.comment_line;
         let view = cx.entity();
+        // The list closure takes `view`; the side panel needs its own handle.
+        let panel_view = view.clone();
         let comment_editor = self.comment_editor.clone();
         let path = SharedString::from(file.path.to_string());
         let line_count = file.line_count();
@@ -879,6 +891,75 @@ impl Render for DiffView {
                                             )
                                     }))
                             })
+                            // A stale draft is text the reviewer wrote that
+                            // currently cannot be submitted. It is shown here with
+                            // the one action that fixes that.
+                            .when(!stale_drafts.is_empty(), |panel| {
+                                panel
+                                    .child(div().mt_2().text_xs().text_color(rgb(0xf87171)).child(
+                                        format!(
+                                            "{} draft{} need re-anchoring",
+                                            stale_drafts.len(),
+                                            if stale_drafts.len() == 1 { "" } else { "s" },
+                                        ),
+                                    ))
+                                    .children(stale_drafts.iter().map(|draft| {
+                                        let move_view = panel_view.clone();
+                                        let stale = draft.anchor.clone();
+                                        div()
+                                            .p_2()
+                                            .rounded_md()
+                                            .border_l_2()
+                                            .border_color(rgb(0xf87171))
+                                            .bg(rgb(0x1c1917))
+                                            .flex()
+                                            .flex_col()
+                                            .gap_1()
+                                            .child(div().text_xs().text_color(rgb(0x94a3b8)).child(
+                                                format!(
+                                                    "was {} line {}",
+                                                    draft.anchor.side, draft.anchor.line,
+                                                ),
+                                            ))
+                                            .child(
+                                                div()
+                                                    .text_xs()
+                                                    .text_color(rgb(0xe5e7eb))
+                                                    .child(SharedString::from(draft.body.clone())),
+                                            )
+                                            .child(
+                                                div()
+                                                    .id(("reanchor", draft.anchor.line))
+                                                    .mt_1()
+                                                    .px_2()
+                                                    .py_1()
+                                                    .rounded_sm()
+                                                    .bg(rgb(0x2563eb))
+                                                    .text_xs()
+                                                    .text_color(rgb(0xffffff))
+                                                    .cursor_pointer()
+                                                    .on_mouse_down(
+                                                        MouseButton::Left,
+                                                        move |_, _window, cx| {
+                                                            cx.stop_propagation();
+                                                            let stale = stale.clone();
+                                                            move_view.update(cx, |this, cx| {
+                                                                cx.emit(
+                                                                    DiffViewEvent::DraftReanchored {
+                                                                        stale,
+                                                                        row: this.selected_line,
+                                                                    },
+                                                                );
+                                                            });
+                                                        },
+                                                    )
+                                                    .child(format!(
+                                                        "Move to row {}",
+                                                        selected_line + 1
+                                                    )),
+                                            )
+                                    }))
+                            })
                             .child(div().mt_4().text_xs().text_color(rgb(0x64748b)).child(
                                 format!(
                                     "Row {} · j/k move · c comment · esc close",
@@ -938,8 +1019,32 @@ impl ReviewView {
         cx: &mut Context<Self>,
     ) {
         let file = self.session.selected_file_index();
+
+        // Moving a draft touches two positions, so it reports both: the old one is
+        // now empty and the new one holds the text. Persistence needs both or the
+        // draft would come back twice.
+        if let DiffViewEvent::DraftReanchored { stale, row } = event {
+            if let Some(moved) = self.session.reanchor_draft(stale, file, *row) {
+                let drafts = self.session.shared_drafts();
+                let draft = drafts.get(&moved.anchored).cloned();
+                self.diff_view
+                    .update(cx, |view, cx| view.set_drafts(drafts, cx));
+                cx.emit(DraftsChanged {
+                    draft: None,
+                    anchor: moved.vacated,
+                });
+                cx.emit(DraftsChanged {
+                    draft,
+                    anchor: moved.anchored,
+                });
+                cx.notify();
+            }
+            return;
+        }
+
         let row = match event {
             DiffViewEvent::DraftEdited { row, .. } | DiffViewEvent::DraftDiscarded { row } => *row,
+            DiffViewEvent::DraftReanchored { .. } => return,
         };
         // The anchor is read before the change so a discarded draft still reports
         // which position it was removed from.
@@ -951,7 +1056,7 @@ impl ReviewView {
             DiffViewEvent::DraftEdited { body, .. } => {
                 self.session.set_draft(file, row, body.clone());
             }
-            DiffViewEvent::DraftDiscarded { .. } => {
+            DiffViewEvent::DraftDiscarded { .. } | DiffViewEvent::DraftReanchored { .. } => {
                 self.session.clear_draft(file, row);
             }
         }
@@ -1341,6 +1446,15 @@ impl SessionView {
         cx.notify();
     }
 
+    /// The loaded review, once there is one.
+    #[cfg(test)]
+    fn review(&self) -> Option<&Entity<ReviewView>> {
+        match &self.state {
+            SessionState::Ready { review, .. } => Some(review),
+            _ => None,
+        }
+    }
+
     /// The reason drafts are not reaching storage, if they are not.
     #[must_use]
     pub fn draft_write_failure(&self) -> Option<String> {
@@ -1678,6 +1792,13 @@ mod tests {
         }
     }
 
+    fn review_of(view: &Entity<SessionView>, app: &mut App) -> Entity<ReviewView> {
+        view.read(app)
+            .review()
+            .expect("the session should be ready")
+            .clone()
+    }
+
     fn ready_session_view(
         cx: &mut TestAppContext,
         sink: Option<Box<dyn domain::DraftSink>>,
@@ -1947,6 +2068,73 @@ mod tests {
         }
 
         assert!(cx.read(|app| view.read(app).session().drafts().is_empty()));
+    }
+
+    /// Moving a stale draft has to reach storage as a removal *and* a write, or
+    /// reopening would show the draft in both places.
+    #[gpui::test]
+    fn re_anchoring_a_stale_draft_reaches_the_sink_from_both_sides(cx: &mut TestAppContext) {
+        cx.update(init);
+        let sink = RecordingSink::default();
+        let mut session = repository_backed_session(&["src/review.rs"]);
+        let stale = DiffAnchor {
+            path: "src/review.rs".into(),
+            side: domain::DiffSide::Right,
+            line: 9_999,
+            head_sha: "a".repeat(40).into(),
+        };
+        session.restore_drafts([(stale.clone(), "written last week".to_owned())]);
+        assert_eq!(session.drafts().stale_count(), 1);
+
+        let (view, cx) = cx.add_window_view(|_window, cx| SessionView::loading("a review", cx));
+        cx.update(|window, app| {
+            view.update(app, |view, cx| {
+                view.finish(
+                    Ok(LoadedSession {
+                        session,
+                        draft_sink: Some(Box::new(sink.clone())),
+                    }),
+                    window,
+                    cx,
+                );
+            });
+        });
+
+        // Select a commentable row, then move the stale draft onto it.
+        for _ in 0..6 {
+            cx.dispatch_action(SelectNextLine);
+        }
+        cx.update(|_window, app| {
+            let review = review_of(&view, app);
+            review.update(app, |review, cx| {
+                let diff = review.diff_view.clone();
+                diff.update(cx, |_diff, cx| {
+                    cx.emit(DiffViewEvent::DraftReanchored {
+                        stale: stale.clone(),
+                        row: 6,
+                    });
+                });
+            });
+        });
+
+        cx.update(|_window, app| {
+            let session = review_of(&view, app).read(app).session();
+            assert_eq!(session.drafts().stale_count(), 0, "no longer stale");
+            assert_eq!(
+                session.draft_at(0, 6).map(|draft| draft.body.clone()),
+                Some("written last week".to_owned()),
+            );
+            assert_eq!(session.drafts().len(), 1, "moved, not duplicated");
+        });
+
+        assert_eq!(
+            sink.calls(),
+            [
+                // The position it left, then the one it now occupies.
+                "discard src/review.rs 9999".to_owned(),
+                "save src/review.rs 6 written last week".to_owned(),
+            ],
+        );
     }
 
     /// A file with nothing to render must not put the view in a state where

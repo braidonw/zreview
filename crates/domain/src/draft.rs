@@ -114,6 +114,19 @@ impl Drafts {
         self.entries.remove(&key)
     }
 
+    /// Removes a stale draft by its old anchor, returning its text.
+    ///
+    /// Only stale drafts can be taken this way. An anchored draft is reachable by
+    /// row, and letting it be pulled out by anchor would leave the row index
+    /// pointing at nothing.
+    pub fn take_stale(&mut self, anchor: &DiffAnchor) -> Option<String> {
+        let key = DraftKey::of(anchor);
+        if !self.entries.get(&key).is_some_and(|draft| draft.is_stale) {
+            return None;
+        }
+        self.entries.remove(&key).map(|draft| draft.body)
+    }
+
     #[must_use]
     pub fn at(&self, file: usize, row: usize) -> Option<&DraftComment> {
         let key = self.by_row.get(&(file, row))?;

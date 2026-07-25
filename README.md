@@ -67,9 +67,9 @@ Existing GitHub review conversations are loaded and rendered read-only inside th
 
 The window opens before any Git or GitHub work starts. Loading runs on a background executor and reports its stage, and a failure is shown in the app with the next action to take — `gh auth login` for an unauthenticated CLI, a link for a missing one, and so on — rather than printed to a terminal you may not be watching. Only argument errors are still reported on the command line.
 
-Comments you write become local drafts anchored to the line they are on, saved as you type into a bundled SQLite database under `~/Library/Application Support/ZReview`. They come back when you reopen the same pull request, including drafts written before the branch was pushed to — those are kept and marked as needing re-anchoring rather than discarded.
+Comments you write become local drafts anchored to the line they are on, saved as you type into a bundled SQLite database under `~/Library/Application Support/ZReview`. They come back when you reopen the same pull request, including drafts written before the branch was pushed to — those are kept, listed against their file, and can be moved onto a line in the current diff rather than being discarded.
 
-It does not yet submit reviews, re-anchor a stale draft, persist anything besides drafts, provide syntax highlighting, or run an AI review backend. The comment field is a minimal keyboard-input prototype used to validate focus and variable-height virtualized rows; it will be replaced by an IME-aware production editor.
+It does not yet submit reviews, persist anything besides drafts, provide syntax highlighting, or run an AI review backend. The comment field is a minimal keyboard-input prototype used to validate focus and variable-height virtualized rows; it will be replaced by an IME-aware production editor.
 
 ## License
 

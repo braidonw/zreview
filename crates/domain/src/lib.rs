@@ -345,6 +345,15 @@ impl SessionSource {
     }
 }
 
+/// The two positions a re-anchored draft touched.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReanchoredDraft {
+    /// Where the draft used to claim to be, now empty.
+    pub vacated: DiffAnchor,
+    /// Where it is now, validated against the current diff.
+    pub anchored: DiffAnchor,
+}
+
 /// The outcome of restoring drafts saved in an earlier session.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct RestoredDrafts {
@@ -455,6 +464,36 @@ impl ReviewSession {
         Arc::make_mut(&mut self.drafts)
             .remove_at(file, row)
             .is_some()
+    }
+
+    /// Moves a stale draft onto a row in the current diff.
+    ///
+    /// A stale draft holds text that cannot be submitted, because the position it
+    /// was written against is no longer in the diff. This is how it becomes
+    /// submittable again: the reviewer picks a line that is, and the text moves
+    /// there with a freshly validated anchor.
+    ///
+    /// Returns the anchors involved — the one vacated and the one now holding the
+    /// text — so persistence can follow the move. `None` when the target row
+    /// cannot carry a comment, or `stale` names no stale draft.
+    pub fn reanchor_draft(
+        &mut self,
+        stale: &DiffAnchor,
+        file: usize,
+        row: usize,
+    ) -> Option<ReanchoredDraft> {
+        let target = self.anchor_for(file, row)?;
+        // Checked before the text is removed, so a refused move changes nothing.
+        if self.drafts.get(&target).is_some() {
+            return None;
+        }
+        let body = Arc::make_mut(&mut self.drafts).take_stale(stale)?;
+        Arc::make_mut(&mut self.drafts).insert(target.clone(), body, file, row);
+
+        Some(ReanchoredDraft {
+            vacated: stale.clone(),
+            anchored: target,
+        })
     }
 
     #[must_use]
@@ -973,6 +1012,100 @@ mod tests {
         assert_eq!(session.drafts().stale_count(), 1);
         // It did not take the row it would have occupied.
         assert!(session.draft_at(0, 6).is_none());
+    }
+
+    fn stale_anchor() -> DiffAnchor {
+        DiffAnchor {
+            path: "src/review.rs".into(),
+            side: DiffSide::Right,
+            line: 9_999,
+            head_sha: "h".repeat(40).into(),
+        }
+    }
+
+    /// Without this, a kept stale draft is text the reviewer can see and never
+    /// submit.
+    #[test]
+    fn a_stale_draft_can_be_moved_onto_a_line_in_the_diff() {
+        let mut session = anchored_session();
+        session.restore_drafts([(stale_anchor(), "still worth saying".to_owned())]);
+        assert_eq!(session.drafts().stale_count(), 1);
+
+        let moved = session
+            .reanchor_draft(&stale_anchor(), 0, 6)
+            .expect("row 6 can carry a comment");
+
+        assert_eq!(moved.vacated, stale_anchor());
+        assert_eq!(moved.anchored.line, 6);
+        assert_eq!(moved.anchored.side, DiffSide::Right);
+
+        // The text is now anchored where it can be submitted.
+        let draft = session.draft_at(0, 6).expect("it should be on the row");
+        assert_eq!(draft.body, "still worth saying");
+        assert!(!draft.is_stale);
+        assert_eq!(session.drafts().stale_count(), 0);
+        assert_eq!(session.drafts().len(), 1, "moved, not duplicated");
+    }
+
+    #[test]
+    fn re_anchoring_refuses_a_row_that_cannot_carry_a_comment() {
+        let source = SessionSource::LocalComparison {
+            repository_root: PathBuf::from("/tmp/repository"),
+            base_sha: "b".repeat(40).into(),
+            diff_base_sha: "d".repeat(40).into(),
+            head_sha: "h".repeat(40).into(),
+        };
+        let mut file = DiffFile::demo(4);
+        file.path = "src/review.rs".into();
+        let mut lines = file.lines.to_vec();
+        lines[3] = DiffLine {
+            kind: DiffLineKind::NoNewlineMarker,
+            old_line: None,
+            new_line: None,
+            text: "No newline at end of file".into(),
+        };
+        file.lines = lines.into();
+        let mut session = ReviewSession::new(source, vec![file].into()).unwrap();
+        session.restore_drafts([(stale_anchor(), "still worth saying".to_owned())]);
+
+        assert!(session.reanchor_draft(&stale_anchor(), 0, 3).is_none());
+        // Refused without consuming the text.
+        assert_eq!(session.drafts().stale_count(), 1);
+        assert_eq!(
+            session.drafts().stale().next().unwrap().body,
+            "still worth saying",
+        );
+    }
+
+    /// One anchor holds one draft, so a move must not silently overwrite whatever
+    /// is already on the target row.
+    #[test]
+    fn re_anchoring_refuses_a_row_that_already_has_a_draft() {
+        let mut session = anchored_session();
+        session.set_draft(0, 6, "written just now");
+        session.restore_drafts([(stale_anchor(), "written last week".to_owned())]);
+
+        assert!(session.reanchor_draft(&stale_anchor(), 0, 6).is_none());
+
+        assert_eq!(session.draft_at(0, 6).unwrap().body, "written just now");
+        assert_eq!(
+            session.drafts().stale().next().unwrap().body,
+            "written last week",
+        );
+    }
+
+    #[test]
+    fn re_anchoring_an_anchor_with_no_stale_draft_does_nothing() {
+        let mut session = anchored_session();
+        session.set_draft(0, 0, "an ordinary draft");
+        let anchored = session.anchor_for(0, 0).unwrap();
+
+        // Not stale, so it cannot be pulled out by anchor.
+        assert!(session.reanchor_draft(&anchored, 0, 6).is_none());
+        assert!(session.reanchor_draft(&stale_anchor(), 0, 6).is_none());
+
+        assert_eq!(session.draft_at(0, 0).unwrap().body, "an ordinary draft");
+        assert_eq!(session.drafts().len(), 1);
     }
 
     #[test]

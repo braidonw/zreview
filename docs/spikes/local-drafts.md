@@ -47,7 +47,11 @@ Every layer refuses to drop text in that situation:
   what has to happen before they can be submitted;
 - the diff marks a stale draft as needing re-anchoring rather than hiding it.
 
-Re-anchoring itself is not implemented yet — see the limitations.
+A stale draft can then be moved: select a line in the current diff and the panel
+listing the draft offers to move it there. The move is validated like any other
+draft creation, refuses a row that cannot carry a comment, and refuses a row that
+already holds a draft rather than overwriting it. It reaches storage as a removal
+*and* a write, because a move that only wrote would come back in both places.
 
 ## Persistence
 
@@ -90,7 +94,11 @@ review data and makes relocating it later a matter of configuration.
   draft from another head restored as stale *with* its warning, and unusable
   storage warning while still opening the session;
 - the last link, that a keystroke reaches the sink and a discard reaches it too,
-  through a recording sink.
+  through a recording sink;
+- re-anchoring: a stale draft moving onto a row and ceasing to be stale, refusal
+  on a row that cannot carry a comment and on one that already holds a draft
+  (neither consuming the text), and the move reaching storage as both a removal
+  and a write.
 
 Verified against a real repository: a draft on a deleted line anchored to
 `LEFT` line 2, was written to SQLite with the expected scope, head, path, side and
@@ -98,9 +106,8 @@ line, and came back non-stale on reopen with no warnings.
 
 ## Current limitations
 
-- **A stale draft cannot be re-anchored.** It is kept, shown, and counted, but
-  moving it to a line in the current diff has no UI yet. This is the most
-  important gap.
+- Re-anchoring is one draft at a time, from the file's panel, and only onto the
+  currently selected row. There is no way to move several at once.
 - The composer is still the prototype editor: append and backspace, no cursor, no
   selection, no IME. Editing a long draft is genuinely awkward.
 - Nothing is submitted anywhere yet. Drafts accumulate locally.
@@ -115,7 +122,6 @@ line, and came back non-stale on reopen with no warnings.
 
 ## Next step
 
-Re-anchoring stale drafts, then the review summary and batch submission — the rest
-of Phase 3. Submission is where the anchor validator earns its place: only anchors
-that resolve may become inline comments, and everything else has to be moved or
-folded into the summary.
+The review summary and batch submission — the rest of Phase 3. Submission is where
+the anchor validator earns its place: only anchors that resolve may become inline
+comments, and everything else has to be moved or folded into the summary.
