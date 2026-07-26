@@ -13,6 +13,7 @@ publish = false
 domain.workspace = true
 git.workspace = true
 github.workspace = true
+review.workspace = true
 store.workspace = true
 
 [dev-dependencies]

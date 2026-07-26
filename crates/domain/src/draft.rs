@@ -13,40 +13,7 @@ use std::{
     sync::Arc,
 };
 
-use crate::{DiffAnchor, DiffSide};
-
-/// Where draft changes are written so they survive the process.
-///
-/// Declared here, next to the drafts themselves, so the storage implementation
-/// depends on the domain rather than the other way round — and so a view can
-/// report a write failure without knowing a database exists.
-///
-/// Implementations must not block: this is called from the UI thread as the
-/// reviewer types. `Send` because a sink is built wherever loading happens, which
-/// is not the thread that will use it.
-pub trait DraftSink: Send + 'static {
-    /// Records the current text at an anchor.
-    fn save(&self, anchor: &DiffAnchor, body: &str);
-
-    /// Records that the draft at an anchor is gone.
-    fn discard(&self, anchor: &DiffAnchor);
-
-    /// Records the review summary for a snapshot.
-    ///
-    /// Keyed by head rather than by anchor, because the summary belongs to the
-    /// review as a whole rather than to any line.
-    fn save_summary(&self, head_sha: &str, body: &str);
-
-    /// Records that every draft at these anchors has been submitted and is no
-    /// longer local, along with the summary that went with them.
-    ///
-    /// Called only after a forge has accepted the review: until then the local
-    /// copy is the only copy.
-    fn clear_submitted(&self, head_sha: &str, anchors: &[DiffAnchor]);
-
-    /// The most recent write failure, if writes are failing.
-    fn failure(&self) -> Option<String>;
-}
+use crate::{DiffAnchor, DiffSide, FindingProvenance};
 
 /// A draft's position, ordered so a queue reads down the file.
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -67,7 +34,7 @@ impl DraftKey {
 }
 
 /// One unsubmitted comment.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct DraftComment {
     pub anchor: DiffAnchor,
     pub body: String,
@@ -76,6 +43,22 @@ pub struct DraftComment {
     /// A stale draft still holds its text and is still shown, but it cannot be
     /// submitted inline until it is re-anchored.
     pub is_stale: bool,
+    /// Set when this draft started life as a backend's finding.
+    ///
+    /// The reviewer accepted it, so it is their comment now and posts under their
+    /// name — but which model proposed it and which guidance it rested on stay
+    /// recorded, both because PLAN section 8 asks findings to be auditable and
+    /// because a reviewer scanning the queue should be able to tell their own words
+    /// from a suggestion they took.
+    pub provenance: Option<FindingProvenance>,
+}
+
+impl DraftComment {
+    /// Whether a backend proposed this rather than the reviewer writing it.
+    #[must_use]
+    pub const fn is_proposed(&self) -> bool {
+        self.provenance.is_some()
+    }
 }
 
 /// Every draft in one session.
@@ -96,14 +79,38 @@ impl Drafts {
     /// reopening the composer on a line edits what is there rather than stacking
     /// a second comment on the same line.
     pub fn insert(&mut self, anchor: DiffAnchor, body: String, file: usize, row: usize) {
+        self.insert_with(anchor, body, None, file, row);
+    }
+
+    /// Stores a draft, recording where it came from when a backend proposed it.
+    ///
+    /// Editing a proposed draft keeps its provenance: the reviewer reworded a
+    /// suggestion, which does not make it stop having been one.
+    pub fn insert_with(
+        &mut self,
+        anchor: DiffAnchor,
+        body: String,
+        provenance: Option<FindingProvenance>,
+        file: usize,
+        row: usize,
+    ) {
         let key = DraftKey::of(&anchor);
         self.by_row.insert((file, row), key.clone());
+        // An edit that arrives without provenance must not erase provenance already
+        // recorded here, or accepting a finding and then rewording it would lose the
+        // attribution.
+        let provenance = provenance.or_else(|| {
+            self.entries
+                .get(&key)
+                .and_then(|existing| existing.provenance.clone())
+        });
         self.entries.insert(
             key,
             DraftComment {
                 anchor,
                 body,
                 is_stale: false,
+                provenance,
             },
         );
     }
@@ -111,12 +118,17 @@ impl Drafts {
     /// Stores a draft whose anchor no longer resolves to a displayed row.
     pub fn insert_stale(&mut self, anchor: DiffAnchor, body: String) {
         let key = DraftKey::of(&anchor);
+        let provenance = self
+            .entries
+            .get(&key)
+            .and_then(|existing| existing.provenance.clone());
         self.entries.insert(
             key,
             DraftComment {
                 anchor,
                 body,
                 is_stale: true,
+                provenance,
             },
         );
     }
@@ -149,6 +161,18 @@ impl Drafts {
             return None;
         }
         self.entries.remove(&key).map(|draft| draft.body)
+    }
+
+    /// Attaches provenance to a draft that is already here.
+    ///
+    /// Returns `false` when no draft holds that anchor, which is how restoring
+    /// skips provenance for a draft that has since been submitted or discarded.
+    pub fn set_provenance(&mut self, anchor: &DiffAnchor, provenance: FindingProvenance) -> bool {
+        let Some(draft) = self.entries.get_mut(&DraftKey::of(anchor)) else {
+            return false;
+        };
+        draft.provenance = Some(provenance);
+        true
     }
 
     #[must_use]

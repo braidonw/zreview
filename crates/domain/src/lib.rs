@@ -8,14 +8,29 @@ use std::{
 };
 
 mod anchor;
+mod backend;
 mod comment;
 mod draft;
+mod finding;
+mod guidance;
+mod review_state;
 mod session;
 mod submission;
 
 pub use anchor::{AnchorError, AnchorIndex, AnchorLocation, DiffAnchor, DiffSide};
+pub use backend::{
+    GuidanceExcerpt, IgnoreProgress, ReviewBackend, ReviewError, ReviewEventSink, ReviewProgress,
+    ReviewRequest,
+};
 pub use comment::{CommentThread, PlacedComments, ReviewComment, UnplacedReason, UnplacedThread};
-pub use draft::{DraftComment, DraftSink, Drafts};
+pub use draft::{DraftComment, Drafts};
+pub use finding::{
+    DismissedFindings, Finding, FindingId, FindingOrigin, FindingProvenance, Findings,
+    GuidanceCitation, MAX_COMMENT_BYTES, MAX_FINDINGS, MAX_RATIONALE_BYTES, MAX_TITLE_BYTES,
+    RawFinding, RawLocation, RejectedFinding, RejectionReason, Severity, fingerprint,
+};
+pub use guidance::{GuidanceEntry, GuidanceSelection, GuidanceSkip};
+pub use review_state::ReviewStateSink;
 pub use session::{LoadStage, LoadedSession, SessionFailure};
 pub use submission::{
     ExcludedDraft, ExclusionReason, ReviewEvent, ReviewSubmission, ReviewSubmitter,
@@ -398,6 +413,36 @@ pub struct ReviewSession {
     warnings: Vec<SessionFailure>,
     drafts: Arc<Drafts>,
     summary: String,
+    /// Findings from the most recent review run, waiting to be acted on.
+    findings: Findings,
+    /// Claims the reviewer rejected, kept so a re-run does not offer them again.
+    dismissed: DismissedFindings,
+    /// What a review would be held to, discovered when the snapshot opened.
+    guidance: GuidanceSelection,
+}
+
+/// What happened when a reviewer accepted a finding.
+#[derive(Clone, Debug, PartialEq)]
+pub enum FindingAcceptance {
+    /// Written as a draft. The anchor and body are returned so persistence can
+    /// follow.
+    Drafted { anchor: DiffAnchor, body: String },
+    /// A draft is already at that anchor, so nothing was written.
+    ///
+    /// Both texts come back for a composer to open pre-filled: overwriting the
+    /// reviewer's own words is the one thing acceptance must never do silently, and
+    /// choosing between them is not a decision this layer should make.
+    Occupied {
+        anchor: DiffAnchor,
+        location: AnchorLocation,
+        existing: String,
+        proposed: String,
+    },
+    /// The finding is about the change as a whole, so there is no line to attach it
+    /// to. Its text is returned for the summary, if the reviewer wants it there.
+    NotInline { proposed: String },
+    /// No pending finding has that id.
+    Unknown,
 }
 
 impl ReviewSession {
@@ -423,6 +468,9 @@ impl ReviewSession {
             warnings: Vec::new(),
             drafts: Arc::new(Drafts::default()),
             summary: String::new(),
+            findings: Findings::default(),
+            dismissed: DismissedFindings::default(),
+            guidance: GuidanceSelection::default(),
         })
     }
 
@@ -556,6 +604,146 @@ impl ReviewSession {
     #[must_use]
     pub fn draft_at(&self, file: usize, row: usize) -> Option<&DraftComment> {
         self.drafts.at(file, row)
+    }
+
+    /// Findings waiting for the reviewer to accept or dismiss.
+    #[must_use]
+    pub const fn findings(&self) -> &Findings {
+        &self.findings
+    }
+
+    /// What a review would be held to, and what of it would be sent.
+    #[must_use]
+    pub const fn guidance(&self) -> &GuidanceSelection {
+        &self.guidance
+    }
+
+    /// Records what discovery found when the snapshot opened.
+    pub fn set_guidance(&mut self, guidance: GuidanceSelection) {
+        self.guidance = guidance;
+    }
+
+    /// Turns one guidance file on or off for the next run.
+    ///
+    /// Returns whether anything changed, so a view can avoid a redraw for a click
+    /// that meant nothing.
+    pub fn set_guidance_included(&mut self, path: &str, included: bool) -> bool {
+        self.guidance.set_included(path, included)
+    }
+
+    /// Flips one guidance file, returning its new state.
+    pub fn toggle_guidance(&mut self, path: &str) -> Option<bool> {
+        self.guidance.toggle(path)
+    }
+
+    /// Claims the reviewer has dismissed, so a re-run can suppress them.
+    #[must_use]
+    pub const fn dismissed_findings(&self) -> &DismissedFindings {
+        &self.dismissed
+    }
+
+    /// Replaces the pending findings with the result of a review run.
+    ///
+    /// Anything the reviewer already dismissed is suppressed here rather than
+    /// offered again, and the count of what was suppressed is returned so the run
+    /// can say so — a review that hid twelve findings looks exactly like one that
+    /// found nothing otherwise.
+    pub fn set_findings(&mut self, mut findings: Findings) -> usize {
+        let suppressed = findings.drop_dismissed(&self.dismissed);
+        self.findings = findings;
+        suppressed
+    }
+
+    /// Restores dismissals recorded in an earlier session.
+    pub fn restore_dismissed(&mut self, dismissed: DismissedFindings) {
+        self.dismissed = dismissed;
+    }
+
+    /// Reattaches provenance to drafts restored from storage.
+    ///
+    /// Called after [`restore_drafts`], because provenance describes a draft that
+    /// must already be there. Provenance for an anchor holding no draft is ignored:
+    /// the draft was submitted or discarded, and an attribution with nothing to
+    /// attribute is not worth keeping.
+    ///
+    /// Returns how many drafts got their provenance back.
+    ///
+    /// [`restore_drafts`]: Self::restore_drafts
+    pub fn restore_provenance(
+        &mut self,
+        provenance: Vec<(DiffAnchor, FindingProvenance)>,
+    ) -> usize {
+        let drafts = Arc::make_mut(&mut self.drafts);
+        provenance
+            .into_iter()
+            .filter(|(anchor, recorded)| drafts.set_provenance(anchor, recorded.clone()))
+            .count()
+    }
+
+    /// Accepts a finding, writing its proposed comment as a draft.
+    ///
+    /// This is the moment a finding stops being a finding. The reviewer read it and
+    /// said yes, so it becomes an ordinary draft — persisted, re-anchored after a
+    /// force-push, and submitted by exactly the same machinery as a comment they
+    /// typed themselves. What it keeps is its provenance.
+    ///
+    /// Refuses to overwrite. One anchor holds one draft, so a finding landing where
+    /// the reviewer has already written something would destroy their words, and
+    /// this module does not do that. That case comes back as
+    /// [`FindingAcceptance::Occupied`] carrying both texts, for a composer to open
+    /// pre-filled so the reviewer decides.
+    pub fn accept_finding(&mut self, id: FindingId) -> FindingAcceptance {
+        let Some(finding) = self.findings.get(id) else {
+            return FindingAcceptance::Unknown;
+        };
+        let (Some(anchor), Some(location)) = (finding.anchor.clone(), finding.location) else {
+            return FindingAcceptance::NotInline {
+                proposed: finding.proposed_comment.clone(),
+            };
+        };
+
+        if let Some(existing) = self.drafts.get(&anchor) {
+            return FindingAcceptance::Occupied {
+                anchor,
+                location,
+                existing: existing.body.clone(),
+                proposed: finding.proposed_comment.clone(),
+            };
+        }
+
+        let provenance = finding.provenance();
+        let body = finding.proposed_comment.clone();
+        Arc::make_mut(&mut self.drafts).insert_with(
+            anchor.clone(),
+            body.clone(),
+            Some(provenance),
+            location.file,
+            location.row,
+        );
+        // Only now, once the text is somewhere durable.
+        self.findings.take(id);
+        FindingAcceptance::Drafted { anchor, body }
+    }
+
+    /// Dismisses a finding and remembers the decision.
+    ///
+    /// Returns the fingerprint to persist, so the same claim is not offered again on
+    /// the next run.
+    pub fn dismiss_finding(&mut self, id: FindingId) -> Option<String> {
+        let finding = self.findings.take(id)?;
+        self.dismissed.insert(finding.fingerprint.clone());
+        Some(finding.fingerprint)
+    }
+
+    /// Clears a finding the reviewer resolved by hand, after an
+    /// [`FindingAcceptance::Occupied`] composer wrote the merged text.
+    ///
+    /// Separate from [`accept_finding`] because the draft already exists by then;
+    /// this only retires the finding that prompted it.
+    ///
+    /// [`accept_finding`]: Self::accept_finding
+    pub fn retire_finding(&mut self, id: FindingId) -> Option<Finding> {
+        self.findings.take(id)
     }
 
     /// Assembles the review that submitting would post.
@@ -988,6 +1176,257 @@ mod tests {
         let mut file = DiffFile::demo(40);
         file.path = "src/review.rs".into();
         ReviewSession::new(source, vec![file].into()).unwrap()
+    }
+
+    /// A raw finding on a row the demo fixture makes commentable.
+    ///
+    /// Row 6 of the fixture is an addition, so it anchors right at its new line.
+    fn raw_finding(session: &ReviewSession, row: usize, title: &str) -> RawFinding {
+        let anchor = session
+            .anchor_for(0, row)
+            .expect("the row can carry a comment");
+        RawFinding {
+            location: Some(RawLocation {
+                path: anchor.path,
+                side: anchor.side,
+                line: anchor.line,
+                start_line: None,
+            }),
+            severity: Severity::Warning,
+            confidence: 0.9,
+            title: title.to_owned(),
+            rationale: "because".to_owned(),
+            proposed_comment: "Handle the failure here.".to_owned(),
+            guidance_sources: vec![GuidanceCitation {
+                path: "AGENTS.md".into(),
+                content_hash: "hash".into(),
+            }],
+        }
+    }
+
+    fn with_findings(session: &mut ReviewSession, raw: Vec<RawFinding>) {
+        let anchors = session.anchors().expect("the session is anchored").clone();
+        let findings = Findings::validate(raw, &anchors, &FindingOrigin::Ai("claude-code".into()));
+        session.set_findings(findings);
+    }
+
+    #[test]
+    fn accepting_a_finding_writes_it_as_a_draft_carrying_its_provenance() {
+        let mut session = anchored_session();
+        let raw = raw_finding(&session, 6, "unchecked index");
+        with_findings(&mut session, vec![raw]);
+        let id = session.findings().accepted()[0].id;
+
+        let outcome = session.accept_finding(id);
+
+        let FindingAcceptance::Drafted { anchor, body } = outcome else {
+            panic!("expected the finding to become a draft, got {outcome:?}");
+        };
+        assert_eq!(body, "Handle the failure here.");
+        let draft = session.drafts().get(&anchor).expect("the draft is there");
+        assert!(draft.is_proposed());
+        let provenance = draft.provenance.as_ref().expect("provenance is recorded");
+        assert_eq!(provenance.origin, FindingOrigin::Ai("claude-code".into()));
+        assert_eq!(provenance.guidance_sources[0].path.as_ref(), "AGENTS.md");
+        // Acted on, so no longer pending.
+        assert!(session.findings().is_empty());
+    }
+
+    #[test]
+    fn a_draft_the_reviewer_wrote_has_no_provenance() {
+        let mut session = anchored_session();
+        session.set_draft(0, 6, "my own thought");
+
+        let draft = session.draft_at(0, 6).expect("the draft is there");
+
+        assert!(!draft.is_proposed());
+    }
+
+    /// The case that decided the design: acceptance must never overwrite.
+    #[test]
+    fn accepting_onto_a_line_the_reviewer_already_commented_on_writes_nothing() {
+        let mut session = anchored_session();
+        session.set_draft(0, 6, "I already said something here");
+        let raw = raw_finding(&session, 6, "unchecked index");
+        with_findings(&mut session, vec![raw]);
+        let id = session.findings().accepted()[0].id;
+
+        let outcome = session.accept_finding(id);
+
+        let FindingAcceptance::Occupied {
+            location,
+            existing,
+            proposed,
+            ..
+        } = outcome
+        else {
+            panic!("expected the anchor to be occupied, got {outcome:?}");
+        };
+        assert_eq!(existing, "I already said something here");
+        assert_eq!(proposed, "Handle the failure here.");
+        assert_eq!(location.row, 6);
+        // The reviewer's words are untouched, and the finding is still pending.
+        assert_eq!(
+            session.draft_at(0, 6).map(|draft| draft.body.as_str()),
+            Some("I already said something here")
+        );
+        assert_eq!(session.findings().len(), 1);
+    }
+
+    #[test]
+    fn resolving_an_occupied_anchor_by_hand_retires_the_finding() {
+        let mut session = anchored_session();
+        session.set_draft(0, 6, "mine");
+        let raw = raw_finding(&session, 6, "unchecked index");
+        with_findings(&mut session, vec![raw]);
+        let id = session.findings().accepted()[0].id;
+
+        // What the composer does once the reviewer merges the two texts.
+        assert!(session.set_draft(0, 6, "mine, and also: handle the failure"));
+        let retired = session.retire_finding(id);
+
+        assert!(retired.is_some());
+        assert!(session.findings().is_empty());
+        assert_eq!(
+            session.draft_at(0, 6).map(|draft| draft.body.as_str()),
+            Some("mine, and also: handle the failure")
+        );
+    }
+
+    #[test]
+    fn rewording_an_accepted_finding_keeps_its_provenance() {
+        let mut session = anchored_session();
+        let raw = raw_finding(&session, 6, "unchecked index");
+        with_findings(&mut session, vec![raw]);
+        let id = session.findings().accepted()[0].id;
+        session.accept_finding(id);
+
+        // The reviewer edits the wording; it is still a suggestion they took.
+        assert!(session.set_draft(0, 6, "Please handle this failure case."));
+
+        let draft = session.draft_at(0, 6).expect("the draft is there");
+        assert_eq!(draft.body, "Please handle this failure case.");
+        assert!(draft.is_proposed());
+    }
+
+    #[test]
+    fn a_finding_about_the_whole_change_has_no_line_to_attach_to() {
+        let mut session = anchored_session();
+        let mut raw = raw_finding(&session, 6, "no tests anywhere");
+        raw.location = None;
+        with_findings(&mut session, vec![raw]);
+        let id = session.findings().accepted()[0].id;
+
+        let outcome = session.accept_finding(id);
+
+        assert!(matches!(outcome, FindingAcceptance::NotInline { .. }));
+        assert!(session.drafts().is_empty());
+    }
+
+    #[test]
+    fn dismissing_a_finding_records_it_so_a_re_run_does_not_offer_it_again() {
+        let mut session = anchored_session();
+        let raw = raw_finding(&session, 6, "unchecked index");
+        with_findings(&mut session, vec![raw.clone()]);
+        let id = session.findings().accepted()[0].id;
+
+        let fingerprint = session
+            .dismiss_finding(id)
+            .expect("dismissing returns the fingerprint to persist");
+
+        assert!(session.findings().is_empty());
+        assert!(session.dismissed_findings().contains(&fingerprint));
+
+        // The same claim on a second run is suppressed, and says so.
+        with_findings(&mut session, vec![raw]);
+        assert!(session.findings().is_empty());
+        assert!(matches!(
+            session.findings().rejected()[0].reason,
+            RejectionReason::PreviouslyDismissed { .. }
+        ));
+    }
+
+    #[test]
+    fn a_dismissal_does_not_suppress_a_different_claim_on_the_same_line() {
+        let mut session = anchored_session();
+        let dismissed = raw_finding(&session, 6, "unchecked index");
+        let other = raw_finding(&session, 6, "misleading name");
+        with_findings(&mut session, vec![dismissed]);
+        let id = session.findings().accepted()[0].id;
+        session.dismiss_finding(id);
+
+        with_findings(&mut session, vec![other]);
+
+        assert_eq!(session.findings().len(), 1);
+        assert_eq!(session.findings().accepted()[0].title, "misleading name");
+    }
+
+    #[test]
+    fn set_findings_reports_how_many_it_suppressed() {
+        let mut session = anchored_session();
+        let first = raw_finding(&session, 6, "one");
+        let second = raw_finding(&session, 7, "two");
+        with_findings(&mut session, vec![first.clone(), second.clone()]);
+        let id = session.findings().accepted()[0].id;
+        session.dismiss_finding(id);
+
+        let anchors = session.anchors().expect("anchored").clone();
+        let findings = Findings::validate(
+            vec![first, second],
+            &anchors,
+            &FindingOrigin::Ai("claude-code".into()),
+        );
+        let suppressed = session.set_findings(findings);
+
+        assert_eq!(suppressed, 1);
+        assert_eq!(session.findings().len(), 1);
+    }
+
+    #[test]
+    fn dismissals_restored_from_an_earlier_session_still_suppress() {
+        let mut session = anchored_session();
+        let raw = raw_finding(&session, 6, "unchecked index");
+        let anchors = session.anchors().expect("anchored").clone();
+        let findings = Findings::validate(
+            vec![raw],
+            &anchors,
+            &FindingOrigin::Ai("claude-code".into()),
+        );
+        let fingerprint = findings.accepted()[0].fingerprint.clone();
+
+        session.restore_dismissed([fingerprint].into_iter().collect());
+        let suppressed = session.set_findings(findings);
+
+        assert_eq!(suppressed, 1);
+        assert!(session.findings().is_empty());
+    }
+
+    #[test]
+    fn accepting_a_finding_that_is_not_pending_does_nothing() {
+        let mut session = anchored_session();
+
+        let outcome = session.accept_finding(FindingId(7));
+
+        assert_eq!(outcome, FindingAcceptance::Unknown);
+        assert!(session.drafts().is_empty());
+    }
+
+    #[test]
+    fn an_accepted_finding_submits_like_any_other_draft() {
+        let mut session = anchored_session();
+        let raw = raw_finding(&session, 6, "unchecked index");
+        with_findings(&mut session, vec![raw]);
+        let id = session.findings().accepted()[0].id;
+        session.accept_finding(id);
+        session.set_summary("Took one suggestion from the review.");
+
+        let submission = session
+            .prepare_submission(ReviewEvent::Comment)
+            .expect("the review has a comment to post");
+
+        assert_eq!(submission.comments.len(), 1);
+        assert_eq!(submission.comments[0].body, "Handle the failure here.");
+        assert!(submission.excluded.is_empty());
     }
 
     /// A pull request keeps its drafts across a push; the head is not in the key.

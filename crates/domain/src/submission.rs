@@ -79,7 +79,7 @@ pub struct SubmittableComment {
 }
 
 /// A draft that will not be part of the submission.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct ExcludedDraft {
     pub draft: DraftComment,
     pub reason: ExclusionReason,
@@ -100,7 +100,7 @@ impl Display for ExclusionReason {
 }
 
 /// A review, ready to be shown to a human and then sent.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct ReviewSubmission {
     /// The commit the review is pinned to. Sent as `commit_id`, so the forge
     /// rejects the submission if it no longer matches the pull request's head.
@@ -142,7 +142,7 @@ impl ReviewSubmission {
 
 /// Where a review a human has confirmed is sent.
 ///
-/// A port, like [`crate::DraftSink`]: declared next to the submission it carries
+/// A port, like [`crate::ReviewStateSink`]: declared next to the submission it carries
 /// so the forge implementation depends on the domain, and so a view can offer to
 /// submit without knowing what a forge is.
 ///
