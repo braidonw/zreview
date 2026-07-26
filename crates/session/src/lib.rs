@@ -161,6 +161,19 @@ fn attach_draft_storage(
         Ok(saved) => restore_saved_drafts(session, saved),
         Err(error) => session.push_warning(draft_storage_warning(&error)),
     }
+    // Provenance and dismissals are restored after the drafts they describe, and a
+    // failure to read either is not worth a warning of its own: the reviewer's words
+    // are back, which is what matters. Losing an attribution or re-offering a
+    // dismissed finding is a smaller harm than a second warning about the same
+    // database.
+    if let Ok(provenance) = reader.load_provenance(&scope) {
+        session.restore_provenance(provenance);
+    }
+    if let Some(head_sha) = session.source().head_sha()
+        && let Ok(dismissed) = reader.load_dismissals(&scope, head_sha)
+    {
+        session.restore_dismissed(dismissed.into_iter().collect());
+    }
 
     match DraftStore::open(&path) {
         Ok(writer) => Some(Box::new(DraftWriter::spawn(writer, scope))),
@@ -522,6 +535,144 @@ mod tests {
         assert_eq!(draft.body, "worth keeping");
         assert!(!draft.is_stale);
         assert!(reopened.warnings().is_empty(), "nothing to warn about");
+    }
+
+    /// The whole point of persisting provenance: a restart must not turn a
+    /// suggestion the reviewer took into a comment they appear to have written.
+    #[test]
+    fn an_accepted_findings_provenance_survives_reopening_the_session() {
+        let repository = temporary_repository();
+        let data = TempDir::new().unwrap();
+        let storage = DraftStorage::At(data.path().join("review-data.sqlite3"));
+        let request = local_request(&repository);
+
+        let fingerprint = {
+            let mut loaded = load(&request, &storage, &|_| {}).unwrap();
+            let sink = loaded.draft_sink.as_ref().expect("drafts should persist");
+            let anchor = loaded.session.anchor_for(0, 0).unwrap();
+
+            let raw = domain::RawFinding {
+                location: Some(domain::RawLocation {
+                    path: anchor.path.clone(),
+                    side: anchor.side,
+                    line: anchor.line,
+                    start_line: None,
+                }),
+                severity: domain::Severity::Error,
+                confidence: 0.9,
+                title: "unchecked index".to_owned(),
+                rationale: "it can panic".to_owned(),
+                proposed_comment: "Check the length first.".to_owned(),
+                guidance_sources: vec![domain::GuidanceCitation {
+                    path: "AGENTS.md".into(),
+                    content_hash: "hash".into(),
+                }],
+            };
+            let anchors = loaded.session.anchors().unwrap().clone();
+            let findings = domain::Findings::validate(
+                vec![raw],
+                &anchors,
+                &domain::FindingOrigin::Ai("claude-code".into()),
+            );
+            let fingerprint = findings.accepted()[0].fingerprint.clone();
+            let id = findings.accepted()[0].id;
+            loaded.session.set_findings(findings);
+
+            // What the UI does on accept: write the draft, then persist both the
+            // text and where it came from.
+            let domain::FindingAcceptance::Drafted { anchor, body } =
+                loaded.session.accept_finding(id)
+            else {
+                panic!("the finding should have become a draft");
+            };
+            sink.save(&anchor, &body);
+            let provenance = loaded
+                .session
+                .drafts()
+                .get(&anchor)
+                .and_then(|draft| draft.provenance.clone())
+                .expect("the draft carries provenance");
+            sink.save_provenance(&anchor, &provenance);
+            assert_eq!(sink.failure(), None);
+            fingerprint
+        };
+
+        let reopened = load(&request, &storage, &|_| {}).unwrap().session;
+
+        let draft = reopened.draft_at(0, 0).expect("the draft came back");
+        assert_eq!(draft.body, "Check the length first.");
+        assert!(
+            draft.is_proposed(),
+            "it is still a suggestion the reviewer took"
+        );
+        let provenance = draft.provenance.as_ref().unwrap();
+        assert_eq!(
+            provenance.origin,
+            domain::FindingOrigin::Ai("claude-code".into())
+        );
+        assert_eq!(provenance.guidance_sources[0].path.as_ref(), "AGENTS.md");
+        assert_eq!(provenance.fingerprint, fingerprint);
+    }
+
+    #[test]
+    fn a_dismissal_survives_reopening_and_suppresses_the_same_claim() {
+        let repository = temporary_repository();
+        let data = TempDir::new().unwrap();
+        let storage = DraftStorage::At(data.path().join("review-data.sqlite3"));
+        let request = local_request(&repository);
+
+        let raw = {
+            let loaded = load(&request, &storage, &|_| {}).unwrap();
+            let anchor = loaded.session.anchor_for(0, 0).unwrap();
+            domain::RawFinding {
+                location: Some(domain::RawLocation {
+                    path: anchor.path.clone(),
+                    side: anchor.side,
+                    line: anchor.line,
+                    start_line: None,
+                }),
+                severity: domain::Severity::Warning,
+                confidence: 0.5,
+                title: "a claim the reviewer rejects".to_owned(),
+                rationale: String::new(),
+                proposed_comment: "not worth posting".to_owned(),
+                guidance_sources: Vec::new(),
+            }
+        };
+
+        {
+            let mut loaded = load(&request, &storage, &|_| {}).unwrap();
+            let sink = loaded.draft_sink.as_ref().expect("drafts should persist");
+            let anchors = loaded.session.anchors().unwrap().clone();
+            let findings = domain::Findings::validate(
+                vec![raw.clone()],
+                &anchors,
+                &domain::FindingOrigin::Ai("claude-code".into()),
+            );
+            let id = findings.accepted()[0].id;
+            loaded.session.set_findings(findings);
+
+            let fingerprint = loaded
+                .session
+                .dismiss_finding(id)
+                .expect("dismissing yields the fingerprint");
+            let head_sha = loaded.session.source().head_sha().unwrap().to_string();
+            sink.dismiss_finding(&head_sha, &fingerprint);
+            assert_eq!(sink.failure(), None);
+        }
+
+        let mut reopened = load(&request, &storage, &|_| {}).unwrap().session;
+        let anchors = reopened.anchors().unwrap().clone();
+        let findings = domain::Findings::validate(
+            vec![raw],
+            &anchors,
+            &domain::FindingOrigin::Ai("claude-code".into()),
+        );
+
+        let suppressed = reopened.set_findings(findings);
+
+        assert_eq!(suppressed, 1, "the dismissal came back");
+        assert!(reopened.findings().is_empty());
     }
 
     #[test]

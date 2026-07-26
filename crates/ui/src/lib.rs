@@ -2689,6 +2689,20 @@ mod tests {
             self.calls.lock().unwrap().push(format!("summary {body}"));
         }
 
+        fn save_provenance(&self, anchor: &DiffAnchor, provenance: &domain::FindingProvenance) {
+            self.calls.lock().unwrap().push(format!(
+                "provenance {} {} {}",
+                anchor.path, anchor.line, provenance.origin
+            ));
+        }
+
+        fn dismiss_finding(&self, _head_sha: &str, fingerprint: &str) {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(format!("dismiss {fingerprint}"));
+        }
+
         fn clear_submitted(&self, _head_sha: &str, anchors: &[DiffAnchor]) {
             let positions = anchors
                 .iter()

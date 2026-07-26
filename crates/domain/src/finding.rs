@@ -23,6 +23,7 @@
 //! backend's output would look identical to one that found nothing.
 
 use std::{
+    collections::BTreeSet,
     fmt::{Display, Formatter, Write as _},
     sync::Arc,
 };
@@ -177,6 +178,26 @@ impl Display for FindingId {
     }
 }
 
+/// Where an accepted comment came from, kept once the finding itself is gone.
+///
+/// A reviewer who accepts a finding is making it their own comment: they read it,
+/// can edit it, and it posts under their name. But PLAN section 8 asks every
+/// finding to explain which guidance produced it, and a reviewer looking at their
+/// queue before submitting should be able to tell which comments they wrote and
+/// which a model proposed. So the provenance rides along on the draft rather than
+/// being discarded at the moment of acceptance.
+///
+/// The fingerprint comes too, so a re-run can recognise that a claim is already
+/// sitting in the queue as a draft rather than offering it again.
+#[derive(Clone, Debug, PartialEq)]
+pub struct FindingProvenance {
+    pub origin: FindingOrigin,
+    /// How sure the backend was, recorded as stated.
+    pub confidence: f32,
+    pub guidance_sources: Vec<GuidanceCitation>,
+    pub fingerprint: String,
+}
+
 /// A finding that passed validation.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Finding {
@@ -207,6 +228,62 @@ impl Finding {
     pub const fn is_inline(&self) -> bool {
         self.anchor.is_some()
     }
+
+    /// What to record on the draft this finding becomes.
+    #[must_use]
+    pub fn provenance(&self) -> FindingProvenance {
+        FindingProvenance {
+            origin: self.origin.clone(),
+            confidence: self.confidence,
+            guidance_sources: self.guidance_sources.clone(),
+            fingerprint: self.fingerprint.clone(),
+        }
+    }
+}
+
+/// Claims the reviewer has already rejected, so a re-run does not offer them again.
+///
+/// Held as fingerprints rather than as findings: the point is to recognise the same
+/// claim next time, and the fingerprint is exactly the identity that survives a
+/// re-run. Without this, reviewing a large change over two sittings means
+/// re-triaging everything dismissed in the first one.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct DismissedFindings {
+    fingerprints: BTreeSet<String>,
+}
+
+impl DismissedFindings {
+    #[must_use]
+    pub fn contains(&self, fingerprint: &str) -> bool {
+        self.fingerprints.contains(fingerprint)
+    }
+
+    /// Records a dismissal. Returns whether it was new.
+    pub fn insert(&mut self, fingerprint: impl Into<String>) -> bool {
+        self.fingerprints.insert(fingerprint.into())
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = &str> {
+        self.fingerprints.iter().map(String::as_str)
+    }
+
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.fingerprints.len()
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.fingerprints.is_empty()
+    }
+}
+
+impl FromIterator<String> for DismissedFindings {
+    fn from_iter<I: IntoIterator<Item = String>>(iterator: I) -> Self {
+        Self {
+            fingerprints: iterator.into_iter().collect(),
+        }
+    }
 }
 
 /// Why a finding was not accepted.
@@ -232,6 +309,8 @@ pub enum RejectionReason {
     Duplicate { fingerprint: String },
     /// The run had already accepted as many findings as it will show.
     TooMany { limit: usize },
+    /// The reviewer dismissed this same claim on an earlier run.
+    PreviouslyDismissed { fingerprint: String },
 }
 
 impl Display for RejectionReason {
@@ -257,6 +336,7 @@ impl Display for RejectionReason {
             Self::TooMany { limit } => {
                 write!(formatter, "over the {limit}-finding limit for one run")
             }
+            Self::PreviouslyDismissed { .. } => formatter.write_str("dismissed on an earlier run"),
         }
     }
 }
@@ -444,6 +524,31 @@ impl Findings {
         Some(self.accepted.remove(index))
     }
 
+    /// Moves claims the reviewer has already rejected out of the pending list.
+    ///
+    /// They become rejections rather than disappearing, so a run that suppressed
+    /// twelve previously dismissed findings can say so. Silently showing nothing
+    /// would be indistinguishable from a review that found nothing.
+    pub fn drop_dismissed(&mut self, dismissed: &DismissedFindings) -> usize {
+        let mut suppressed = 0;
+        let mut kept = Vec::with_capacity(self.accepted.len());
+        for finding in std::mem::take(&mut self.accepted) {
+            if dismissed.contains(&finding.fingerprint) {
+                suppressed += 1;
+                self.rejected.push(RejectedFinding {
+                    reason: RejectionReason::PreviouslyDismissed {
+                        fingerprint: finding.fingerprint.clone(),
+                    },
+                    raw: raw_of(finding),
+                });
+            } else {
+                kept.push(finding);
+            }
+        }
+        self.accepted = kept;
+        suppressed
+    }
+
     #[must_use]
     pub fn get(&self, id: FindingId) -> Option<&Finding> {
         self.accepted.iter().find(|finding| finding.id == id)
@@ -457,6 +562,28 @@ impl Findings {
     #[must_use]
     pub fn len(&self) -> usize {
         self.accepted.len()
+    }
+}
+
+/// Turns an accepted finding back into the claim it came from.
+///
+/// Only needed so a suppressed finding can be reported in the same shape as every
+/// other rejection: a reviewer reading the rejected list should not have to care
+/// that this one was refused later than the others.
+fn raw_of(finding: Finding) -> RawFinding {
+    RawFinding {
+        location: finding.anchor.map(|anchor| RawLocation {
+            path: anchor.path,
+            side: anchor.side,
+            line: anchor.line,
+            start_line: anchor.start_line,
+        }),
+        severity: finding.severity,
+        confidence: finding.confidence,
+        title: finding.title,
+        rationale: finding.rationale,
+        proposed_comment: finding.proposed_comment,
+        guidance_sources: finding.guidance_sources,
     }
 }
 
