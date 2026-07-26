@@ -142,7 +142,7 @@ impl ReviewSubmission {
 
 /// Where a review a human has confirmed is sent.
 ///
-/// A port, like [`crate::DraftSink`]: declared next to the submission it carries
+/// A port, like [`crate::ReviewStateSink`]: declared next to the submission it carries
 /// so the forge implementation depends on the domain, and so a view can offer to
 /// submit without knowing what a forge is.
 ///

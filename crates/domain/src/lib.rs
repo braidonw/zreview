@@ -12,6 +12,7 @@ mod backend;
 mod comment;
 mod draft;
 mod finding;
+mod review_state;
 mod session;
 mod submission;
 
@@ -21,12 +22,13 @@ pub use backend::{
     ReviewRequest,
 };
 pub use comment::{CommentThread, PlacedComments, ReviewComment, UnplacedReason, UnplacedThread};
-pub use draft::{DraftComment, DraftSink, Drafts};
+pub use draft::{DraftComment, Drafts};
 pub use finding::{
     DismissedFindings, Finding, FindingId, FindingOrigin, FindingProvenance, Findings,
     GuidanceCitation, MAX_COMMENT_BYTES, MAX_FINDINGS, MAX_RATIONALE_BYTES, MAX_TITLE_BYTES,
     RawFinding, RawLocation, RejectedFinding, RejectionReason, Severity, fingerprint,
 };
+pub use review_state::ReviewStateSink;
 pub use session::{LoadStage, LoadedSession, SessionFailure};
 pub use submission::{
     ExcludedDraft, ExclusionReason, ReviewEvent, ReviewSubmission, ReviewSubmitter,

@@ -7,7 +7,7 @@
 //! GitHub, but words that were typed and not saved are gone, and so is the
 //! triage work of rejecting twenty findings one by one.
 //!
-//! Writes go through [`DraftWriter`], which owns a thread, because PLAN's
+//! Writes go through [`ReviewStateWriter`], which owns a thread, because PLAN's
 //! performance budget rules out database work on the UI thread and a draft is
 //! written on every keystroke.
 
@@ -22,7 +22,9 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use domain::{DiffAnchor, DiffSide, DraftSink, FindingOrigin, FindingProvenance, GuidanceCitation};
+use domain::{
+    DiffAnchor, DiffSide, FindingOrigin, FindingProvenance, GuidanceCitation, ReviewStateSink,
+};
 use rusqlite::Connection;
 use thiserror::Error;
 
@@ -47,7 +49,7 @@ pub enum StoreError {
     #[error("could not migrate the review database: {0}")]
     Migrate(#[source] rusqlite::Error),
 
-    #[error("could not read stored drafts: {0}")]
+    #[error("could not read stored review state: {0}")]
     Read(#[source] rusqlite::Error),
 
     #[error("could not write a draft: {0}")]
@@ -63,12 +65,12 @@ pub enum StoreError {
     NoHomeDirectory,
 }
 
-/// The database drafts and other review state live in.
-pub struct DraftStore {
+/// The database a review's local state lives in.
+pub struct ReviewStore {
     connection: Connection,
 }
 
-impl DraftStore {
+impl ReviewStore {
     /// Opens, creating and migrating as needed.
     ///
     /// # Errors
@@ -680,16 +682,16 @@ enum Command {
 /// database work on the UI thread, so the caller hands over a change and returns
 /// immediately. Failures are recorded rather than returned, because there is no
 /// useful answer to give a keystroke — they surface the next time the view asks.
-pub struct DraftWriter {
+pub struct ReviewStateWriter {
     sender: Option<Sender<Command>>,
     failure: Arc<Mutex<Option<String>>>,
     thread: Option<JoinHandle<()>>,
 }
 
-impl DraftWriter {
+impl ReviewStateWriter {
     /// Starts the writer thread for one scope.
     #[must_use]
-    pub fn spawn(store: DraftStore, scope: String) -> Self {
+    pub fn spawn(store: ReviewStore, scope: String) -> Self {
         let (sender, receiver) = mpsc::channel();
         let failure = Arc::new(Mutex::new(None));
         let thread_failure = Arc::clone(&failure);
@@ -746,7 +748,7 @@ impl DraftWriter {
     }
 }
 
-impl DraftSink for DraftWriter {
+impl ReviewStateSink for ReviewStateWriter {
     fn save(&self, anchor: &DiffAnchor, body: &str) {
         self.send(Command::Upsert {
             anchor: anchor.clone(),
@@ -793,7 +795,7 @@ impl DraftSink for DraftWriter {
     }
 }
 
-impl Drop for DraftWriter {
+impl Drop for ReviewStateWriter {
     /// Finishes queued writes before going away, so quitting does not drop the
     /// last keystrokes.
     fn drop(&mut self) {
@@ -855,7 +857,7 @@ mod tests {
 
     #[test]
     fn provenance_survives_a_round_trip_with_every_citation() {
-        let mut store = DraftStore::open_in_memory().unwrap();
+        let mut store = ReviewStore::open_in_memory().unwrap();
         let anchor = anchor("src/queue.rs", 12, DiffSide::Right, HEAD);
         store.upsert(SCOPE, &anchor, "Handle the failure.").unwrap();
 
@@ -888,7 +890,7 @@ mod tests {
 
     #[test]
     fn rewriting_provenance_replaces_its_citations_rather_than_adding_to_them() {
-        let mut store = DraftStore::open_in_memory().unwrap();
+        let mut store = ReviewStore::open_in_memory().unwrap();
         let anchor = anchor("src/queue.rs", 12, DiffSide::Right, HEAD);
         store
             .upsert_provenance(SCOPE, &anchor, &provenance())
@@ -913,7 +915,7 @@ mod tests {
     /// The two sides of a line are separate drafts, so separate provenance.
     #[test]
     fn provenance_is_keyed_by_side_as_well_as_line() {
-        let mut store = DraftStore::open_in_memory().unwrap();
+        let mut store = ReviewStore::open_in_memory().unwrap();
         let right = anchor("src/queue.rs", 12, DiffSide::Right, HEAD);
         let left = anchor("src/queue.rs", 12, DiffSide::Left, HEAD);
         let mut from_check = provenance();
@@ -936,7 +938,7 @@ mod tests {
 
     #[test]
     fn a_draft_the_reviewer_wrote_has_no_provenance_row() {
-        let store = DraftStore::open_in_memory().unwrap();
+        let store = ReviewStore::open_in_memory().unwrap();
         let anchor = anchor("src/queue.rs", 12, DiffSide::Right, HEAD);
         store.upsert(SCOPE, &anchor, "my own words").unwrap();
 
@@ -945,7 +947,7 @@ mod tests {
 
     #[test]
     fn a_dismissal_survives_and_is_scoped_to_its_head() {
-        let store = DraftStore::open_in_memory().unwrap();
+        let store = ReviewStore::open_in_memory().unwrap();
 
         store
             .insert_dismissal(SCOPE, HEAD, "fingerprint-one")
@@ -971,7 +973,7 @@ mod tests {
 
     #[test]
     fn dismissing_the_same_claim_twice_is_not_an_error() {
-        let store = DraftStore::open_in_memory().unwrap();
+        let store = ReviewStore::open_in_memory().unwrap();
 
         store.insert_dismissal(SCOPE, HEAD, "fingerprint").unwrap();
         store.insert_dismissal(SCOPE, HEAD, "fingerprint").unwrap();
@@ -1014,7 +1016,7 @@ mod tests {
             connection.pragma_update(None, "user_version", 3).unwrap();
         }
 
-        let mut store = DraftStore::open(&path).unwrap();
+        let mut store = ReviewStore::open(&path).unwrap();
 
         let drafts = store.load(SCOPE).unwrap();
         assert_eq!(drafts.len(), 1);
@@ -1031,7 +1033,7 @@ mod tests {
 
     #[test]
     fn a_draft_round_trips() {
-        let store = DraftStore::open_in_memory().unwrap();
+        let store = ReviewStore::open_in_memory().unwrap();
         let anchor = anchor("src/review.rs", 11, DiffSide::Right, HEAD);
 
         store.upsert(SCOPE, &anchor, "needs a test").unwrap();
@@ -1044,7 +1046,7 @@ mod tests {
 
     #[test]
     fn writing_the_same_anchor_replaces_the_body() {
-        let store = DraftStore::open_in_memory().unwrap();
+        let store = ReviewStore::open_in_memory().unwrap();
         let anchor = anchor("src/review.rs", 11, DiffSide::Right, HEAD);
 
         store.upsert(SCOPE, &anchor, "first").unwrap();
@@ -1057,7 +1059,7 @@ mod tests {
 
     #[test]
     fn the_two_sides_of_a_line_are_separate_rows() {
-        let store = DraftStore::open_in_memory().unwrap();
+        let store = ReviewStore::open_in_memory().unwrap();
         store
             .upsert(SCOPE, &anchor("src/a.rs", 10, DiffSide::Right, HEAD), "new")
             .unwrap();
@@ -1072,7 +1074,7 @@ mod tests {
     /// was pushed to must still hand back what was written against the old head.
     #[test]
     fn drafts_from_an_earlier_head_are_still_returned() {
-        let store = DraftStore::open_in_memory().unwrap();
+        let store = ReviewStore::open_in_memory().unwrap();
         store
             .upsert(
                 SCOPE,
@@ -1096,7 +1098,7 @@ mod tests {
 
     #[test]
     fn scopes_do_not_see_each_other() {
-        let store = DraftStore::open_in_memory().unwrap();
+        let store = ReviewStore::open_in_memory().unwrap();
         let anchor = anchor("src/review.rs", 11, DiffSide::Right, HEAD);
         store.upsert(SCOPE, &anchor, "for this review").unwrap();
         store
@@ -1110,7 +1112,7 @@ mod tests {
 
     #[test]
     fn deleting_removes_only_that_anchor() {
-        let store = DraftStore::open_in_memory().unwrap();
+        let store = ReviewStore::open_in_memory().unwrap();
         let kept = anchor("src/review.rs", 10, DiffSide::Right, HEAD);
         let removed = anchor("src/review.rs", 11, DiffSide::Right, HEAD);
         store.upsert(SCOPE, &kept, "keep me").unwrap();
@@ -1127,7 +1129,7 @@ mod tests {
 
     #[test]
     fn drafts_load_in_reading_order() {
-        let store = DraftStore::open_in_memory().unwrap();
+        let store = ReviewStore::open_in_memory().unwrap();
         for (path, line) in [("src/b.rs", 5), ("src/a.rs", 40), ("src/a.rs", 4)] {
             store
                 .upsert(
@@ -1154,11 +1156,11 @@ mod tests {
         let anchor = anchor("src/review.rs", 11, DiffSide::Right, HEAD);
 
         {
-            let store = DraftStore::open(&path).unwrap();
+            let store = ReviewStore::open(&path).unwrap();
             store.upsert(SCOPE, &anchor, "survives").unwrap();
         }
 
-        let reopened = DraftStore::open(&path).unwrap();
+        let reopened = ReviewStore::open(&path).unwrap();
         assert_eq!(reopened.load(SCOPE).unwrap()[0].1, "survives");
     }
 
@@ -1167,7 +1169,7 @@ mod tests {
         let directory = TempDir::new().unwrap();
         let path = directory.path().join("review-data.sqlite3");
 
-        let first = DraftStore::open(&path).unwrap();
+        let first = ReviewStore::open(&path).unwrap();
         let version: i64 = first
             .connection
             .query_row("PRAGMA user_version", [], |row| row.get(0))
@@ -1176,7 +1178,7 @@ mod tests {
         drop(first);
 
         // Would fail on a duplicate CREATE TABLE if migration re-ran.
-        assert!(DraftStore::open(&path).is_ok());
+        assert!(ReviewStore::open(&path).is_ok());
     }
 
     #[test]
@@ -1187,7 +1189,8 @@ mod tests {
         let discarded = anchor("src/review.rs", 11, DiffSide::Right, HEAD);
 
         {
-            let writer = DraftWriter::spawn(DraftStore::open(&path).unwrap(), SCOPE.to_owned());
+            let writer =
+                ReviewStateWriter::spawn(ReviewStore::open(&path).unwrap(), SCOPE.to_owned());
             writer.save(&kept, "keep me");
             writer.save(&discarded, "not this");
             writer.discard(&discarded);
@@ -1195,7 +1198,7 @@ mod tests {
             // Dropping joins the thread, so every queued write has landed.
         }
 
-        let loaded = DraftStore::open(&path).unwrap().load(SCOPE).unwrap();
+        let loaded = ReviewStore::open(&path).unwrap().load(SCOPE).unwrap();
         assert_eq!(loaded.len(), 1);
         assert_eq!(loaded[0].1, "keep me");
     }
@@ -1207,21 +1210,22 @@ mod tests {
         let anchor = anchor("src/review.rs", 11, DiffSide::Right, HEAD);
 
         {
-            let writer = DraftWriter::spawn(DraftStore::open(&path).unwrap(), SCOPE.to_owned());
+            let writer =
+                ReviewStateWriter::spawn(ReviewStore::open(&path).unwrap(), SCOPE.to_owned());
             // Mirrors typing: one write per keystroke.
             for body in ["n", "ne", "nee", "need"] {
                 writer.save(&anchor, body);
             }
         }
 
-        let loaded = DraftStore::open(&path).unwrap().load(SCOPE).unwrap();
+        let loaded = ReviewStore::open(&path).unwrap().load(SCOPE).unwrap();
         assert_eq!(loaded.len(), 1);
         assert_eq!(loaded[0].1, "need");
     }
 
     #[test]
     fn a_range_survives_storage() {
-        let store = DraftStore::open_in_memory().unwrap();
+        let store = ReviewStore::open_in_memory().unwrap();
         let mut ranged = anchor("src/review.rs", 12, DiffSide::Right, HEAD);
         ranged.start_line = Some(10);
 
@@ -1237,7 +1241,7 @@ mod tests {
     /// range behind on the same key.
     #[test]
     fn rewriting_a_range_as_a_single_line_clears_the_start() {
-        let store = DraftStore::open_in_memory().unwrap();
+        let store = ReviewStore::open_in_memory().unwrap();
         let mut ranged = anchor("src/review.rs", 12, DiffSide::Right, HEAD);
         ranged.start_line = Some(10);
         store.upsert(SCOPE, &ranged, "this block").unwrap();
@@ -1253,7 +1257,7 @@ mod tests {
 
     #[test]
     fn a_stored_side_that_cannot_be_read_is_reported() {
-        let store = DraftStore::open_in_memory().unwrap();
+        let store = ReviewStore::open_in_memory().unwrap();
         store
             .connection
             .execute(

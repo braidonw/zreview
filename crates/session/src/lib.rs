@@ -10,12 +10,12 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use domain::{
-    DiffAnchor, DiffFile, DraftSink, FileStatus, LoadStage, LoadedSession, ReviewSession,
+    DiffAnchor, DiffFile, FileStatus, LoadStage, LoadedSession, ReviewSession, ReviewStateSink,
     ReviewSubmission, ReviewSubmitter, SessionFailure, SessionSource, SubmissionOutcome,
 };
 use git::{ComparisonMode, GitError};
 use github::{GithubClient, GithubError, PullRequestLocator, PullRequestSelector};
-use store::{DraftStore, DraftWriter, StoreError};
+use store::{ReviewStateWriter, ReviewStore, StoreError};
 
 mod review_run;
 
@@ -70,7 +70,7 @@ impl SessionRequest {
 /// remediation when the failure is one the reviewer can act on.
 pub fn load(
     request: &SessionRequest,
-    drafts: &DraftStorage,
+    drafts: &ReviewStorage,
     report: &dyn Fn(LoadStage),
 ) -> Result<LoadedSession, SessionFailure> {
     report(LoadStage::Starting);
@@ -97,20 +97,20 @@ pub fn load(
         }
     };
 
-    let draft_sink = attach_draft_storage(&mut session, drafts);
+    let review_sink = attach_draft_storage(&mut session, drafts);
     Ok(LoadedSession {
         session,
-        draft_sink,
+        review_sink,
         submitter,
     })
 }
 
-/// Where drafts are persisted.
+/// Where a review's local state is persisted.
 ///
 /// Passed in rather than resolved internally so a test never touches the
 /// reviewer's real review data, and so relocating it later needs no new plumbing.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub enum DraftStorage {
+pub enum ReviewStorage {
     /// The review data directory in the user's Application Support.
     #[default]
     Default,
@@ -120,7 +120,7 @@ pub enum DraftStorage {
     Disabled,
 }
 
-impl DraftStorage {
+impl ReviewStorage {
     fn path(&self) -> Option<Result<PathBuf, StoreError>> {
         match self {
             Self::Default => Some(store::default_database_path()),
@@ -130,36 +130,37 @@ impl DraftStorage {
     }
 }
 
-/// Restores saved drafts into the session and returns where new ones are written.
+/// Restores saved review state into the session and returns where new state is
+/// written.
 ///
 /// Storage failing does not fail the load: a reviewer can still read a diff
 /// without persistence. It is recorded as a warning instead, because typing into
 /// something that is not saving is exactly the situation they must be told about.
 fn attach_draft_storage(
     session: &mut ReviewSession,
-    drafts: &DraftStorage,
-) -> Option<Box<dyn DraftSink>> {
+    drafts: &ReviewStorage,
+) -> Option<Box<dyn ReviewStateSink>> {
     let scope = session.source().draft_scope()?;
     let path = match drafts.path()? {
         Ok(path) => path,
         Err(error) => {
-            session.push_warning(draft_storage_warning(&error));
+            session.push_warning(review_storage_warning(&error));
             return None;
         }
     };
 
     // One connection to read the existing drafts, and a second for the writer
     // thread, so a connection is never shared across threads.
-    let reader = match DraftStore::open(&path) {
+    let reader = match ReviewStore::open(&path) {
         Ok(reader) => reader,
         Err(error) => {
-            session.push_warning(draft_storage_warning(&error));
+            session.push_warning(review_storage_warning(&error));
             return None;
         }
     };
     match reader.load(&scope) {
         Ok(saved) => restore_saved_drafts(session, saved),
-        Err(error) => session.push_warning(draft_storage_warning(&error)),
+        Err(error) => session.push_warning(review_storage_warning(&error)),
     }
     // Provenance and dismissals are restored after the drafts they describe, and a
     // failure to read either is not worth a warning of its own: the reviewer's words
@@ -175,10 +176,10 @@ fn attach_draft_storage(
         session.restore_dismissed(dismissed.into_iter().collect());
     }
 
-    match DraftStore::open(&path) {
-        Ok(writer) => Some(Box::new(DraftWriter::spawn(writer, scope))),
+    match ReviewStore::open(&path) {
+        Ok(writer) => Some(Box::new(ReviewStateWriter::spawn(writer, scope))),
         Err(error) => {
-            session.push_warning(draft_storage_warning(&error));
+            session.push_warning(review_storage_warning(&error));
             None
         }
     }
@@ -246,7 +247,7 @@ fn restore_saved_drafts(session: &mut ReviewSession, saved: Vec<(DiffAnchor, Str
     );
 }
 
-fn draft_storage_warning(error: &StoreError) -> SessionFailure {
+fn review_storage_warning(error: &StoreError) -> SessionFailure {
     SessionFailure::from_error("Drafts are not being saved", error).with_remediation(
         "Review can continue, but anything written will be lost when ZReview closes.",
     )
@@ -397,7 +398,7 @@ mod tests {
 
     #[test]
     fn the_demo_request_loads_without_a_repository() {
-        let session = load(&SessionRequest::Demo, &DraftStorage::Disabled, &|_| {})
+        let session = load(&SessionRequest::Demo, &ReviewStorage::Disabled, &|_| {})
             .unwrap()
             .session;
 
@@ -418,7 +419,7 @@ mod tests {
                 base: "main".to_owned(),
                 head: "feature".to_owned(),
             },
-            &DraftStorage::Disabled,
+            &ReviewStorage::Disabled,
             &|stage| stages.borrow_mut().push(stage),
         )
         .unwrap()
@@ -447,7 +448,7 @@ mod tests {
                 base: "main".to_owned(),
                 head: "HEAD".to_owned(),
             },
-            &DraftStorage::Disabled,
+            &ReviewStorage::Disabled,
             &|_| {},
         )
         .unwrap_err();
@@ -474,7 +475,7 @@ mod tests {
                 base: "main".to_owned(),
                 head: "main".to_owned(),
             },
-            &DraftStorage::Disabled,
+            &ReviewStorage::Disabled,
             &|_| {},
         )
         .unwrap_err();
@@ -493,7 +494,7 @@ mod tests {
                 base: "no-such-branch".to_owned(),
                 head: "main".to_owned(),
             },
-            &DraftStorage::Disabled,
+            &ReviewStorage::Disabled,
             &|_| {},
         )
         .unwrap_err();
@@ -515,12 +516,12 @@ mod tests {
     fn a_draft_survives_reopening_the_session() {
         let repository = temporary_repository();
         let data = TempDir::new().unwrap();
-        let storage = DraftStorage::At(data.path().join("review-data.sqlite3"));
+        let storage = ReviewStorage::At(data.path().join("review-data.sqlite3"));
         let request = local_request(&repository);
 
         {
             let mut loaded = load(&request, &storage, &|_| {}).unwrap();
-            let sink = loaded.draft_sink.as_ref().expect("drafts should persist");
+            let sink = loaded.review_sink.as_ref().expect("drafts should persist");
             assert!(loaded.session.set_draft(0, 0, "worth keeping"));
             let anchor = loaded.session.anchor_for(0, 0).unwrap();
             sink.save(&anchor, "worth keeping");
@@ -543,12 +544,12 @@ mod tests {
     fn an_accepted_findings_provenance_survives_reopening_the_session() {
         let repository = temporary_repository();
         let data = TempDir::new().unwrap();
-        let storage = DraftStorage::At(data.path().join("review-data.sqlite3"));
+        let storage = ReviewStorage::At(data.path().join("review-data.sqlite3"));
         let request = local_request(&repository);
 
         let fingerprint = {
             let mut loaded = load(&request, &storage, &|_| {}).unwrap();
-            let sink = loaded.draft_sink.as_ref().expect("drafts should persist");
+            let sink = loaded.review_sink.as_ref().expect("drafts should persist");
             let anchor = loaded.session.anchor_for(0, 0).unwrap();
 
             let raw = domain::RawFinding {
@@ -618,7 +619,7 @@ mod tests {
     fn a_dismissal_survives_reopening_and_suppresses_the_same_claim() {
         let repository = temporary_repository();
         let data = TempDir::new().unwrap();
-        let storage = DraftStorage::At(data.path().join("review-data.sqlite3"));
+        let storage = ReviewStorage::At(data.path().join("review-data.sqlite3"));
         let request = local_request(&repository);
 
         let raw = {
@@ -642,7 +643,7 @@ mod tests {
 
         {
             let mut loaded = load(&request, &storage, &|_| {}).unwrap();
-            let sink = loaded.draft_sink.as_ref().expect("drafts should persist");
+            let sink = loaded.review_sink.as_ref().expect("drafts should persist");
             let anchors = loaded.session.anchors().unwrap().clone();
             let findings = domain::Findings::validate(
                 vec![raw.clone()],
@@ -679,12 +680,12 @@ mod tests {
     fn a_discarded_draft_does_not_come_back() {
         let repository = temporary_repository();
         let data = TempDir::new().unwrap();
-        let storage = DraftStorage::At(data.path().join("review-data.sqlite3"));
+        let storage = ReviewStorage::At(data.path().join("review-data.sqlite3"));
         let request = local_request(&repository);
 
         {
             let loaded = load(&request, &storage, &|_| {}).unwrap();
-            let sink = loaded.draft_sink.as_ref().unwrap();
+            let sink = loaded.review_sink.as_ref().unwrap();
             let anchor = loaded.session.anchor_for(0, 0).unwrap();
             sink.save(&anchor, "second thoughts");
             sink.discard(&anchor);
@@ -706,18 +707,18 @@ mod tests {
         let repository = temporary_repository();
         let data = TempDir::new().unwrap();
         let path = data.path().join("review-data.sqlite3");
-        let storage = DraftStorage::At(path.clone());
+        let storage = ReviewStorage::At(path.clone());
         let request = local_request(&repository);
 
         // Write directly, as an earlier head would have.
         {
-            let scope = load(&request, &DraftStorage::Disabled, &|_| {})
+            let scope = load(&request, &ReviewStorage::Disabled, &|_| {})
                 .unwrap()
                 .session
                 .source()
                 .draft_scope()
                 .unwrap();
-            let store = DraftStore::open(&path).unwrap();
+            let store = ReviewStore::open(&path).unwrap();
             store
                 .upsert(
                     &scope,
@@ -753,12 +754,12 @@ mod tests {
         let repository = temporary_repository();
         let loaded = load(
             &local_request(&repository),
-            &DraftStorage::Disabled,
+            &ReviewStorage::Disabled,
             &|_| {},
         )
         .unwrap();
 
-        assert!(loaded.draft_sink.is_none());
+        assert!(loaded.review_sink.is_none());
         assert!(loaded.session.warnings().is_empty(), "not a failure");
     }
 
@@ -766,9 +767,9 @@ mod tests {
     /// sink and no complaint about it.
     #[test]
     fn the_demo_persists_nothing() {
-        let loaded = load(&SessionRequest::Demo, &DraftStorage::Default, &|_| {}).unwrap();
+        let loaded = load(&SessionRequest::Demo, &ReviewStorage::Default, &|_| {}).unwrap();
 
-        assert!(loaded.draft_sink.is_none());
+        assert!(loaded.review_sink.is_none());
         assert!(loaded.session.warnings().is_empty());
     }
 
@@ -779,11 +780,11 @@ mod tests {
         let file = TempDir::new().unwrap();
         let blocker = file.path().join("not-a-directory");
         std::fs::write(&blocker, "").unwrap();
-        let storage = DraftStorage::At(blocker.join("review-data.sqlite3"));
+        let storage = ReviewStorage::At(blocker.join("review-data.sqlite3"));
 
         let loaded = load(&local_request(&repository), &storage, &|_| {}).unwrap();
 
-        assert!(loaded.draft_sink.is_none(), "nowhere to write");
+        assert!(loaded.review_sink.is_none(), "nowhere to write");
         let warning = loaded
             .session
             .warnings()

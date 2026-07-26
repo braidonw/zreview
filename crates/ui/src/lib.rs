@@ -8,9 +8,9 @@ use std::sync::Arc;
 
 use domain::{
     ChangeCounts, CommentThread, DiffAnchor, DiffFile, DiffLine, DiffLineKind, DraftComment,
-    DraftSink, Drafts, ExcludedDraft, FileStatus, LoadStage, LoadedSession, PlacedComments,
-    ReviewEvent, ReviewSession, ReviewSubmission, ReviewSubmitter, SessionFailure, SessionSource,
-    SubmissionOutcome,
+    Drafts, ExcludedDraft, FileStatus, LoadStage, LoadedSession, PlacedComments, ReviewEvent,
+    ReviewSession, ReviewStateSink, ReviewSubmission, ReviewSubmitter, SessionFailure,
+    SessionSource, SubmissionOutcome,
 };
 use gpui::{
     App, ClipboardItem, Context, ElementInputHandler, Entity, EntityInputHandler, EventEmitter,
@@ -1920,7 +1920,7 @@ enum SubmissionState {
 pub struct SessionView {
     state: SessionState,
     /// Where draft changes are written, once the session is ready.
-    draft_sink: Option<Box<dyn DraftSink>>,
+    review_sink: Option<Box<dyn ReviewStateSink>>,
     /// Where a confirmed review is posted. Absent when the session is not a pull
     /// request, in which case submitting is not offered at all.
     submitter: Option<Arc<dyn ReviewSubmitter>>,
@@ -1937,7 +1937,7 @@ impl SessionView {
                 description: description.into(),
                 stage: SharedString::from(LoadStage::default().label()),
             },
-            draft_sink: None,
+            review_sink: None,
             submitter: None,
             submission: SubmissionState::Idle,
             focus_handle: cx.focus_handle(),
@@ -1967,7 +1967,7 @@ impl SessionView {
     ) {
         self.state = match result {
             Ok(loaded) => {
-                self.draft_sink = loaded.draft_sink;
+                self.review_sink = loaded.review_sink;
                 self.submitter = loaded.submitter;
                 let review = cx.new(|cx| ReviewView::new(loaded.session, window, cx));
                 let subscription = cx.subscribe(&review, |this, review, event, cx| {
@@ -2000,7 +2000,7 @@ impl SessionView {
     ) {
         match event {
             ReviewViewEvent::DraftChanged { anchor, draft } => {
-                if let Some(sink) = &self.draft_sink {
+                if let Some(sink) = &self.review_sink {
                     match draft {
                         Some(draft) => sink.save(anchor, &draft.body),
                         None => sink.discard(anchor),
@@ -2008,7 +2008,7 @@ impl SessionView {
                 }
             }
             ReviewViewEvent::SummaryChanged { body } => {
-                if let Some(sink) = &self.draft_sink
+                if let Some(sink) = &self.review_sink
                     && let Some(head_sha) = review.read(cx).session().source().head_sha()
                 {
                     sink.save_summary(head_sha, body);
@@ -2084,7 +2084,7 @@ impl SessionView {
                         let anchors =
                             review.update(cx, |review, cx| review.mark_submitted(&submission, cx));
                         if let (Some(sink), Some(head_sha)) = (
-                            this.draft_sink.as_ref(),
+                            this.review_sink.as_ref(),
                             review.read(cx).session().source().head_sha(),
                         ) {
                             sink.clear_submitted(head_sha, &anchors);
@@ -2131,7 +2131,7 @@ impl SessionView {
     /// The reason drafts are not reaching storage, if they are not.
     #[must_use]
     pub fn draft_write_failure(&self) -> Option<String> {
-        self.draft_sink.as_ref().and_then(|sink| sink.failure())
+        self.review_sink.as_ref().and_then(|sink| sink.failure())
     }
 
     #[must_use]
@@ -2670,7 +2670,7 @@ mod tests {
         }
     }
 
-    impl domain::DraftSink for RecordingSink {
+    impl domain::ReviewStateSink for RecordingSink {
         fn save(&self, anchor: &DiffAnchor, body: &str) {
             self.calls
                 .lock()
@@ -2729,7 +2729,7 @@ mod tests {
 
     fn ready_session_view(
         cx: &mut TestAppContext,
-        sink: Option<Box<dyn domain::DraftSink>>,
+        sink: Option<Box<dyn domain::ReviewStateSink>>,
     ) -> (Entity<SessionView>, &mut gpui::VisualTestContext) {
         let (view, cx) = cx.add_window_view(|_window, cx| SessionView::loading("a review", cx));
         cx.update(|window, app| {
@@ -2737,7 +2737,7 @@ mod tests {
                 view.finish(
                     Ok(LoadedSession {
                         session: repository_backed_session(&["src/review.rs"]),
-                        draft_sink: sink,
+                        review_sink: sink,
                         submitter: None,
                     }),
                     window,
@@ -3267,7 +3267,7 @@ mod tests {
                 view.finish(
                     Ok(LoadedSession {
                         session,
-                        draft_sink: Some(Box::new(sink)),
+                        review_sink: Some(Box::new(sink)),
                         submitter: Some(Arc::new(submitter)),
                     }),
                     window,
@@ -3522,7 +3522,7 @@ mod tests {
                 view.finish(
                     Ok(LoadedSession {
                         session,
-                        draft_sink: Some(Box::new(sink.clone())),
+                        review_sink: Some(Box::new(sink.clone())),
                         submitter: None,
                     }),
                     window,

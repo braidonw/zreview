@@ -9,7 +9,7 @@ use std::fmt::Display;
 
 use std::sync::Arc;
 
-use crate::{DraftSink, ReviewSession, ReviewSubmitter};
+use crate::{ReviewSession, ReviewStateSink, ReviewSubmitter};
 
 /// A session that is ready to review, together with where its drafts are written.
 ///
@@ -20,7 +20,7 @@ pub struct LoadedSession {
     pub session: ReviewSession,
     /// Absent when there is nothing to persist to — the generated fixture, or a
     /// database that could not be opened.
-    pub draft_sink: Option<Box<dyn DraftSink>>,
+    pub review_sink: Option<Box<dyn ReviewStateSink>>,
     /// Absent when the session is not a pull request and so cannot be submitted.
     pub submitter: Option<Arc<dyn ReviewSubmitter>>,
 }
@@ -30,7 +30,7 @@ impl std::fmt::Debug for LoadedSession {
         formatter
             .debug_struct("LoadedSession")
             .field("session", &self.session)
-            .field("persists_drafts", &self.draft_sink.is_some())
+            .field("persists_drafts", &self.review_sink.is_some())
             .field("can_submit", &self.submitter.is_some())
             .finish()
     }
@@ -42,7 +42,7 @@ impl LoadedSession {
     pub fn unsaved(session: ReviewSession) -> Self {
         Self {
             session,
-            draft_sink: None,
+            review_sink: None,
             submitter: None,
         }
     }

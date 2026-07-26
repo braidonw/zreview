@@ -13,7 +13,7 @@ use std::{
 
 use domain::{LoadStage, LoadedSession, SessionFailure};
 use gpui::{App, WindowHandle};
-use session::{DraftStorage, SessionRequest};
+use session::{ReviewStorage, SessionRequest};
 use ui::SessionView;
 
 /// How often the foreground task publishes progress.
@@ -37,7 +37,7 @@ struct Handoff {
 pub fn spawn(
     window: WindowHandle<SessionView>,
     request: SessionRequest,
-    drafts: DraftStorage,
+    drafts: ReviewStorage,
     cx: &mut App,
 ) {
     let handoff = Arc::new(Mutex::new(Handoff::default()));
@@ -119,7 +119,7 @@ mod tests {
             .update(cx, |view, _window, _cx| assert!(view.is_loading()))
             .unwrap();
 
-        cx.update(|cx| spawn(window, SessionRequest::Demo, DraftStorage::Disabled, cx));
+        cx.update(|cx| spawn(window, SessionRequest::Demo, ReviewStorage::Disabled, cx));
         settle(cx);
 
         window
@@ -146,7 +146,7 @@ mod tests {
                     base: "main".to_owned(),
                     head: "HEAD".to_owned(),
                 },
-                DraftStorage::Disabled,
+                ReviewStorage::Disabled,
                 cx,
             );
         });

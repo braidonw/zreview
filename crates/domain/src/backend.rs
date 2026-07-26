@@ -1,12 +1,12 @@
 //! The port a review engine plugs into.
 //!
 //! Declared here, beside the findings it produces, so that adapters depend on the
-//! domain rather than the domain on them — the same direction as [`DraftSink`] and
+//! domain rather than the domain on them — the same direction as [`ReviewStateSink`] and
 //! [`ReviewSubmitter`]. A view can show a review running, and report why one
 //! failed, without knowing whether a subprocess, an HTTP client, or a stub is
 //! behind it.
 //!
-//! [`DraftSink`]: crate::DraftSink
+//! [`ReviewStateSink`]: crate::ReviewStateSink
 //! [`ReviewSubmitter`]: crate::ReviewSubmitter
 //!
 //! What this port deliberately does not carry, per PLAN section 8:
