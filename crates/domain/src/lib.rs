@@ -12,6 +12,7 @@ mod backend;
 mod comment;
 mod draft;
 mod finding;
+mod guidance;
 mod review_state;
 mod session;
 mod submission;
@@ -28,6 +29,7 @@ pub use finding::{
     GuidanceCitation, MAX_COMMENT_BYTES, MAX_FINDINGS, MAX_RATIONALE_BYTES, MAX_TITLE_BYTES,
     RawFinding, RawLocation, RejectedFinding, RejectionReason, Severity, fingerprint,
 };
+pub use guidance::{GuidanceEntry, GuidanceSelection, GuidanceSkip};
 pub use review_state::ReviewStateSink;
 pub use session::{LoadStage, LoadedSession, SessionFailure};
 pub use submission::{
@@ -415,6 +417,8 @@ pub struct ReviewSession {
     findings: Findings,
     /// Claims the reviewer rejected, kept so a re-run does not offer them again.
     dismissed: DismissedFindings,
+    /// What a review would be held to, discovered when the snapshot opened.
+    guidance: GuidanceSelection,
 }
 
 /// What happened when a reviewer accepted a finding.
@@ -466,6 +470,7 @@ impl ReviewSession {
             summary: String::new(),
             findings: Findings::default(),
             dismissed: DismissedFindings::default(),
+            guidance: GuidanceSelection::default(),
         })
     }
 
@@ -605,6 +610,30 @@ impl ReviewSession {
     #[must_use]
     pub const fn findings(&self) -> &Findings {
         &self.findings
+    }
+
+    /// What a review would be held to, and what of it would be sent.
+    #[must_use]
+    pub const fn guidance(&self) -> &GuidanceSelection {
+        &self.guidance
+    }
+
+    /// Records what discovery found when the snapshot opened.
+    pub fn set_guidance(&mut self, guidance: GuidanceSelection) {
+        self.guidance = guidance;
+    }
+
+    /// Turns one guidance file on or off for the next run.
+    ///
+    /// Returns whether anything changed, so a view can avoid a redraw for a click
+    /// that meant nothing.
+    pub fn set_guidance_included(&mut self, path: &str, included: bool) -> bool {
+        self.guidance.set_included(path, included)
+    }
+
+    /// Flips one guidance file, returning its new state.
+    pub fn toggle_guidance(&mut self, path: &str) -> Option<bool> {
+        self.guidance.toggle(path)
     }
 
     /// Claims the reviewer has dismissed, so a re-run can suppress them.

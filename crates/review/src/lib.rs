@@ -653,6 +653,47 @@ fn is_inside_repository(relative: &str) -> bool {
         })
 }
 
+/// Hands discovery's results to the domain, for the panel and for the run.
+///
+/// The reason for a skip is rendered here rather than carried as a type: the
+/// domain has no business knowing what a size limit or a glob error looks like,
+/// and a reviewer only ever needs to read it.
+/// `reviewed_paths` are the files under review, so configuration exclusions are
+/// resolved here against real paths rather than carried into the domain as globs.
+#[must_use]
+pub fn into_selection(guidance: &Guidance, reviewed_paths: &[&str]) -> domain::GuidanceSelection {
+    let entries = guidance
+        .files()
+        .iter()
+        .map(|file| domain::GuidanceEntry {
+            excerpt: domain::GuidanceExcerpt {
+                path: file.path.clone(),
+                scope: file.scope.to_string().into(),
+                content: file.content.clone(),
+                content_hash: file.content_hash.clone().into(),
+            },
+            included: file.included,
+        })
+        .collect();
+    let skipped = guidance
+        .skipped()
+        .iter()
+        .map(|skip| domain::GuidanceSkip {
+            path: skip.path.clone(),
+            reason: skip.reason.to_string().into(),
+        })
+        .collect();
+    // An unusable exclude pattern must not silently exclude everything or nothing.
+    // Reviewing the file is the recoverable half, and discovery already recorded the
+    // bad pattern as a skip, so it is visible in the panel either way.
+    let excluded_paths = reviewed_paths
+        .iter()
+        .filter(|path| guidance.excludes_reviewed_path(path).unwrap_or(false))
+        .map(|path| Arc::from(*path))
+        .collect();
+    domain::GuidanceSelection::new(entries, skipped, excluded_paths)
+}
+
 /// The absolute path of a repository-relative guidance file.
 #[must_use]
 pub fn guidance_path(repository_root: &Path, relative: &str) -> PathBuf {

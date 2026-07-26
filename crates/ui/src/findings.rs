@@ -79,9 +79,168 @@ const fn severity_colour(severity: Severity) -> u32 {
 }
 
 /// Whether the panel has anything worth the screen space.
+///
+/// Guidance counts: a reviewer should be able to see what a review would be held
+/// to, and what would leave their machine, before deciding to run one.
 #[must_use]
 pub fn is_visible(session: &ReviewSession, run: &ReviewRunState) -> bool {
-    !matches!(run, ReviewRunState::Idle) || !session.findings().is_empty()
+    !matches!(run, ReviewRunState::Idle)
+        || !session.findings().is_empty()
+        || !session.guidance().is_empty()
+}
+
+/// The guidance section: what this review would be held to, and what of it will be
+/// sent.
+///
+/// PLAN section 8 requires this before a run, and requires that the reviewer can
+/// turn any of it off without editing configuration. Collapsed once a run has
+/// happened, because by then the findings are what they came for — but the summary
+/// line stays, so what was sent is never off screen entirely.
+fn render_guidance(
+    session: &ReviewSession,
+    expanded: bool,
+    view: &Entity<ReviewView>,
+) -> Option<Div> {
+    let guidance = session.guidance();
+    if guidance.is_empty() {
+        return None;
+    }
+    let count = guidance.included_count();
+    let kilobytes = guidance.included_bytes() / 1024;
+    let excluded = guidance.excluded_paths().len();
+    let toggle_view = view.clone();
+
+    Some(
+        div()
+            .flex_shrink_0()
+            .flex()
+            .flex_col()
+            .border_b_1()
+            .border_color(rgb(BORDER))
+            .child(
+                div()
+                    .id("guidance-header")
+                    .px_3()
+                    .py_2()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .gap_2()
+                    .cursor_pointer()
+                    .on_mouse_down(MouseButton::Left, move |_, _window, cx| {
+                        cx.stop_propagation();
+                        toggle_view.update(cx, ReviewView::toggle_guidance_panel);
+                    })
+                    .child(div().text_color(rgb(TEXT)).child(if count == 0 {
+                        SharedString::from("No guidance will be sent")
+                    } else {
+                        SharedString::from(format!(
+                            "{count} guidance file{} · {kilobytes} KB",
+                            if count == 1 { "" } else { "s" }
+                        ))
+                    }))
+                    .child(div().text_xs().text_color(rgb(MUTED)).child(if expanded {
+                        "hide"
+                    } else {
+                        "show"
+                    })),
+            )
+            .when(expanded, |section| {
+                section
+                    .children(guidance.entries().iter().map(|entry| {
+                        render_guidance_entry(
+                            entry.path().to_string(),
+                            &entry.excerpt.scope,
+                            entry.bytes(),
+                            entry.included,
+                            view,
+                        )
+                    }))
+                    // Found and not used, each with its reason. Silently dropping a
+                    // file the reviewer expected to matter is worse than not finding
+                    // it at all.
+                    .children(guidance.skipped().iter().map(|skip| {
+                        div()
+                            .px_3()
+                            .py_1()
+                            .flex()
+                            .flex_col()
+                            .child(div().text_color(rgb(0x64748b)).child(skip.path.to_string()))
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(rgb(0x64748b))
+                                    .child(skip.reason.to_string()),
+                            )
+                    }))
+                    .when(excluded > 0, |section| {
+                        section.child(
+                            div()
+                                .px_3()
+                                .py_1()
+                                .text_xs()
+                                .text_color(rgb(0xfbbf24))
+                                .child(format!(
+                                    "{excluded} file{} excluded from review by .zreview.toml",
+                                    if excluded == 1 { "" } else { "s" }
+                                )),
+                        )
+                    })
+            }),
+    )
+}
+
+fn render_guidance_entry(
+    path: String,
+    scope: &str,
+    bytes: usize,
+    included: bool,
+    view: &Entity<ReviewView>,
+) -> AnyElement {
+    let toggle_path = path.clone();
+    let view = view.clone();
+
+    div()
+        .id(SharedString::from(format!("guidance-{path}")))
+        .px_3()
+        .py_1()
+        .flex()
+        .items_center()
+        .gap_2()
+        .cursor_pointer()
+        .on_mouse_down(MouseButton::Left, move |_, _window, cx| {
+            cx.stop_propagation();
+            let path = toggle_path.clone();
+            view.update(cx, |review, cx| review.toggle_guidance(&path, cx));
+        })
+        // A filled box is sent, an empty one is not. The state has to be readable
+        // at a glance: this is the disclosure control.
+        .child(
+            div()
+                .w(px(12.0))
+                .h(px(12.0))
+                .flex_shrink_0()
+                .rounded_sm()
+                .border_1()
+                .border_color(rgb(if included { 0x4ade80 } else { 0x475569 }))
+                .when(included, |box_| box_.bg(rgb(0x4ade80))),
+        )
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .overflow_hidden()
+                .text_color(rgb(if included { TEXT } else { MUTED }))
+                .child(path),
+        )
+        .child(
+            div()
+                .flex_shrink_0()
+                .text_xs()
+                .text_color(rgb(MUTED))
+                .child(format!("{} · {}K", scope, bytes / 1024)),
+        )
+        .into_any_element()
 }
 
 /// The findings panel.
@@ -89,6 +248,7 @@ pub fn render(
     session: &ReviewSession,
     run: &ReviewRunState,
     selected: Option<FindingId>,
+    guidance_expanded: bool,
     view: &Entity<ReviewView>,
 ) -> Div {
     div()
@@ -102,6 +262,7 @@ pub fn render(
         .font_family("SF Mono")
         .text_size(px(12.0))
         .child(render_header(session, run, view))
+        .children(render_guidance(session, guidance_expanded, view))
         .child(
             div()
                 .flex_1()

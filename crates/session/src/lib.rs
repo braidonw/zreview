@@ -97,6 +97,7 @@ pub fn load(
         }
     };
 
+    attach_guidance(&mut session);
     let review_sink = attach_draft_storage(&mut session, drafts);
     Ok(LoadedSession {
         session,
@@ -127,6 +128,35 @@ impl ReviewStorage {
             Self::At(path) => Some(Ok(path.clone())),
             Self::Disabled => None,
         }
+    }
+}
+
+/// Discovers what the repository says its code should be reviewed against.
+///
+/// PLAN section 8 wants this to happen when a snapshot opens, not when a review
+/// starts, so the reviewer can see what would be sent — and turn any of it off —
+/// before anything leaves the machine. It is read-only: discovery never executes
+/// anything a repository provides.
+///
+/// A demo session has no repository, so it gets nothing and the panel stays away.
+fn attach_guidance(session: &mut ReviewSession) {
+    let Some(root) = repository_root(session.source()) else {
+        return;
+    };
+    let paths: Vec<&str> = session.files().iter().map(|file| &*file.path).collect();
+    let discovered = review::discover(root, &paths);
+    session.set_guidance(review::into_selection(&discovered, &paths));
+}
+
+fn repository_root(source: &SessionSource) -> Option<&Path> {
+    match source {
+        SessionSource::Demo => None,
+        SessionSource::LocalComparison {
+            repository_root, ..
+        }
+        | SessionSource::GitHubPullRequest {
+            repository_root, ..
+        } => Some(repository_root),
     }
 }
 

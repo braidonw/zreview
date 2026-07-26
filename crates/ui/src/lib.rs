@@ -1461,6 +1461,11 @@ pub struct ReviewView {
     run: ReviewRunState,
     /// Which finding the reviewer is looking at.
     selected_finding: Option<FindingId>,
+    /// Whether the guidance section is open.
+    ///
+    /// Open before the first run, because PLAN wants what will be sent seen before
+    /// it is sent; collapsed afterwards, when the findings are what matters.
+    guidance_expanded: bool,
     /// Held so draft edits keep reaching the session.
     _diff_subscription: Subscription,
     /// Held so summary edits keep reaching the session.
@@ -1500,6 +1505,7 @@ impl ReviewView {
             file_list_state: ListState::new(file_count, ListAlignment::Top, px(36.0)),
             run: ReviewRunState::default(),
             selected_finding: None,
+            guidance_expanded: true,
             _diff_subscription: diff_subscription,
             _summary_subscription: summary_subscription,
         }
@@ -1549,6 +1555,9 @@ impl ReviewView {
             suppressed,
             unreviewed: unreviewed.into_iter().map(SharedString::from).collect(),
         };
+        // The disclosure has served its purpose; the findings are what the reviewer
+        // wants the space for now. The summary line stays visible either way.
+        self.guidance_expanded = false;
         cx.notify();
     }
 
@@ -1564,6 +1573,27 @@ impl ReviewView {
             remediation: remediation.map(SharedString::from),
         };
         cx.notify();
+    }
+
+    /// Opens or closes the guidance section.
+    pub fn toggle_guidance_panel(&mut self, cx: &mut Context<Self>) {
+        self.guidance_expanded = !self.guidance_expanded;
+        cx.notify();
+    }
+
+    #[must_use]
+    pub const fn guidance_expanded(&self) -> bool {
+        self.guidance_expanded
+    }
+
+    /// Turns one guidance file on or off for the next run.
+    ///
+    /// Not persisted: it is a decision about this sitting, and a choice that
+    /// silently outlived the session would be a worse surprise than re-making it.
+    pub fn toggle_guidance(&mut self, path: &str, cx: &mut Context<Self>) {
+        if self.session.toggle_guidance(path).is_some() {
+            cx.notify();
+        }
     }
 
     /// Asks the running review to stop.
@@ -2197,7 +2227,13 @@ impl Render for ReviewView {
             )
             // Only takes space once there is something to say.
             .children(findings::is_visible(&self.session, &self.run).then(|| {
-                findings::render(&self.session, &self.run, self.selected_finding, &panel_view)
+                findings::render(
+                    &self.session,
+                    &self.run,
+                    self.selected_finding,
+                    self.guidance_expanded,
+                    &panel_view,
+                )
             }))
     }
 }
@@ -3281,6 +3317,117 @@ mod tests {
             assert!(view.session().findings().is_empty());
         });
         assert!(sink.calls().iter().any(|call| call.starts_with("summary ")));
+    }
+
+    fn guidance_selection() -> domain::GuidanceSelection {
+        let entry = |path: &str, content: &str| domain::GuidanceEntry {
+            excerpt: domain::GuidanceExcerpt {
+                path: path.into(),
+                scope: "whole repository".into(),
+                content: content.to_owned(),
+                content_hash: "hash".into(),
+            },
+            included: true,
+        };
+        domain::GuidanceSelection::new(
+            vec![
+                entry("AGENTS.md", &"a".repeat(2048)),
+                entry("CLAUDE.md", "b"),
+            ],
+            vec![domain::GuidanceSkip {
+                path: "HUGE.md".into(),
+                reason: "90000 bytes, over the 65536-byte limit".into(),
+            }],
+            vec!["vendor/lib.rs".into()],
+        )
+    }
+
+    /// The panel is the disclosure notice, so turning a file off has to change what
+    /// a run would send — not just how the row is drawn.
+    #[gpui::test]
+    fn toggling_guidance_changes_what_would_be_sent(cx: &mut TestAppContext) {
+        cx.update(init);
+        let (view, cx) = ready_session_view(cx, None);
+        let review = cx.update(|_window, app| review_of(&view, app));
+
+        cx.update(|_window, app| {
+            review.update(app, |view, _cx| {
+                view.session.set_guidance(guidance_selection());
+            });
+        });
+        cx.update(|_window, app| {
+            let guidance = review.read(app).session().guidance();
+            assert_eq!(guidance.included_count(), 2);
+            assert_eq!(guidance.included_bytes(), 2049);
+        });
+
+        cx.update(|_window, app| {
+            review.update(app, |view, cx| view.toggle_guidance("AGENTS.md", cx));
+        });
+
+        cx.update(|_window, app| {
+            let guidance = review.read(app).session().guidance();
+            assert_eq!(guidance.included_count(), 1);
+            assert_eq!(guidance.included_bytes(), 1);
+            let sent: Vec<_> = guidance
+                .included()
+                .map(|excerpt| excerpt.path.to_string())
+                .collect();
+            assert_eq!(sent, vec!["CLAUDE.md".to_owned()]);
+        });
+    }
+
+    #[gpui::test]
+    fn the_guidance_section_starts_open_and_collapses_once_a_run_finishes(cx: &mut TestAppContext) {
+        cx.update(init);
+        let (view, cx) = ready_session_view(cx, None);
+        let review = cx.update(|_window, app| review_of(&view, app));
+
+        // Open before a run: PLAN wants what will be sent seen before it is sent.
+        cx.update(|_window, app| assert!(review.read(app).guidance_expanded()));
+
+        cx.update(|_window, app| {
+            review.update(app, |view, cx| {
+                view.review_finished(Findings::default(), Vec::new(), cx);
+            });
+        });
+
+        cx.update(|_window, app| assert!(!review.read(app).guidance_expanded()));
+
+        // And it can be reopened.
+        cx.update(|_window, app| {
+            review.update(app, ReviewView::toggle_guidance_panel);
+        });
+        cx.update(|_window, app| assert!(review.read(app).guidance_expanded()));
+    }
+
+    /// A session with guidance is worth showing the panel for even before a review
+    /// has been run, because that is when the disclosure matters.
+    #[gpui::test]
+    fn the_panel_appears_for_guidance_alone(cx: &mut TestAppContext) {
+        cx.update(init);
+        let (view, cx) = ready_session_view(cx, None);
+        let review = cx.update(|_window, app| review_of(&view, app));
+
+        cx.update(|_window, app| {
+            let view = review.read(app);
+            assert!(
+                !findings::is_visible(view.session(), view.review_run()),
+                "nothing discovered yet"
+            );
+        });
+
+        cx.update(|_window, app| {
+            review.update(app, |view, cx| {
+                view.session.set_guidance(guidance_selection());
+                cx.notify();
+            });
+        });
+
+        cx.update(|_window, app| {
+            let view = review.read(app);
+            assert!(findings::is_visible(view.session(), view.review_run()));
+        });
     }
 
     #[gpui::test]

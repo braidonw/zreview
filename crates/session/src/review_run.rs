@@ -16,24 +16,16 @@
 //! Discovering a repository's configuration is not consent to run its commands, so
 //! until that gate exists this reviews with a model and nothing else.
 
-use std::path::Path;
-
 use domain::{
-    FindingOrigin, Findings, GuidanceExcerpt, ReviewBackend, ReviewError, ReviewEventSink,
-    ReviewRequest, ReviewSession, SessionSource,
+    FindingOrigin, Findings, ReviewBackend, ReviewError, ReviewEventSink, ReviewRequest,
+    ReviewSession, SessionSource,
 };
-use review::Guidance;
 
 /// One completed review, and everything needed to explain it.
 #[derive(Clone, Debug)]
 pub struct ReviewRun {
     /// Findings that survived validation, ranked, and the claims that did not.
     pub findings: Findings,
-    /// What guidance was discovered and which of it was sent.
-    ///
-    /// Carried back so the reviewer can see what the review was actually held to,
-    /// rather than having to trust that it was held to anything.
-    pub guidance: Guidance,
     /// Files excluded by `.zreview.toml`, so an unreviewed file is not mistaken
     /// for a clean one.
     pub excluded: Vec<String>,
@@ -72,21 +64,19 @@ pub fn run(
         .zip(session.source().diff_base_sha())
         .ok_or(ReviewError::NothingToReview)?;
 
-    let paths: Vec<&str> = session.files().iter().map(|file| &*file.path).collect();
-    let guidance = repository_root(session.source())
-        .map_or_else(Guidance::default, |root| review::discover(root, &paths));
+    // Read from the session rather than re-discovered. The guidance panel showed
+    // the reviewer what would be sent and let them turn things off, so a run that
+    // discovered its own copy could quietly disagree with the disclosure they were
+    // given.
+    let guidance = session.guidance();
 
-    // Exclusions are about what gets reviewed, so they are applied here rather than
-    // left to the backend to respect.
     let mut excluded = Vec::new();
     let mut files = Vec::new();
     for file in session.files() {
-        match guidance.excludes_reviewed_path(&file.path) {
-            Ok(true) => excluded.push(file.path.to_string()),
-            // An unusable exclude pattern must not silently review everything or
-            // silently review nothing; reviewing it and reporting the pattern is
-            // the recoverable half, and discovery already recorded the pattern.
-            Ok(false) | Err(_) => files.push(file.clone()),
+        if guidance.excludes(&file.path) {
+            excluded.push(file.path.to_string());
+        } else {
+            files.push(file.clone());
         }
     }
     if files.is_empty() {
@@ -98,7 +88,7 @@ pub fn run(
         base_sha: base_sha.clone(),
         title: pull_request_title(session.source()),
         description: None,
-        guidance: guidance.included().map(excerpt).collect(),
+        guidance: guidance.included().cloned().collect(),
         files: files.into(),
     };
 
@@ -108,31 +98,9 @@ pub fn run(
 
     Ok(ReviewRun {
         findings: Findings::validate(raw, anchors, &origin),
-        guidance,
         excluded,
         omitted: material.omitted,
     })
-}
-
-fn excerpt(file: &review::GuidanceFile) -> GuidanceExcerpt {
-    GuidanceExcerpt {
-        path: file.path.clone(),
-        scope: file.scope.to_string().into(),
-        content: file.content.clone(),
-        content_hash: file.content_hash.clone().into(),
-    }
-}
-
-fn repository_root(source: &SessionSource) -> Option<&Path> {
-    match source {
-        SessionSource::Demo => None,
-        SessionSource::LocalComparison {
-            repository_root, ..
-        }
-        | SessionSource::GitHubPullRequest {
-            repository_root, ..
-        } => Some(repository_root),
-    }
 }
 
 /// The change's stated intent, when the source records one.
@@ -148,7 +116,10 @@ fn pull_request_title(source: &SessionSource) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{Arc, Mutex};
+    use std::{
+        path::Path,
+        sync::{Arc, Mutex},
+    };
 
     use domain::{
         ChangeCounts, DiffFile, DiffHunk, DiffLine, DiffLineKind, FileStatus, IgnoreProgress,
@@ -221,9 +192,13 @@ mod tests {
         }
     }
 
+    /// A session with guidance attached, the way `load` builds one.
+    ///
+    /// Discovery happens at load time now, so a session that skipped it would make
+    /// `run` behave as though the repository said nothing.
     fn session(root: &Path, paths: &[&str]) -> ReviewSession {
         let files: Vec<_> = paths.iter().map(|path| file(path)).collect();
-        ReviewSession::new(
+        let mut session = ReviewSession::new(
             SessionSource::LocalComparison {
                 repository_root: root.to_path_buf(),
                 base_sha: Arc::from(BASE),
@@ -232,7 +207,10 @@ mod tests {
             },
             Arc::from(files),
         )
-        .expect("the session has files")
+        .expect("the session has files");
+        let discovered = review::discover(root, paths);
+        session.set_guidance(review::into_selection(&discovered, paths));
+        session
     }
 
     fn finding(path: &str, line: u32) -> RawFinding {
@@ -298,12 +276,48 @@ mod tests {
             .expect("the guidance was sent");
         assert!(excerpt.content.contains("Never use unwrap"));
         assert!(!excerpt.content_hash.is_empty());
-        assert!(
-            run.guidance
-                .files()
-                .iter()
-                .any(|file| &*file.path == "AGENTS.md")
-        );
+        assert_eq!(run.findings.accepted().len(), 0);
+    }
+
+    /// The guidance panel is the input to a run, not a preview of one. Turning a
+    /// file off has to actually stop it being sent, or the panel is a disclosure
+    /// notice that can disagree with what left the machine.
+    #[test]
+    fn guidance_the_reviewer_turned_off_is_not_sent() {
+        let root = tempfile::tempdir().expect("a temporary directory");
+        std::fs::write(root.path().join("AGENTS.md"), "Never use unwrap.")
+            .expect("the guidance is written");
+        std::fs::write(root.path().join("CLAUDE.md"), "Prefer iterators.")
+            .expect("the guidance is written");
+        let mut session = session(root.path(), &["src/main.rs"]);
+        let backend = Stub::new(Vec::new());
+
+        assert!(session.set_guidance_included("CLAUDE.md", false));
+        run(&session, &backend, &IgnoreProgress).expect("the review completes");
+
+        let sent: Vec<_> = backend
+            .request()
+            .guidance
+            .iter()
+            .map(|excerpt| excerpt.path.to_string())
+            .collect();
+        assert_eq!(sent, vec!["AGENTS.md".to_owned()]);
+    }
+
+    #[test]
+    fn turning_all_guidance_off_still_reviews_against_the_diff() {
+        let root = tempfile::tempdir().expect("a temporary directory");
+        std::fs::write(root.path().join("AGENTS.md"), "Never use unwrap.")
+            .expect("the guidance is written");
+        let mut session = session(root.path(), &["src/main.rs"]);
+        let backend = Stub::new(vec![finding("src/main.rs", 1)]);
+
+        session.set_guidance_included("AGENTS.md", false);
+        let run = run(&session, &backend, &IgnoreProgress).expect("the review completes");
+
+        assert!(backend.request().guidance.is_empty());
+        // A review with no guidance is still a review; bugs are bugs.
+        assert_eq!(run.findings.accepted().len(), 1);
     }
 
     #[test]
