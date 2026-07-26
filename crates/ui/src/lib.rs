@@ -3401,20 +3401,19 @@ mod tests {
         cx.update(|_window, app| assert!(review.read(app).guidance_expanded()));
     }
 
-    /// A session with guidance is worth showing the panel for even before a review
-    /// has been run, because that is when the disclosure matters.
+    /// The panel carries the only Review button, so it must not depend on there
+    /// being something to show yet.
     #[gpui::test]
-    fn the_panel_appears_for_guidance_alone(cx: &mut TestAppContext) {
+    fn the_panel_is_reachable_whenever_a_review_is_possible(cx: &mut TestAppContext) {
         cx.update(init);
         let (view, cx) = ready_session_view(cx, None);
         let review = cx.update(|_window, app| review_of(&view, app));
 
         cx.update(|_window, app| {
             let view = review.read(app);
-            assert!(
-                !findings::is_visible(view.session(), view.review_run()),
-                "nothing discovered yet"
-            );
+            // A repository-backed snapshot can be reviewed, so the panel — and the
+            // only Review button — must be reachable before anything is discovered.
+            assert!(findings::is_visible(view.session(), view.review_run()));
         });
 
         cx.update(|_window, app| {
@@ -3427,6 +3426,36 @@ mod tests {
         cx.update(|_window, app| {
             let view = review.read(app);
             assert!(findings::is_visible(view.session(), view.review_run()));
+        });
+    }
+
+    /// The fixture has no commit, so there is nothing to review and no panel.
+    #[gpui::test]
+    fn the_generated_fixture_offers_no_review(cx: &mut TestAppContext) {
+        cx.update(init);
+        let (view, cx) = cx.add_window_view(|_window, cx| SessionView::loading("demo", cx));
+        cx.update(|window, app| {
+            view.update(app, |view, cx| {
+                view.finish(
+                    Ok(LoadedSession {
+                        session: ReviewSession::new(
+                            SessionSource::Demo,
+                            vec![DiffFile::demo(8)].into(),
+                        )
+                        .expect("the fixture has files"),
+                        review_sink: None,
+                        submitter: None,
+                    }),
+                    window,
+                    cx,
+                );
+            });
+        });
+        let review = cx.update(|_window, app| review_of(&view, app));
+
+        cx.update(|_window, app| {
+            let view = review.read(app);
+            assert!(!findings::is_visible(view.session(), view.review_run()));
         });
     }
 

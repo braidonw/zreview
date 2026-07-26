@@ -80,13 +80,18 @@ const fn severity_colour(severity: Severity) -> u32 {
 
 /// Whether the panel has anything worth the screen space.
 ///
-/// Guidance counts: a reviewer should be able to see what a review would be held
-/// to, and what would leave their machine, before deciding to run one.
+/// Shown whenever a review is possible at all, which means whenever the snapshot
+/// has anchors to validate findings against. An earlier version required guidance
+/// or findings to exist first, which hid the panel — and with it the only Review
+/// button — on any repository that happens to carry no `AGENTS.md`. The feature
+/// was invisible exactly where a reviewer had no other way to discover it.
+///
+/// The generated fixture has no commit, so it cannot be reviewed and gets nothing.
 #[must_use]
 pub fn is_visible(session: &ReviewSession, run: &ReviewRunState) -> bool {
-    !matches!(run, ReviewRunState::Idle)
+    session.anchors().is_some()
+        || !matches!(run, ReviewRunState::Idle)
         || !session.findings().is_empty()
-        || !session.guidance().is_empty()
 }
 
 /// The guidance section: what this review would be held to, and what of it will be
@@ -96,98 +101,103 @@ pub fn is_visible(session: &ReviewSession, run: &ReviewRunState) -> bool {
 /// turn any of it off without editing configuration. Collapsed once a run has
 /// happened, because by then the findings are what they came for — but the summary
 /// line stays, so what was sent is never off screen entirely.
-fn render_guidance(
-    session: &ReviewSession,
-    expanded: bool,
-    view: &Entity<ReviewView>,
-) -> Option<Div> {
+fn render_guidance(session: &ReviewSession, expanded: bool, view: &Entity<ReviewView>) -> Div {
     let guidance = session.guidance();
     if guidance.is_empty() {
-        return None;
+        // Discovery ran and found nothing. Saying so is not the same as showing
+        // nothing: a reviewer needs to tell "this repository states no
+        // conventions" from "guidance was never looked for".
+        return div()
+            .flex_shrink_0()
+            .px_3()
+            .py_2()
+            .border_b_1()
+            .border_color(rgb(BORDER))
+            .text_xs()
+            .text_color(rgb(MUTED))
+            .child("No guidance files found — the review will judge the diff alone.");
     }
     let count = guidance.included_count();
     let kilobytes = guidance.included_bytes() / 1024;
     let excluded = guidance.excluded_paths().len();
     let toggle_view = view.clone();
 
-    Some(
-        div()
-            .flex_shrink_0()
-            .flex()
-            .flex_col()
-            .border_b_1()
-            .border_color(rgb(BORDER))
-            .child(
-                div()
-                    .id("guidance-header")
-                    .px_3()
-                    .py_2()
-                    .flex()
-                    .items_center()
-                    .justify_between()
-                    .gap_2()
-                    .cursor_pointer()
-                    .on_mouse_down(MouseButton::Left, move |_, _window, cx| {
-                        cx.stop_propagation();
-                        toggle_view.update(cx, ReviewView::toggle_guidance_panel);
-                    })
-                    .child(div().text_color(rgb(TEXT)).child(if count == 0 {
-                        SharedString::from("No guidance will be sent")
-                    } else {
-                        SharedString::from(format!(
-                            "{count} guidance file{} · {kilobytes} KB",
-                            if count == 1 { "" } else { "s" }
-                        ))
-                    }))
-                    .child(div().text_xs().text_color(rgb(MUTED)).child(if expanded {
-                        "hide"
-                    } else {
-                        "show"
-                    })),
-            )
-            .when(expanded, |section| {
-                section
-                    .children(guidance.entries().iter().map(|entry| {
-                        render_guidance_entry(
-                            entry.path().to_string(),
-                            &entry.excerpt.scope,
-                            entry.bytes(),
-                            entry.included,
-                            view,
+    div()
+        .flex_shrink_0()
+        .flex()
+        .flex_col()
+        .border_b_1()
+        .border_color(rgb(BORDER))
+        .child(
+            div()
+                .id("guidance-header")
+                .px_3()
+                .py_2()
+                .flex()
+                .items_center()
+                .justify_between()
+                .gap_2()
+                .cursor_pointer()
+                .on_mouse_down(MouseButton::Left, move |_, _window, cx| {
+                    cx.stop_propagation();
+                    toggle_view.update(cx, ReviewView::toggle_guidance_panel);
+                })
+                .child(div().text_color(rgb(TEXT)).child(if count == 0 {
+                    SharedString::from("No guidance will be sent")
+                } else {
+                    SharedString::from(format!(
+                        "{count} guidance file{} · {kilobytes} KB",
+                        if count == 1 { "" } else { "s" }
+                    ))
+                }))
+                .child(div().text_xs().text_color(rgb(MUTED)).child(if expanded {
+                    "hide"
+                } else {
+                    "show"
+                })),
+        )
+        .when(expanded, |section| {
+            section
+                .children(guidance.entries().iter().map(|entry| {
+                    render_guidance_entry(
+                        entry.path().to_string(),
+                        &entry.excerpt.scope,
+                        entry.bytes(),
+                        entry.included,
+                        view,
+                    )
+                }))
+                // Found and not used, each with its reason. Silently dropping a
+                // file the reviewer expected to matter is worse than not finding
+                // it at all.
+                .children(guidance.skipped().iter().map(|skip| {
+                    div()
+                        .px_3()
+                        .py_1()
+                        .flex()
+                        .flex_col()
+                        .child(div().text_color(rgb(0x64748b)).child(skip.path.to_string()))
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(rgb(0x64748b))
+                                .child(skip.reason.to_string()),
                         )
-                    }))
-                    // Found and not used, each with its reason. Silently dropping a
-                    // file the reviewer expected to matter is worse than not finding
-                    // it at all.
-                    .children(guidance.skipped().iter().map(|skip| {
+                }))
+                .when(excluded > 0, |section| {
+                    section.child(
                         div()
                             .px_3()
                             .py_1()
-                            .flex()
-                            .flex_col()
-                            .child(div().text_color(rgb(0x64748b)).child(skip.path.to_string()))
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .text_color(rgb(0x64748b))
-                                    .child(skip.reason.to_string()),
-                            )
-                    }))
-                    .when(excluded > 0, |section| {
-                        section.child(
-                            div()
-                                .px_3()
-                                .py_1()
-                                .text_xs()
-                                .text_color(rgb(0xfbbf24))
-                                .child(format!(
-                                    "{excluded} file{} excluded from review by .zreview.toml",
-                                    if excluded == 1 { "" } else { "s" }
-                                )),
-                        )
-                    })
-            }),
-    )
+                            .text_xs()
+                            .text_color(rgb(0xfbbf24))
+                            .child(format!(
+                                "{excluded} file{} excluded from review by .zreview.toml",
+                                if excluded == 1 { "" } else { "s" }
+                            )),
+                    )
+                })
+        })
 }
 
 fn render_guidance_entry(
@@ -262,7 +272,7 @@ pub fn render(
         .font_family("SF Mono")
         .text_size(px(12.0))
         .child(render_header(session, run, view))
-        .children(render_guidance(session, guidance_expanded, view))
+        .child(render_guidance(session, guidance_expanded, view))
         .child(
             div()
                 .flex_1()
