@@ -2,6 +2,7 @@
 
 mod findings;
 mod text;
+pub mod theme;
 
 pub use findings::ReviewRunState;
 pub use text::TextBuffer;
@@ -63,9 +64,9 @@ actions!(
     ]
 );
 
-const ROW_HEIGHT: f32 = 24.0;
+use theme::ROW_HEIGHT;
 const COMMENT_HEIGHT: f32 = 104.0;
-const GUTTER_WIDTH: f32 = 58.0;
+use theme::GUTTER_WIDTH;
 
 fn short_sha(value: &str) -> &str {
     value.get(..7).unwrap_or(value)
@@ -877,11 +878,53 @@ impl DiffView {
         // it read-only underneath as well would duplicate the same text.
         let resting_draft = draft.filter(|_| !show_comment);
         let draft_exists = draft.is_some();
-        let (row_bg, marker_color) = match line.kind {
-            DiffLineKind::Context => (rgb(0x0f172a), rgb(0x64748b)),
-            DiffLineKind::Addition => (rgb(0x10281d), rgb(0x4ade80)),
-            DiffLineKind::Deletion => (rgb(0x30191d), rgb(0xf87171)),
-            DiffLineKind::NoNewlineMarker => (rgb(0x0f172a), rgb(0xfbbf24)),
+        // Diff terrain from the design system: low-chroma fills that read as
+        // landscape at forty rows a screen, sharing no hue with severity.
+        let (row_bg, marker_color, text_color) = match line.kind {
+            DiffLineKind::Context => (
+                rgb(theme::surface::INSET),
+                rgb(theme::text::FAINT),
+                rgb(theme::text::SECONDARY),
+            ),
+            DiffLineKind::Addition => (
+                rgb(theme::diff::add::BG),
+                rgb(theme::diff::add::MARK),
+                rgb(theme::diff::add::FG),
+            ),
+            DiffLineKind::Deletion => (
+                rgb(theme::diff::del::BG),
+                rgb(theme::diff::del::MARK),
+                rgb(theme::diff::del::FG),
+            ),
+            DiffLineKind::NoNewlineMarker => (
+                rgb(theme::surface::INSET),
+                rgb(theme::severity::WARNING),
+                rgb(theme::text::TERTIARY),
+            ),
+        };
+
+        // The accent rail: two pixels down the left of any row a comment is
+        // attached to, or that the composer is about to attach one to. Without it,
+        // the only cue that a line carries a comment is a background tint that is
+        // easy to miss and invisible once the thread scrolls past — the reviewer
+        // could not see where a comment would land. It sits inside the gutter so
+        // the content column never shifts sideways when a comment appears.
+        let rail = if selected || show_comment || in_selection {
+            Some(rgb(theme::accent::BASE))
+        } else if draft_exists {
+            // A draft a model proposed keeps its own hue, so provenance is legible
+            // in the diff and not only in the panel.
+            Some(rgb(
+                if draft.is_some_and(domain::DraftComment::is_proposed) {
+                    theme::proposed::BASE
+                } else {
+                    theme::accent::DIM
+                },
+            ))
+        } else if !threads.is_empty() {
+            Some(rgb(theme::border::DEFAULT))
+        } else {
+            None
         };
         let old_number = line
             .old_line
@@ -903,10 +946,10 @@ impl DiffView {
             .flex()
             .flex_col()
             .bg(if selected {
-                rgb(0x1e3a5f)
+                rgb(theme::surface::SELECTED)
             } else if in_selection {
                 // A range under construction is visible without looking selected.
-                rgb(0x162a44)
+                rgb(theme::surface::HOVER)
             } else {
                 row_bg
             })
@@ -919,8 +962,8 @@ impl DiffView {
                     .px_3()
                     .flex()
                     .items_center()
-                    .bg(rgb(0x172554))
-                    .text_color(rgb(0x93c5fd))
+                    .bg(rgb(theme::diff::hunk::BG))
+                    .text_color(rgb(theme::diff::hunk::FG))
                     .child(SharedString::from(header.to_string()))
             }))
             .child(
@@ -936,12 +979,21 @@ impl DiffView {
                             cx.notify();
                         });
                     })
+                    // Always occupies its two pixels, coloured or not, so a row
+                    // gaining a comment does not move the numbers beside it.
                     .child(
                         div()
-                            .w(px(GUTTER_WIDTH))
+                            .w(px(theme::RAIL_WIDTH))
+                            .h_full()
+                            .flex_shrink_0()
+                            .when_some(rail, |bar, colour| bar.bg(colour)),
+                    )
+                    .child(
+                        div()
+                            .w(px(GUTTER_WIDTH - theme::RAIL_WIDTH))
                             .pr_2()
                             .text_right()
-                            .text_color(rgb(0x64748b))
+                            .text_color(rgb(theme::text::FAINT))
                             .child(old_number),
                     )
                     .child(
@@ -949,7 +1001,7 @@ impl DiffView {
                             .w(px(GUTTER_WIDTH))
                             .pr_2()
                             .text_right()
-                            .text_color(rgb(0x64748b))
+                            .text_color(rgb(theme::text::FAINT))
                             .child(new_number),
                     )
                     .child(div().w(px(20.0)).text_color(marker_color).child(marker))
@@ -958,7 +1010,9 @@ impl DiffView {
                             .flex_1()
                             .overflow_hidden()
                             .whitespace_nowrap()
-                            .text_color(rgb(0xdbeafe))
+                            // Added and removed content carries its own tint, so
+                            // the terrain reads even where the row fill is subtle.
+                            .text_color(text_color)
                             .child(text),
                     )
                     .when(!threads.is_empty(), |row| {
