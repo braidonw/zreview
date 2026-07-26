@@ -7293,6 +7293,7 @@ dependencies = [
  "domain",
  "github",
  "gpui",
+ "review",
  "session",
  "ui",
 ]

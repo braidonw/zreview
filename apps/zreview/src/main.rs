@@ -6,6 +6,7 @@ use session::{ReviewStorage, SessionRequest};
 use ui::SessionView;
 
 mod loading;
+mod review;
 
 const USAGE: &str = "usage:
   zreview
@@ -42,6 +43,16 @@ fn main() -> ExitCode {
                 },
             )
             .expect("failed to open ZReview window");
+
+        // Installed after the window exists, because running a review needs a
+        // handle to the window its progress is published into.
+        window
+            .update(cx, |view, _window, _cx| {
+                view.set_review_launcher(Box::new(move |review, session, cx| {
+                    review::spawn(window, review.clone(), session, cx);
+                }));
+            })
+            .expect("the window was just opened");
 
         loading::spawn(window, request, ReviewStorage::Default, cx);
         cx.activate(true);

@@ -1,16 +1,18 @@
 #![allow(clippy::unreadable_literal)]
 
+mod findings;
 mod text;
 
+pub use findings::ReviewRunState;
 pub use text::TextBuffer;
 
-use std::sync::Arc;
+use std::sync::{Arc, atomic::AtomicBool};
 
 use domain::{
     ChangeCounts, CommentThread, DiffAnchor, DiffFile, DiffLine, DiffLineKind, DraftComment,
-    Drafts, ExcludedDraft, FileStatus, LoadStage, LoadedSession, PlacedComments, ReviewEvent,
-    ReviewSession, ReviewStateSink, ReviewSubmission, ReviewSubmitter, SessionFailure,
-    SessionSource, SubmissionOutcome,
+    Drafts, ExcludedDraft, FileStatus, FindingAcceptance, FindingId, FindingProvenance, Findings,
+    LoadStage, LoadedSession, PlacedComments, ReviewEvent, ReviewSession, ReviewStateSink,
+    ReviewSubmission, ReviewSubmitter, SessionFailure, SessionSource, SubmissionOutcome,
 };
 use gpui::{
     App, ClipboardItem, Context, ElementInputHandler, Entity, EntityInputHandler, EventEmitter,
@@ -33,6 +35,10 @@ actions!(
 actions!(
     review_session,
     [SelectNextFile, SelectPreviousFile, ToggleViewed]
+);
+actions!(
+    review_findings,
+    [RunReview, AcceptFinding, DismissFinding, SelectNextFinding]
 );
 actions!(
     comment_editor,
@@ -87,6 +93,10 @@ pub fn init(cx: &mut App) {
         KeyBinding::new("cmd-shift-j", SelectNextFile, Some(SESSION_CONTEXT)),
         KeyBinding::new("cmd-shift-k", SelectPreviousFile, Some(SESSION_CONTEXT)),
         KeyBinding::new("cmd-shift-v", ToggleViewed, Some(SESSION_CONTEXT)),
+        KeyBinding::new("cmd-shift-r", RunReview, Some(SESSION_CONTEXT)),
+        KeyBinding::new("cmd-shift-f", SelectNextFinding, Some(SESSION_CONTEXT)),
+        KeyBinding::new("cmd-shift-y", AcceptFinding, Some(SESSION_CONTEXT)),
+        KeyBinding::new("cmd-shift-d", DismissFinding, Some(SESSION_CONTEXT)),
         KeyBinding::new("escape", CloseComment, Some("CommentEditor")),
         // The composer is a real text field, so it needs the bindings a reviewer
         // will reach for without thinking.
@@ -695,6 +705,41 @@ impl DiffView {
             self.open_composer(self.selected_rows(), window, cx);
         }
         self.list_state.scroll_to_reveal_item(self.selected_line);
+        cx.notify();
+    }
+
+    /// Scrolls a row into view and selects it, without opening anything.
+    ///
+    /// Used when a finding is chosen in the panel: the reviewer wants to see the
+    /// line it is about before deciding.
+    pub fn reveal_row(&mut self, row: usize, window: &mut Window, cx: &mut Context<Self>) {
+        self.selected_line = row.min(self.file.line_count().saturating_sub(1));
+        self.selection_anchor = None;
+        self.list_state.scroll_to_reveal_item(self.selected_line);
+        window.focus(&self.focus_handle);
+        cx.notify();
+    }
+
+    /// Opens the composer on a row pre-filled with text of the caller's choosing.
+    ///
+    /// The one caller is accepting a finding onto a line that already holds a
+    /// draft: overwriting the reviewer's words is refused, so both texts are put in
+    /// front of them instead and nothing is saved until they commit.
+    pub fn open_composer_with(
+        &mut self,
+        row: usize,
+        text: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.selected_line = row.min(self.file.line_count().saturating_sub(1));
+        self.selection_anchor = None;
+        self.comment_rows = Some(self.selected_line..=self.selected_line);
+        self.list_state.scroll_to_reveal_item(self.selected_line);
+        self.comment_editor
+            .update(cx, |editor, cx| editor.load(text, cx));
+        let editor_focus = self.comment_editor.read(cx).focus_handle.clone();
+        window.focus(&editor_focus);
         cx.notify();
     }
 
@@ -1394,6 +1439,17 @@ pub enum ReviewViewEvent {
     SummaryChanged { body: String },
     /// The reviewer asked to submit. Nothing is posted until they confirm.
     SubmitRequested { event: ReviewEvent },
+    /// The reviewer asked for an automated review. Whoever owns the backend runs
+    /// it; this view only knows it was asked for.
+    ReviewRequested,
+    /// A finding became a draft, and its provenance needs persisting alongside it.
+    FindingAccepted {
+        anchor: DiffAnchor,
+        body: String,
+        provenance: FindingProvenance,
+    },
+    /// A claim was rejected, and the decision needs remembering.
+    FindingDismissed { fingerprint: String },
 }
 
 pub struct ReviewView {
@@ -1401,6 +1457,10 @@ pub struct ReviewView {
     diff_view: Entity<DiffView>,
     summary_editor: Entity<CommentEditor>,
     file_list_state: ListState,
+    /// How far the current review run has got.
+    run: ReviewRunState,
+    /// Which finding the reviewer is looking at.
+    selected_finding: Option<FindingId>,
     /// Held so draft edits keep reaching the session.
     _diff_subscription: Subscription,
     /// Held so summary edits keep reaching the session.
@@ -1438,9 +1498,244 @@ impl ReviewView {
             diff_view,
             summary_editor,
             file_list_state: ListState::new(file_count, ListAlignment::Top, px(36.0)),
+            run: ReviewRunState::default(),
+            selected_finding: None,
             _diff_subscription: diff_subscription,
             _summary_subscription: summary_subscription,
         }
+    }
+
+    /// Records that a review run has started, with the flag that stops it.
+    pub fn review_started(&mut self, cancel: Arc<AtomicBool>, cx: &mut Context<Self>) {
+        self.run = ReviewRunState::Running {
+            detail: SharedString::from("Starting…"),
+            cancel,
+        };
+        cx.notify();
+    }
+
+    /// Publishes the backend's latest progress line.
+    ///
+    /// Ignored unless a run is in flight, so a late report cannot make a finished
+    /// review look like it is still going.
+    pub fn review_progress(&mut self, line: impl Into<SharedString>, cx: &mut Context<Self>) {
+        if let ReviewRunState::Running { detail, .. } = &mut self.run {
+            let line = line.into();
+            if *detail != line {
+                *detail = line;
+                cx.notify();
+            }
+        }
+    }
+
+    /// Takes the findings a completed run produced.
+    ///
+    /// `unreviewed` names files the run did not see — excluded, or too large to fit
+    /// in the material. They are carried into the panel so a partial review cannot
+    /// present itself as a complete one.
+    pub fn review_finished(
+        &mut self,
+        findings: Findings,
+        unreviewed: Vec<String>,
+        cx: &mut Context<Self>,
+    ) {
+        let rejected = findings.rejected().len();
+        let suppressed = self.session.set_findings(findings);
+        let accepted = self.session.findings().len();
+        self.selected_finding = self.session.findings().accepted().first().map(|f| f.id);
+        self.run = ReviewRunState::Complete {
+            accepted,
+            rejected,
+            suppressed,
+            unreviewed: unreviewed.into_iter().map(SharedString::from).collect(),
+        };
+        cx.notify();
+    }
+
+    /// Reports a run that produced nothing, with what to do about it.
+    pub fn review_failed(
+        &mut self,
+        summary: impl Into<SharedString>,
+        remediation: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        self.run = ReviewRunState::Failed {
+            summary: summary.into(),
+            remediation: remediation.map(SharedString::from),
+        };
+        cx.notify();
+    }
+
+    /// Asks the running review to stop.
+    pub fn cancel_review(&mut self, cx: &mut Context<Self>) {
+        self.run.cancel();
+        cx.notify();
+    }
+
+    #[must_use]
+    pub const fn review_run(&self) -> &ReviewRunState {
+        &self.run
+    }
+
+    #[must_use]
+    pub const fn selected_finding(&self) -> Option<FindingId> {
+        self.selected_finding
+    }
+
+    /// Scrolls the diff to a finding's line and selects it in the panel.
+    pub fn reveal_finding(&mut self, id: FindingId, window: &mut Window, cx: &mut Context<Self>) {
+        self.selected_finding = Some(id);
+        let Some(location) = self
+            .session
+            .findings()
+            .get(id)
+            .and_then(|finding| finding.location)
+        else {
+            // A finding about the whole change has nowhere to scroll to.
+            cx.notify();
+            return;
+        };
+        self.select_file_at(location.file, cx);
+        self.diff_view
+            .update(cx, |view, cx| view.reveal_row(location.row, window, cx));
+        cx.notify();
+    }
+
+    fn run_review(&mut self, _: &RunReview, _: &mut Window, cx: &mut Context<Self>) {
+        if self.run.is_running() {
+            return;
+        }
+        cx.emit(ReviewViewEvent::ReviewRequested);
+    }
+
+    fn select_next_finding(
+        &mut self,
+        _: &SelectNextFinding,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let findings = self.session.findings();
+        if findings.is_empty() {
+            return;
+        }
+        let next = self
+            .selected_finding
+            .and_then(|current| {
+                let position = findings
+                    .accepted()
+                    .iter()
+                    .position(|finding| finding.id == current)?;
+                findings.accepted().get(position + 1)
+            })
+            .or_else(|| findings.accepted().first())
+            .map(|finding| finding.id);
+        if let Some(next) = next {
+            self.reveal_finding(next, window, cx);
+        }
+    }
+
+    fn accept_selected_finding(
+        &mut self,
+        _: &AcceptFinding,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(id) = self.selected_finding {
+            self.accept_finding_by_id(id, window, cx);
+        }
+    }
+
+    fn dismiss_selected_finding(
+        &mut self,
+        _: &DismissFinding,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(id) = self.selected_finding {
+            self.dismiss_finding_by_id(id, cx);
+        }
+    }
+
+    /// Accepts a finding, or hands the reviewer the composer when it cannot be
+    /// accepted without overwriting their words.
+    pub fn accept_finding_by_id(
+        &mut self,
+        id: FindingId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match self.session.accept_finding(id) {
+            FindingAcceptance::Drafted { anchor, body } => {
+                let provenance = self
+                    .session
+                    .drafts()
+                    .get(&anchor)
+                    .and_then(|draft| draft.provenance.clone());
+                self.after_findings_changed(cx);
+                if let Some(provenance) = provenance {
+                    cx.emit(ReviewViewEvent::FindingAccepted {
+                        anchor,
+                        body,
+                        provenance,
+                    });
+                }
+            }
+            FindingAcceptance::Occupied {
+                location,
+                existing,
+                proposed,
+                ..
+            } => {
+                // The reviewer already wrote something here. Both texts go into the
+                // composer and they decide; nothing is saved until they do.
+                self.selected_finding = Some(id);
+                self.select_file_at(location.file, cx);
+                let merged = format!("{}\n\n{proposed}", existing.trim_end());
+                self.diff_view.update(cx, |view, cx| {
+                    view.open_composer_with(location.row, merged, window, cx);
+                });
+                cx.notify();
+            }
+            FindingAcceptance::NotInline { proposed } => {
+                // Nowhere to anchor it, so it belongs in the review summary — which
+                // the reviewer can still edit or delete before submitting.
+                let existing = self.session.summary().trim_end().to_owned();
+                let merged = if existing.is_empty() {
+                    proposed
+                } else {
+                    format!("{existing}\n\n{proposed}")
+                };
+                self.session.set_summary(merged.clone());
+                self.summary_editor
+                    .update(cx, |editor, cx| editor.load(merged.clone(), cx));
+                self.session.retire_finding(id);
+                self.after_findings_changed(cx);
+                cx.emit(ReviewViewEvent::SummaryChanged { body: merged });
+            }
+            FindingAcceptance::Unknown => {}
+        }
+    }
+
+    pub fn dismiss_finding_by_id(&mut self, id: FindingId, cx: &mut Context<Self>) {
+        if let Some(fingerprint) = self.session.dismiss_finding(id) {
+            self.after_findings_changed(cx);
+            cx.emit(ReviewViewEvent::FindingDismissed { fingerprint });
+        }
+    }
+
+    /// Republishes drafts for rendering and moves the selection off a finding that
+    /// has been acted on.
+    fn after_findings_changed(&mut self, cx: &mut Context<Self>) {
+        let drafts = self.session.shared_drafts();
+        self.diff_view
+            .update(cx, |view, cx| view.set_drafts(drafts, cx));
+        self.selected_finding = self
+            .session
+            .findings()
+            .accepted()
+            .first()
+            .map(|finding| finding.id);
+        cx.notify();
     }
 
     /// Forgets what a forge accepted, and reports the anchors it consumed.
@@ -1529,6 +1824,19 @@ impl ReviewView {
     #[must_use]
     pub const fn selected_file_index(&self) -> usize {
         self.session.selected_file_index()
+    }
+
+    /// Switches the displayed file without moving focus.
+    ///
+    /// Focus belongs where the reviewer put it: clicking a finding in the panel
+    /// should not yank the keyboard into the diff.
+    fn select_file_at(&mut self, index: usize, cx: &mut Context<Self>) {
+        if self.session.select_file(index) {
+            let file = Arc::new(self.session.selected_file().clone());
+            self.diff_view
+                .update(cx, |view, cx| view.set_file(file, index, cx));
+            self.file_list_state.scroll_to_reveal_item(index);
+        }
     }
 
     fn select_file(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
@@ -1837,6 +2145,8 @@ impl Render for ReviewView {
         let comments = self.session.shared_comments();
         let header = self.render_source_header();
         let review_view = cx.entity();
+        // Cloned before the file list takes ownership of its own copy.
+        let panel_view = review_view.clone();
 
         div()
             .id("review-session")
@@ -1844,6 +2154,10 @@ impl Render for ReviewView {
             .on_action(cx.listener(Self::select_next_file))
             .on_action(cx.listener(Self::select_previous_file))
             .on_action(cx.listener(Self::toggle_viewed))
+            .on_action(cx.listener(Self::run_review))
+            .on_action(cx.listener(Self::select_next_finding))
+            .on_action(cx.listener(Self::accept_selected_finding))
+            .on_action(cx.listener(Self::dismiss_selected_finding))
             .size_full()
             .flex()
             .bg(rgb(0x020617))
@@ -1881,6 +2195,10 @@ impl Render for ReviewView {
                     .child(div().flex_1().min_h_0().child(self.diff_view.clone()))
                     .child(self.render_submit_bar(cx)),
             )
+            // Only takes space once there is something to say.
+            .children(findings::is_visible(&self.session, &self.run).then(|| {
+                findings::render(&self.session, &self.run, self.selected_finding, &panel_view)
+            }))
     }
 }
 
@@ -1917,6 +2235,14 @@ enum SubmissionState {
     Failed(SessionFailure),
 }
 
+/// How a review run is started.
+///
+/// Installed by whoever owns a backend, after the window exists — a view cannot
+/// hold a handle to the window it lives in at construction time. Absent until then,
+/// and absent for good in a build with no backend, in which case asking for a review
+/// does nothing rather than failing.
+pub type ReviewLauncher = Box<dyn Fn(&Entity<ReviewView>, ReviewSession, &mut App)>;
+
 pub struct SessionView {
     state: SessionState,
     /// Where draft changes are written, once the session is ready.
@@ -1925,6 +2251,8 @@ pub struct SessionView {
     /// request, in which case submitting is not offered at all.
     submitter: Option<Arc<dyn ReviewSubmitter>>,
     submission: SubmissionState,
+    /// How to start a review, once something has said how.
+    review_launcher: Option<ReviewLauncher>,
     focus_handle: FocusHandle,
 }
 
@@ -1940,8 +2268,14 @@ impl SessionView {
             review_sink: None,
             submitter: None,
             submission: SubmissionState::Idle,
+            review_launcher: None,
             focus_handle: cx.focus_handle(),
         }
+    }
+
+    /// Says how to run a review. Without this, asking for one does nothing.
+    pub fn set_review_launcher(&mut self, launcher: ReviewLauncher) {
+        self.review_launcher = Some(launcher);
     }
 
     /// Records the stage the loader has reached.
@@ -2015,6 +2349,32 @@ impl SessionView {
                 }
             }
             ReviewViewEvent::SubmitRequested { event } => self.begin_confirmation(*event, cx),
+            ReviewViewEvent::FindingAccepted {
+                anchor,
+                body,
+                provenance,
+            } => {
+                if let Some(sink) = &self.review_sink {
+                    // Text first, then where it came from: an attribution without
+                    // the comment it belongs to is worth nothing.
+                    sink.save(anchor, body);
+                    sink.save_provenance(anchor, provenance);
+                }
+            }
+            ReviewViewEvent::FindingDismissed { fingerprint } => {
+                if let Some(sink) = &self.review_sink
+                    && let Some(head_sha) = review.read(cx).session().source().head_sha()
+                {
+                    sink.dismiss_finding(head_sha, fingerprint);
+                }
+            }
+            ReviewViewEvent::ReviewRequested => {
+                if let Some(launcher) = self.review_launcher.take() {
+                    let session = review.read(cx).session().clone();
+                    launcher(review, session, cx);
+                    self.review_launcher = Some(launcher);
+                }
+            }
         }
         // Renders the alarm if writing has started failing.
         cx.notify();
@@ -2746,6 +3106,231 @@ mod tests {
             });
         });
         (view, cx)
+    }
+
+    /// Puts one finding on the review, anchored to the row a comment can go on.
+    fn give_one_finding(
+        review: &Entity<ReviewView>,
+        cx: &mut gpui::VisualTestContext,
+        title: &str,
+    ) -> FindingId {
+        cx.update(|_window, app| {
+            review.update(app, |view, cx| {
+                let anchor = view
+                    .session()
+                    .anchor_for(0, 1)
+                    .expect("row 1 can carry a comment");
+                let raw = domain::RawFinding {
+                    location: Some(domain::RawLocation {
+                        path: anchor.path.clone(),
+                        side: anchor.side,
+                        line: anchor.line,
+                        start_line: None,
+                    }),
+                    severity: domain::Severity::Warning,
+                    confidence: 0.8,
+                    title: title.to_owned(),
+                    rationale: "because".to_owned(),
+                    proposed_comment: "Handle the failure here.".to_owned(),
+                    guidance_sources: vec![domain::GuidanceCitation {
+                        path: "AGENTS.md".into(),
+                        content_hash: "hash".into(),
+                    }],
+                };
+                let anchors = view.session().anchors().expect("anchored").clone();
+                let findings = Findings::validate(
+                    vec![raw],
+                    &anchors,
+                    &domain::FindingOrigin::Ai("claude-code".into()),
+                );
+                let id = findings.accepted()[0].id;
+                view.review_finished(findings, Vec::new(), cx);
+                id
+            })
+        })
+    }
+
+    #[gpui::test]
+    fn accepting_a_finding_writes_the_draft_and_its_provenance_to_the_sink(
+        cx: &mut TestAppContext,
+    ) {
+        cx.update(init);
+        let sink = RecordingSink::default();
+        let (view, cx) = ready_session_view(cx, Some(Box::new(sink.clone())));
+        let review = cx.update(|_window, app| review_of(&view, app));
+        let id = give_one_finding(&review, cx, "unchecked index");
+
+        cx.update(|window, app| {
+            review.update(app, |view, cx| {
+                view.accept_finding_by_id(id, window, cx);
+            });
+        });
+
+        // The text is written before the note about where it came from.
+        assert_eq!(
+            sink.calls(),
+            [
+                "save src/review.rs 2 Handle the failure here.".to_owned(),
+                "provenance src/review.rs 2 claude-code".to_owned(),
+            ]
+        );
+        cx.update(|_window, app| {
+            let view = review.read(app);
+            assert!(view.session().findings().is_empty(), "acted on");
+            let draft = view.session().draft_at(0, 1).expect("the draft is there");
+            assert!(draft.is_proposed());
+        });
+    }
+
+    #[gpui::test]
+    fn dismissing_a_finding_records_the_decision(cx: &mut TestAppContext) {
+        cx.update(init);
+        let sink = RecordingSink::default();
+        let (view, cx) = ready_session_view(cx, Some(Box::new(sink.clone())));
+        let review = cx.update(|_window, app| review_of(&view, app));
+        let id = give_one_finding(&review, cx, "unchecked index");
+
+        cx.update(|_window, app| {
+            review.update(app, |view, cx| view.dismiss_finding_by_id(id, cx));
+        });
+
+        assert_eq!(sink.calls().len(), 1);
+        assert!(sink.calls()[0].starts_with("dismiss "));
+        cx.update(|_window, app| {
+            assert!(review.read(app).session().findings().is_empty());
+            assert!(review.read(app).session().drafts().is_empty());
+        });
+    }
+
+    /// The reviewer's own words are never overwritten; both texts go to the
+    /// composer instead, and nothing is saved until they commit.
+    #[gpui::test]
+    fn accepting_onto_an_occupied_line_opens_the_composer_pre_filled(cx: &mut TestAppContext) {
+        cx.update(init);
+        let sink = RecordingSink::default();
+        let (view, cx) = ready_session_view(cx, Some(Box::new(sink.clone())));
+        let review = cx.update(|_window, app| review_of(&view, app));
+
+        // The reviewer writes on the line first.
+        cx.dispatch_action(SelectNextLine);
+        cx.dispatch_action(ToggleComment);
+        cx.simulate_input("mine");
+        cx.dispatch_action(CloseComment);
+        let id = give_one_finding(&review, cx, "unchecked index");
+        let before = sink.calls().len();
+
+        cx.update(|window, app| {
+            review.update(app, |view, cx| {
+                view.accept_finding_by_id(id, window, cx);
+            });
+        });
+
+        cx.update(|_window, app| {
+            let view = review.read(app);
+            // Untouched, and the finding is still waiting.
+            assert_eq!(
+                view.session().draft_at(0, 1).map(|d| d.body.as_str()),
+                Some("mine")
+            );
+            assert_eq!(view.session().findings().len(), 1);
+            // The composer holds both texts for the reviewer to reconcile.
+            let composer = view.diff_view.read(app).comment_editor.read(app);
+            assert_eq!(composer.content(), "mine\n\nHandle the failure here.");
+        });
+        assert_eq!(sink.calls().len(), before, "nothing was written");
+    }
+
+    #[gpui::test]
+    fn a_finding_about_the_whole_change_goes_into_the_summary(cx: &mut TestAppContext) {
+        cx.update(init);
+        let sink = RecordingSink::default();
+        let (view, cx) = ready_session_view(cx, Some(Box::new(sink.clone())));
+        let review = cx.update(|_window, app| review_of(&view, app));
+
+        let id = cx.update(|_window, app| {
+            review.update(app, |view, cx| {
+                let raw = domain::RawFinding {
+                    location: None,
+                    severity: domain::Severity::Info,
+                    confidence: 0.5,
+                    title: "no tests".to_owned(),
+                    rationale: String::new(),
+                    proposed_comment: "Consider adding a test.".to_owned(),
+                    guidance_sources: Vec::new(),
+                };
+                let anchors = view.session().anchors().expect("anchored").clone();
+                let findings = Findings::validate(
+                    vec![raw],
+                    &anchors,
+                    &domain::FindingOrigin::Ai("claude-code".into()),
+                );
+                let id = findings.accepted()[0].id;
+                view.review_finished(findings, Vec::new(), cx);
+                id
+            })
+        });
+
+        cx.update(|window, app| {
+            review.update(app, |view, cx| view.accept_finding_by_id(id, window, cx));
+        });
+
+        cx.update(|_window, app| {
+            let view = review.read(app);
+            assert_eq!(view.session().summary(), "Consider adding a test.");
+            assert!(view.session().drafts().is_empty(), "nowhere to anchor it");
+            assert!(view.session().findings().is_empty());
+        });
+        assert!(sink.calls().iter().any(|call| call.starts_with("summary ")));
+    }
+
+    #[gpui::test]
+    fn cancelling_sets_the_flag_the_backend_polls(cx: &mut TestAppContext) {
+        cx.update(init);
+        let (view, cx) = ready_session_view(cx, None);
+        let review = cx.update(|_window, app| review_of(&view, app));
+        let cancel = Arc::new(AtomicBool::new(false));
+
+        cx.update(|_window, app| {
+            review.update(app, |view, cx| {
+                view.review_started(Arc::clone(&cancel), cx);
+                assert!(view.review_run().is_running());
+                view.cancel_review(cx);
+            });
+        });
+
+        assert!(cancel.load(std::sync::atomic::Ordering::Relaxed));
+    }
+
+    #[gpui::test]
+    fn a_failed_run_keeps_its_remediation(cx: &mut TestAppContext) {
+        cx.update(init);
+        let (view, cx) = ready_session_view(cx, None);
+        let review = cx.update(|_window, app| review_of(&view, app));
+
+        cx.update(|_window, app| {
+            review.update(app, |view, cx| {
+                view.review_failed(
+                    "claude is not installed",
+                    Some("Install it.".to_owned()),
+                    cx,
+                );
+            });
+        });
+
+        cx.update(|_window, app| {
+            let ReviewRunState::Failed {
+                summary,
+                remediation,
+            } = review.read(app).review_run()
+            else {
+                panic!("the run should have failed");
+            };
+            assert_eq!(summary.as_ref(), "claude is not installed");
+            assert_eq!(
+                remediation.as_ref().map(SharedString::as_ref),
+                Some("Install it.")
+            );
+        });
     }
 
     /// The last link in the chain: a keystroke reaching storage.
