@@ -63,8 +63,12 @@ answer, and a better one than a list of noise. Prefer few findings you are \
 confident about.
 
 For each finding, set confidence to how sure you are that it is a real problem \
-worth a human's time, from 0 to 1. Cite the guidance files a finding came from \
-in `guidance`, by their exact path, when guidance is what makes it a problem.
+worth a human's time, from 0 to 1.
+
+When guidance is what makes something a problem, cite it in `guidance`. Each \
+entry is a bare path, exactly as it appears in the block's path attribute and \
+nothing else — `AGENTS.md`, not `AGENTS.md: never index without a length check`. \
+Put the reasoning in `rationale`, where it belongs.
 
 Reply with JSON matching the requested schema and nothing else.";
 
@@ -118,7 +122,7 @@ pub fn output_schema() -> serde_json::Value {
                         "guidance": {
                             "type": "array",
                             "items": { "type": "string" },
-                            "description": "Paths of guidance files this finding rests on."
+                            "description": "Bare paths of the guidance files this finding rests on, exactly as given, with no explanation appended. Put reasoning in rationale."
                         }
                     }
                 }

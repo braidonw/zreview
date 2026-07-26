@@ -518,14 +518,43 @@ fn into_raw(wire: WireFinding, citations: &[GuidanceCitation]) -> RawFinding {
         guidance_sources: wire
             .guidance
             .iter()
-            .filter_map(|path| {
-                citations
-                    .iter()
-                    .find(|citation| &*citation.path == path.trim())
-                    .cloned()
-            })
+            .filter_map(|claimed| cited_guidance(claimed, citations).cloned())
             .collect(),
     }
+}
+
+/// Matches a claimed guidance reference against the guidance actually sent.
+///
+/// The contract asks for the exact path, and a real model does not reliably give
+/// one: it returns `"AGENTS.md: never index without a length check"` — the path
+/// plus the rule it applied. Insisting on exact equality dropped the citation
+/// silently, which cost the finding the provenance PLAN section 8 asks every
+/// finding to carry. Crediting the guidance matters more than holding the model to
+/// the formatting, so the path is looked for inside the claim as well as as the
+/// whole of it.
+///
+/// Still bounded by what was sent, so a path the model invented matches nothing and
+/// is dropped.
+fn cited_guidance<'a>(
+    claimed: &str,
+    citations: &'a [GuidanceCitation],
+) -> Option<&'a GuidanceCitation> {
+    let claimed = claimed.trim();
+    let find = |wanted: &str| citations.iter().find(|citation| &*citation.path == wanted);
+
+    find(claimed)
+        // "AGENTS.md: the rule" — take what precedes the explanation.
+        .or_else(|| {
+            claimed
+                .split_once(':')
+                .and_then(|(head, _)| find(head.trim()))
+        })
+        // Anything else that names a file we sent.
+        .or_else(|| {
+            citations
+                .iter()
+                .find(|citation| claimed.contains(&*citation.path))
+        })
 }
 
 /// Finds the JSON object in a reply that may be fenced or have prose around it.
@@ -566,7 +595,10 @@ fn classify(program: &Arc<str>, message: &str, status: Option<i32>) -> ReviewErr
         || lowered.contains("quota")
         || lowered.contains("billing")
     {
-        return ReviewError::QuotaExhausted { program, message };
+        return ReviewError::QuotaExhausted {
+            program,
+            message: with_shadowed_key_note(message),
+        };
     }
     if lowered.contains("rate limit")
         || lowered.contains("rate_limit")
@@ -586,6 +618,28 @@ fn classify(program: &Arc<str>, message: &str, status: Option<i32>) -> ReviewErr
         return ReviewError::Unauthenticated { program };
     }
     ReviewError::Backend { program, message }
+}
+
+/// Environment variable whose presence overrides a signed-in subscription.
+const SHADOWING_KEY: &str = "ANTHROPIC_API_KEY";
+
+/// Names the likeliest cause of an out-of-credit error that should not have
+/// happened.
+///
+/// An `ANTHROPIC_API_KEY` in the environment takes precedence over a signed-in
+/// subscription, so a user on a paid plan sees "credit balance is too low" for an
+/// account they may not even know is being used. This cost an afternoon to work out
+/// from the error alone, which is exactly the kind of thing an error message should
+/// say for you.
+fn with_shadowed_key_note(message: String) -> String {
+    if std::env::var_os(SHADOWING_KEY).is_none_or(|value| value.is_empty()) {
+        return message;
+    }
+    format!(
+        "{message} — note that {SHADOWING_KEY} is set in this environment, which \
+         overrides a signed-in subscription. If you did not mean to use that key, \
+         unset it."
+    )
 }
 
 fn launch_error(program: &Arc<str>, executable: &OsStr, source: &std::io::Error) -> ReviewError {
@@ -1057,6 +1111,79 @@ mod tests {
             .expect("the document is readable");
 
         assert_eq!(findings[0].guidance_sources, citations);
+    }
+
+    #[test]
+    fn guidance_cited_with_its_rule_appended_still_counts() {
+        // What a real model returns: the path, then the rule it applied. Insisting
+        // on a bare path here dropped the citation and lost the finding's
+        // provenance.
+        let citations = vec![GuidanceCitation {
+            path: Arc::from("AGENTS.md"),
+            content_hash: Arc::from("hash"),
+        }];
+        let document = r#"{"findings":[{"path":"src/main.rs","side":"RIGHT","line":1,
+            "start_line":null,"severity":"error","confidence":0.9,"title":"boom",
+            "rationale":"","proposed_comment":"fix",
+            "guidance":["AGENTS.md: Never index a slice without checking its length first."]}]}"#;
+
+        let findings = parse_findings(document, &Arc::from("claude"), &citations)
+            .expect("the document is readable");
+
+        assert_eq!(findings[0].guidance_sources, citations);
+    }
+
+    #[test]
+    fn a_nested_guidance_path_is_matched_when_it_is_named_in_prose() {
+        let citations = vec![GuidanceCitation {
+            path: Arc::from("crates/ui/AGENTS.md"),
+            content_hash: Arc::from("hash"),
+        }];
+
+        let matched = cited_guidance("see crates/ui/AGENTS.md for the rule", &citations);
+
+        assert_eq!(matched, Some(&citations[0]));
+    }
+
+    #[test]
+    fn guidance_that_was_never_sent_matches_nothing() {
+        let citations = vec![GuidanceCitation {
+            path: Arc::from("AGENTS.md"),
+            content_hash: Arc::from("hash"),
+        }];
+
+        assert_eq!(cited_guidance("POLICY.md: made up", &citations), None);
+    }
+
+    #[test]
+    fn an_out_of_credit_error_names_a_shadowing_api_key() {
+        // In a child process, because the parent's environment cannot be mutated
+        // safely under `forbid(unsafe_code)`.
+        const CHILD: &str = "ZREVIEW_SHADOW_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let status = Command::new(std::env::current_exe().expect("the test binary's path"))
+                .args([
+                    "--exact",
+                    "agent::tests::an_out_of_credit_error_names_a_shadowing_api_key",
+                ])
+                .env(CHILD, "1")
+                .env(SHADOWING_KEY, "sk-ant-whatever")
+                .status()
+                .expect("the test binary re-runs");
+            assert!(status.success());
+            return;
+        }
+
+        let error = classify(&Arc::from("claude"), "Credit balance is too low", Some(1));
+
+        match error {
+            ReviewError::QuotaExhausted { message, .. } => {
+                assert!(message.contains("Credit balance is too low"));
+                assert!(message.contains(SHADOWING_KEY));
+                assert!(message.contains("overrides a signed-in subscription"));
+            }
+            other => panic!("expected spent quota, got {other:?}"),
+        }
     }
 
     #[test]
