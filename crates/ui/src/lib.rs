@@ -986,7 +986,7 @@ impl DiffView {
                             .w(px(theme::RAIL_WIDTH))
                             .h_full()
                             .flex_shrink_0()
-                            .when_some(rail, |bar, colour| bar.bg(colour)),
+                            .when_some(rail, gpui::Styled::bg),
                     )
                     .child(
                         div()
