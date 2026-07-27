@@ -301,7 +301,7 @@ impl CommentEditor {
             if !span.is_empty() {
                 row = row.child(
                     div()
-                        .when(highlighted, |piece| piece.bg(rgb(0x1d4ed8)))
+                        .when(highlighted, |piece| piece.bg(rgb(theme::accent::DIM)))
                         .child(SharedString::from(span.to_owned())),
                 );
             }
@@ -326,7 +326,7 @@ impl CommentEditor {
         div()
             .w(px(1.5))
             .h(px(16.0))
-            .bg(rgb(0xf8fafc))
+            .bg(rgb(theme::text::PRIMARY))
             .flex_shrink_0()
     }
 }
@@ -483,12 +483,12 @@ impl Render for CommentEditor {
             .rounded_md()
             .border_1()
             .border_color(if focused {
-                rgb(0x3b82f6)
+                rgb(theme::accent::BASE)
             } else {
-                rgb(0x334155)
+                rgb(theme::surface::OVERLAY)
             })
-            .bg(rgb(0x111827))
-            .text_color(rgb(0xe5e7eb))
+            .bg(rgb(theme::surface::RAISED))
+            .text_color(rgb(theme::text::PRIMARY))
             .text_sm()
             .cursor_text()
             .flex()
@@ -513,7 +513,7 @@ impl Render for CommentEditor {
             .children(if self.text.is_empty() && !focused {
                 vec![
                     div()
-                        .text_color(rgb(0x6b7280))
+                        .text_color(rgb(theme::text::TERTIARY))
                         .child("Write a review comment…"),
                 ]
             } else {
@@ -810,8 +810,8 @@ impl DiffView {
             .p_2()
             .rounded_md()
             .border_l_2()
-            .border_color(rgb(0x818cf8))
-            .bg(rgb(0x131c31))
+            .border_color(rgb(theme::accent::TEXT))
+            .bg(rgb(theme::surface::RAISED))
             .children(thread.comments().iter().map(|comment| {
                 div()
                     .flex()
@@ -825,35 +825,42 @@ impl DiffView {
                             .text_xs()
                             .child(
                                 div()
-                                    .text_color(rgb(0xc7d2fe))
+                                    .text_color(rgb(theme::accent::TEXT))
                                     .font_weight(gpui::FontWeight::SEMIBOLD)
                                     .child(SharedString::from(comment.author.to_string())),
                             )
                             .child(
                                 div()
-                                    .text_color(rgb(0x64748b))
+                                    .text_color(rgb(theme::text::TERTIARY))
                                     .child(SharedString::from(comment.created_at.to_string())),
                             )
                             .when(comment.is_multiline(), |header| {
-                                header.child(div().text_color(rgb(0x64748b)).child(format!(
-                                    "lines {}–{}",
-                                    comment.start_line.unwrap_or_default(),
-                                    comment.line.unwrap_or_default(),
-                                )))
+                                header.child(div().text_color(rgb(theme::text::TERTIARY)).child(
+                                    format!(
+                                        "lines {}–{}",
+                                        comment.start_line.unwrap_or_default(),
+                                        comment.line.unwrap_or_default(),
+                                    ),
+                                ))
                             }),
                     )
                     .child(
                         div()
                             .text_sm()
-                            .text_color(rgb(0xcbd5e1))
+                            .text_color(rgb(theme::text::SECONDARY))
                             .child(SharedString::from(comment.body.to_string())),
                     )
             }))
             .when(replies > 0, |thread| {
-                thread.child(div().text_xs().text_color(rgb(0x64748b)).child(format!(
-                    "{replies} repl{}",
-                    if replies == 1 { "y" } else { "ies" }
-                )))
+                thread.child(
+                    div()
+                        .text_xs()
+                        .text_color(rgb(theme::text::TERTIARY))
+                        .child(format!(
+                            "{replies} repl{}",
+                            if replies == 1 { "y" } else { "ies" }
+                        )),
+                )
             })
             .into_any()
     }
@@ -1021,9 +1028,9 @@ impl DiffView {
                                 .mr_2()
                                 .px_1()
                                 .rounded_sm()
-                                .bg(rgb(0x312e81))
+                                .bg(rgb(theme::accent::DIM))
                                 .text_xs()
-                                .text_color(rgb(0xc7d2fe))
+                                .text_color(rgb(theme::accent::TEXT))
                                 .child(format!("{}", threads.len())),
                         )
                     })
@@ -1033,9 +1040,9 @@ impl DiffView {
                                 .mr_2()
                                 .px_1()
                                 .rounded_sm()
-                                .bg(rgb(0x78350f))
+                                .bg(rgb(theme::severity::WARNING_DIM))
                                 .text_xs()
-                                .text_color(rgb(0xfde68a))
+                                .text_color(rgb(theme::severity::WARNING_TEXT))
                                 .child("draft"),
                         )
                     })
@@ -1047,9 +1054,9 @@ impl DiffView {
                                 .px_2()
                                 .py_1()
                                 .rounded_sm()
-                                .bg(rgb(0x2563eb))
+                                .bg(rgb(theme::accent::BASE))
                                 .text_xs()
-                                .text_color(rgb(0xffffff))
+                                .text_color(rgb(theme::text::ON_ACCENT))
                                 .cursor_pointer()
                                 .on_mouse_down(MouseButton::Left, move |_, window, cx| {
                                     cx.stop_propagation();
@@ -1084,8 +1091,8 @@ impl DiffView {
                         .p_2()
                         .rounded_md()
                         .border_l_2()
-                        .border_color(rgb(0xfbbf24))
-                        .bg(rgb(0x1c1917))
+                        .border_color(rgb(theme::severity::WARNING))
+                        .bg(rgb(theme::surface::OVERLAY))
                         .flex()
                         .flex_col()
                         .gap_1()
@@ -1096,20 +1103,22 @@ impl DiffView {
                                 .text_xs()
                                 .child(
                                     div()
-                                        .text_color(rgb(0xfde68a))
+                                        .text_color(rgb(theme::severity::WARNING_TEXT))
                                         .font_weight(gpui::FontWeight::SEMIBOLD)
                                         .child("Your draft"),
                                 )
                                 .when(draft.is_stale, |header| {
                                     header.child(
-                                        div().text_color(rgb(0xf87171)).child("needs re-anchoring"),
+                                        div()
+                                            .text_color(rgb(theme::severity::ERROR_TEXT))
+                                            .child("needs re-anchoring"),
                                     )
                                 }),
                         )
                         .child(
                             div()
                                 .text_sm()
-                                .text_color(rgb(0xe5e7eb))
+                                .text_color(rgb(theme::text::PRIMARY))
                                 .child(SharedString::from(draft.body.clone())),
                         ),
                 )
@@ -1133,8 +1142,8 @@ impl DiffView {
                                 .items_center()
                                 .rounded_md()
                                 .border_1()
-                                .border_color(rgb(0x475569))
-                                .text_color(rgb(0xcbd5e1))
+                                .border_color(rgb(theme::border::STRONG))
+                                .text_color(rgb(theme::text::SECONDARY))
                                 .cursor_pointer()
                                 .on_mouse_down(MouseButton::Left, move |_, window, cx| {
                                     cx.stop_propagation();
@@ -1155,8 +1164,8 @@ impl DiffView {
                                 .items_center()
                                 .rounded_md()
                                 .border_1()
-                                .border_color(rgb(0x7f1d1d))
-                                .text_color(rgb(0xfca5a5))
+                                .border_color(rgb(theme::severity::ERROR_DIM))
+                                .text_color(rgb(theme::severity::ERROR_TEXT))
                                 .cursor_pointer()
                                 .on_mouse_down(MouseButton::Left, move |_, window, cx| {
                                     cx.stop_propagation();
@@ -1231,7 +1240,7 @@ impl Render for DiffView {
             .size_full()
             .flex()
             .flex_col()
-            .bg(rgb(0x020617))
+            .bg(rgb(theme::surface::BASE))
             .font_family("SF Mono")
             .text_size(px(13.0))
             .child(
@@ -1243,8 +1252,8 @@ impl Render for DiffView {
                     .items_center()
                     .justify_between()
                     .border_b_1()
-                    .border_color(rgb(0x1e293b))
-                    .bg(rgb(0x0f172a))
+                    .border_color(rgb(theme::border::DEFAULT))
+                    .bg(rgb(theme::surface::BASE))
                     .child(
                         div()
                             .flex()
@@ -1252,13 +1261,13 @@ impl Render for DiffView {
                             .items_center()
                             .child(
                                 div()
-                                    .text_color(rgb(0xf8fafc))
+                                    .text_color(rgb(theme::text::PRIMARY))
                                     .font_weight(gpui::FontWeight::SEMIBOLD)
                                     .child("ZReview"),
                             )
-                            .child(div().text_color(rgb(0x94a3b8)).child(path)),
+                            .child(div().text_color(rgb(theme::text::SECONDARY)).child(path)),
                     )
-                    .child(div().text_color(rgb(0x94a3b8)).child(format!(
+                    .child(div().text_color(rgb(theme::text::SECONDARY)).child(format!(
                         "{line_count} lines · {hunk_count} hunk{}",
                         if hunk_count == 1 { "" } else { "s" }
                     ))),
@@ -1270,8 +1279,8 @@ impl Render for DiffView {
                     .px_3()
                     .flex()
                     .items_center()
-                    .bg(rgb(0x172554))
-                    .text_color(rgb(0x93c5fd))
+                    .bg(rgb(theme::diff::hunk::BG))
+                    .text_color(rgb(theme::accent::TEXT))
                     .child(current_hunk),
             )
             .child(
@@ -1291,7 +1300,7 @@ impl Render for DiffView {
                             .gap_2()
                             .child(
                                 div()
-                                    .text_color(rgb(0xf8fafc))
+                                    .text_color(rgb(theme::text::PRIMARY))
                                     .font_weight(gpui::FontWeight::SEMIBOLD)
                                     .child(reason.label()),
                             )
@@ -1299,7 +1308,7 @@ impl Render for DiffView {
                                 div()
                                     .max_w(px(420.0))
                                     .text_xs()
-                                    .text_color(rgb(0x64748b))
+                                    .text_color(rgb(theme::text::TERTIARY))
                                     .child(reason.detail()),
                             )
                     }))
@@ -1332,15 +1341,15 @@ impl Render for DiffView {
                             .flex_shrink_0()
                             .p_4()
                             .border_l_1()
-                            .border_color(rgb(0x1e293b))
-                            .bg(rgb(0x0f172a))
-                            .text_color(rgb(0x94a3b8))
+                            .border_color(rgb(theme::border::DEFAULT))
+                            .bg(rgb(theme::surface::BASE))
+                            .text_color(rgb(theme::text::SECONDARY))
                             .flex()
                             .flex_col()
                             .gap_3()
                             .child(
                                 div()
-                                    .text_color(rgb(0xf8fafc))
+                                    .text_color(rgb(theme::text::PRIMARY))
                                     .font_weight(gpui::FontWeight::SEMIBOLD)
                                     .child("Conversations"),
                             )
@@ -1353,7 +1362,7 @@ impl Render for DiffView {
                                 panel.child(
                                     div()
                                         .text_xs()
-                                        .text_color(rgb(0xfde68a))
+                                        .text_color(rgb(theme::severity::WARNING_TEXT))
                                         .child(format!("{draft_count} of your drafts")),
                                 )
                             })
@@ -1367,7 +1376,7 @@ impl Render for DiffView {
                                         div()
                                             .mt_2()
                                             .text_xs()
-                                            .text_color(rgb(0xfbbf24))
+                                            .text_color(rgb(theme::severity::WARNING))
                                             .child(format!("{} not on a line", unplaced.len())),
                                     )
                                     .children(unplaced.iter().map(|unplaced| {
@@ -1375,25 +1384,31 @@ impl Render for DiffView {
                                         div()
                                             .p_2()
                                             .rounded_md()
-                                            .bg(rgb(0x131c31))
+                                            .bg(rgb(theme::surface::RAISED))
                                             .flex()
                                             .flex_col()
                                             .gap_1()
                                             .child(
                                                 div()
                                                     .text_xs()
-                                                    .text_color(rgb(0xfbbf24))
+                                                    .text_color(rgb(theme::severity::WARNING))
                                                     .child(unplaced.reason.to_string()),
                                             )
                                             .child(
-                                                div().text_xs().text_color(rgb(0xc7d2fe)).child(
-                                                    SharedString::from(root.author.to_string()),
-                                                ),
+                                                div()
+                                                    .text_xs()
+                                                    .text_color(rgb(theme::accent::TEXT))
+                                                    .child(SharedString::from(
+                                                        root.author.to_string(),
+                                                    )),
                                             )
                                             .child(
-                                                div().text_xs().text_color(rgb(0xcbd5e1)).child(
-                                                    SharedString::from(root.body.to_string()),
-                                                ),
+                                                div()
+                                                    .text_xs()
+                                                    .text_color(rgb(theme::text::SECONDARY))
+                                                    .child(SharedString::from(
+                                                        root.body.to_string(),
+                                                    )),
                                             )
                                     }))
                             })
@@ -1402,13 +1417,17 @@ impl Render for DiffView {
                             // the one action that fixes that.
                             .when(!stale_drafts.is_empty(), |panel| {
                                 panel
-                                    .child(div().mt_2().text_xs().text_color(rgb(0xf87171)).child(
-                                        format!(
-                                            "{} draft{} need re-anchoring",
-                                            stale_drafts.len(),
-                                            if stale_drafts.len() == 1 { "" } else { "s" },
-                                        ),
-                                    ))
+                                    .child(
+                                        div()
+                                            .mt_2()
+                                            .text_xs()
+                                            .text_color(rgb(theme::severity::ERROR_TEXT))
+                                            .child(format!(
+                                                "{} draft{} need re-anchoring",
+                                                stale_drafts.len(),
+                                                if stale_drafts.len() == 1 { "" } else { "s" },
+                                            )),
+                                    )
                                     .children(stale_drafts.iter().map(|draft| {
                                         let move_view = panel_view.clone();
                                         let stale = draft.anchor.clone();
@@ -1416,21 +1435,24 @@ impl Render for DiffView {
                                             .p_2()
                                             .rounded_md()
                                             .border_l_2()
-                                            .border_color(rgb(0xf87171))
-                                            .bg(rgb(0x1c1917))
+                                            .border_color(rgb(theme::severity::ERROR_TEXT))
+                                            .bg(rgb(theme::surface::OVERLAY))
                                             .flex()
                                             .flex_col()
                                             .gap_1()
-                                            .child(div().text_xs().text_color(rgb(0x94a3b8)).child(
-                                                format!(
-                                                    "was {} line {}",
-                                                    draft.anchor.side, draft.anchor.line,
-                                                ),
-                                            ))
                                             .child(
                                                 div()
                                                     .text_xs()
-                                                    .text_color(rgb(0xe5e7eb))
+                                                    .text_color(rgb(theme::text::SECONDARY))
+                                                    .child(format!(
+                                                        "was {} line {}",
+                                                        draft.anchor.side, draft.anchor.line,
+                                                    )),
+                                            )
+                                            .child(
+                                                div()
+                                                    .text_xs()
+                                                    .text_color(rgb(theme::text::PRIMARY))
                                                     .child(SharedString::from(draft.body.clone())),
                                             )
                                             .child(
@@ -1440,9 +1462,9 @@ impl Render for DiffView {
                                                     .px_2()
                                                     .py_1()
                                                     .rounded_sm()
-                                                    .bg(rgb(0x2563eb))
+                                                    .bg(rgb(theme::accent::BASE))
                                                     .text_xs()
-                                                    .text_color(rgb(0xffffff))
+                                                    .text_color(rgb(theme::text::ON_ACCENT))
                                                     .cursor_pointer()
                                                     .on_mouse_down(
                                                         MouseButton::Left,
@@ -1466,12 +1488,16 @@ impl Render for DiffView {
                                             )
                                     }))
                             })
-                            .child(div().mt_4().text_xs().text_color(rgb(0x64748b)).child(
-                                format!(
-                                    "Row {} · j/k move · c comment · esc close",
-                                    selected_line + 1
-                                ),
-                            )),
+                            .child(
+                                div()
+                                    .mt_4()
+                                    .text_xs()
+                                    .text_color(rgb(theme::text::TERTIARY))
+                                    .child(format!(
+                                        "Row {} · j/k move · c comment · esc close",
+                                        selected_line + 1
+                                    )),
+                            ),
                     ),
             )
     }
@@ -1987,8 +2013,8 @@ impl ReviewView {
             .items_center()
             .gap_3()
             .border_t_1()
-            .border_color(rgb(0x1e293b))
-            .bg(rgb(0x0f172a))
+            .border_color(rgb(theme::border::DEFAULT))
+            .bg(rgb(theme::surface::BASE))
             .font_family("SF Mono")
             .text_size(px(13.0))
             .child(
@@ -2000,7 +2026,7 @@ impl ReviewView {
                     .gap_1()
                     .child(
                         div()
-                            .text_color(rgb(0xf8fafc))
+                            .text_color(rgb(theme::text::PRIMARY))
                             .font_weight(gpui::FontWeight::SEMIBOLD)
                             .child(format!("{ready} to submit")),
                     )
@@ -2008,7 +2034,7 @@ impl ReviewView {
                         counts.child(
                             div()
                                 .text_xs()
-                                .text_color(rgb(0xf87171))
+                                .text_color(rgb(theme::severity::ERROR_TEXT))
                                 .child(format!("{stale} not anchored")),
                         )
                     }),
@@ -2017,9 +2043,9 @@ impl ReviewView {
             .children(can_submit.then(|| {
                 div().flex_shrink_0().flex().gap_2().children(
                     [
-                        (ReviewEvent::Comment, rgb(0x2563eb)),
-                        (ReviewEvent::Approve, rgb(0x15803d)),
-                        (ReviewEvent::RequestChanges, rgb(0xb91c1c)),
+                        (ReviewEvent::Comment, rgb(theme::accent::BASE)),
+                        (ReviewEvent::Approve, rgb(theme::severity::SUCCESS)),
+                        (ReviewEvent::RequestChanges, rgb(theme::severity::ERROR)),
                     ]
                     .map(|(event, colour)| {
                         let view = review_view.clone();
@@ -2033,7 +2059,7 @@ impl ReviewView {
                             .rounded_md()
                             .bg(colour)
                             .text_xs()
-                            .text_color(rgb(0xffffff))
+                            .text_color(rgb(theme::text::ON_ACCENT))
                             .cursor_pointer()
                             .on_mouse_down(MouseButton::Left, move |_, _window, cx| {
                                 cx.stop_propagation();
@@ -2085,33 +2111,38 @@ impl ReviewView {
             .justify_center()
             .gap_1()
             .border_b_1()
-            .border_color(rgb(0x1e293b))
+            .border_color(rgb(theme::border::DEFAULT))
             .child(
                 div()
                     .text_xs()
-                    .text_color(rgb(0x60a5fa))
+                    .text_color(rgb(theme::severity::INFO))
                     .overflow_hidden()
                     .whitespace_nowrap()
                     .child(label),
             )
             .child(
                 div()
-                    .text_color(rgb(0xf8fafc))
+                    .text_color(rgb(theme::text::PRIMARY))
                     .font_weight(gpui::FontWeight::SEMIBOLD)
                     .overflow_hidden()
                     .whitespace_nowrap()
                     .child(title),
             )
-            .child(div().text_xs().text_color(rgb(0x64748b)).child(format!(
-                "{file_count} files · {viewed_count} viewed · {thread_count} conversations"
-            )))
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(rgb(theme::text::TERTIARY))
+                    .child(format!(
+                        "{file_count} files · {viewed_count} viewed · {thread_count} conversations"
+                    )),
+            )
             // Conversations that would not load, or drafts that are not being
             // saved, must be visible: a session that quietly lacks either looks
             // exactly like one that has nothing to show.
             .children(self.session.warnings().iter().map(|warning| {
                 div()
                     .text_xs()
-                    .text_color(rgb(0xfbbf24))
+                    .text_color(rgb(theme::severity::WARNING))
                     .child(SharedString::from(warning.summary.clone()))
             }))
     }
@@ -2125,13 +2156,13 @@ impl ReviewView {
         review_view: &Entity<Self>,
     ) -> gpui::AnyElement {
         let (status, status_color) = match file.status {
-            FileStatus::Added => ("A", rgb(0x4ade80)),
-            FileStatus::Deleted => ("D", rgb(0xf87171)),
-            FileStatus::Modified => ("M", rgb(0xfbbf24)),
-            FileStatus::Renamed => ("R", rgb(0x60a5fa)),
-            FileStatus::Copied => ("C", rgb(0xa78bfa)),
-            FileStatus::TypeChanged => ("T", rgb(0xf59e0b)),
-            FileStatus::Unmerged => ("U", rgb(0xfb7185)),
+            FileStatus::Added => ("A", rgb(theme::severity::SUCCESS)),
+            FileStatus::Deleted => ("D", rgb(theme::severity::ERROR_TEXT)),
+            FileStatus::Modified => ("M", rgb(theme::severity::WARNING)),
+            FileStatus::Renamed => ("R", rgb(theme::severity::INFO)),
+            FileStatus::Copied => ("C", rgb(theme::proposed::BASE)),
+            FileStatus::TypeChanged => ("T", rgb(theme::severity::WARNING)),
+            FileStatus::Unmerged => ("U", rgb(theme::severity::ERROR)),
         };
         // Counted when the file was built, not per frame.
         let ChangeCounts {
@@ -2151,9 +2182,9 @@ impl ReviewView {
             .gap_2()
             .cursor_pointer()
             .bg(if selected {
-                rgb(0x1e3a5f)
+                rgb(theme::surface::SELECTED)
             } else {
-                rgb(0x0f172a)
+                rgb(theme::surface::BASE)
             })
             .when(viewed, |row| row.opacity(0.55))
             .on_mouse_down(MouseButton::Left, move |_, window, cx| {
@@ -2171,7 +2202,7 @@ impl ReviewView {
                     .flex_1()
                     .overflow_hidden()
                     .whitespace_nowrap()
-                    .text_color(rgb(0xcbd5e1))
+                    .text_color(rgb(theme::text::SECONDARY))
                     .child(path),
             )
             .when(threads > 0, |row| {
@@ -2179,14 +2210,19 @@ impl ReviewView {
                     div()
                         .px_1()
                         .rounded_sm()
-                        .bg(rgb(0x312e81))
+                        .bg(rgb(theme::accent::DIM))
                         .text_xs()
-                        .text_color(rgb(0xc7d2fe))
+                        .text_color(rgb(theme::accent::TEXT))
                         .child(format!("{threads}")),
                 )
             })
             .when(file.is_binary, |row| {
-                row.child(div().text_xs().text_color(rgb(0x64748b)).child("binary"))
+                row.child(
+                    div()
+                        .text_xs()
+                        .text_color(rgb(theme::text::TERTIARY))
+                        .child("binary"),
+                )
             })
             .when(!file.is_binary, |row| {
                 row.child(
@@ -2196,18 +2232,18 @@ impl ReviewView {
                         .text_xs()
                         .child(
                             div()
-                                .text_color(rgb(0x4ade80))
+                                .text_color(rgb(theme::severity::SUCCESS))
                                 .child(format!("+{additions}")),
                         )
                         .child(
                             div()
-                                .text_color(rgb(0xf87171))
+                                .text_color(rgb(theme::severity::ERROR_TEXT))
                                 .child(format!("-{deletions}")),
                         ),
                 )
             })
             .when(viewed, |row| {
-                row.child(div().text_color(rgb(0x4ade80)).child("✓"))
+                row.child(div().text_color(rgb(theme::severity::SUCCESS)).child("✓"))
             })
             .into_any()
     }
@@ -2244,7 +2280,7 @@ impl Render for ReviewView {
             .on_action(cx.listener(Self::dismiss_selected_finding))
             .size_full()
             .flex()
-            .bg(rgb(0x020617))
+            .bg(rgb(theme::surface::BASE))
             .child(
                 div()
                     .w(px(290.0))
@@ -2253,8 +2289,8 @@ impl Render for ReviewView {
                     .flex()
                     .flex_col()
                     .border_r_1()
-                    .border_color(rgb(0x1e293b))
-                    .bg(rgb(0x0f172a))
+                    .border_color(rgb(theme::border::DEFAULT))
+                    .bg(rgb(theme::surface::BASE))
                     .child(header)
                     .child(
                         list(self.file_list_state.clone(), move |index, _, _| {
@@ -2615,8 +2651,8 @@ impl SessionView {
                 .flex_col()
                 .gap_2()
                 .border_b_1()
-                .border_color(rgb(0x1e293b))
-                .bg(rgb(0x0b1220))
+                .border_color(rgb(theme::border::DEFAULT))
+                .bg(rgb(theme::surface::BASE))
                 .font_family("SF Mono")
                 .text_size(px(13.0))
         };
@@ -2628,7 +2664,7 @@ impl SessionView {
                 panel()
                     .child(
                         div()
-                            .text_color(rgb(0x93c5fd))
+                            .text_color(rgb(theme::accent::TEXT))
                             .child("Submitting the review…"),
                     )
                     .into_any(),
@@ -2638,7 +2674,7 @@ impl SessionView {
                 panel()
                     .child(
                         div()
-                            .text_color(rgb(0x4ade80))
+                            .text_color(rgb(theme::severity::SUCCESS))
                             .font_weight(gpui::FontWeight::SEMIBOLD)
                             .child(format!(
                                 "Submitted as {} with {} inline comment{}",
@@ -2650,7 +2686,7 @@ impl SessionView {
                     .child(
                         div()
                             .text_xs()
-                            .text_color(rgb(0x94a3b8))
+                            .text_color(rgb(theme::text::SECONDARY))
                             .child(SharedString::from(outcome.url.clone())),
                     )
                     .into_any(),
@@ -2660,19 +2696,19 @@ impl SessionView {
                 panel()
                     .child(
                         div()
-                            .text_color(rgb(0xf87171))
+                            .text_color(rgb(theme::severity::ERROR_TEXT))
                             .font_weight(gpui::FontWeight::SEMIBOLD)
                             .child(SharedString::from(failure.summary.clone())),
                     )
                     .children(failure.remediation.as_ref().map(|remediation| {
                         div()
-                            .text_color(rgb(0xfde68a))
+                            .text_color(rgb(theme::severity::WARNING_TEXT))
                             .child(SharedString::from(remediation.clone()))
                     }))
                     .children(failure.detail.as_ref().map(|detail| {
                         div()
                             .text_xs()
-                            .text_color(rgb(0x94a3b8))
+                            .text_color(rgb(theme::text::SECONDARY))
                             .child(SharedString::from(detail.clone()))
                     }))
                     .into_any(),
@@ -2696,7 +2732,7 @@ impl SessionView {
         panel
             .child(
                 div()
-                    .text_color(rgb(0xf8fafc))
+                    .text_color(rgb(theme::text::PRIMARY))
                     .font_weight(gpui::FontWeight::SEMIBOLD)
                     .child(format!(
                         "{} with {} inline comment{}",
@@ -2715,15 +2751,15 @@ impl SessionView {
             .child(
                 div()
                     .text_xs()
-                    .text_color(rgb(0x64748b))
+                    .text_color(rgb(theme::text::TERTIARY))
                     .child(format!("pinned to {}", short_sha(&submission.head_sha))),
             )
             .children((!submission.body.is_empty()).then(|| {
                 div()
                     .p_2()
                     .rounded_md()
-                    .bg(rgb(0x131c31))
-                    .text_color(rgb(0xcbd5e1))
+                    .bg(rgb(theme::surface::RAISED))
+                    .text_color(rgb(theme::text::SECONDARY))
                     .child(SharedString::from(submission.body.clone()))
             }))
             .children(submission.comments.iter().map(|comment| {
@@ -2734,15 +2770,20 @@ impl SessionView {
                     .p_2()
                     .rounded_md()
                     .border_l_2()
-                    .border_color(rgb(0x2563eb))
-                    .bg(rgb(0x131c31))
-                    .child(div().text_xs().text_color(rgb(0x94a3b8)).child(format!(
-                        "{} {} line {}",
-                        comment.path, comment.side, comment.line,
-                    )))
+                    .border_color(rgb(theme::accent::BASE))
+                    .bg(rgb(theme::surface::RAISED))
                     .child(
                         div()
-                            .text_color(rgb(0xe5e7eb))
+                            .text_xs()
+                            .text_color(rgb(theme::text::SECONDARY))
+                            .child(format!(
+                                "{} {} line {}",
+                                comment.path, comment.side, comment.line,
+                            )),
+                    )
+                    .child(
+                        div()
+                            .text_color(rgb(theme::text::PRIMARY))
                             .child(SharedString::from(comment.body.clone())),
                     )
             }))
@@ -2754,24 +2795,31 @@ impl SessionView {
                     .flex()
                     .flex_col()
                     .gap_1()
-                    .child(div().text_color(rgb(0xf87171)).child(format!(
-                        "{} draft{} will NOT be posted",
-                        submission.excluded.len(),
-                        if submission.excluded.len() == 1 {
-                            ""
-                        } else {
-                            "s"
-                        },
-                    )))
+                    .child(
+                        div()
+                            .text_color(rgb(theme::severity::ERROR_TEXT))
+                            .child(format!(
+                                "{} draft{} will NOT be posted",
+                                submission.excluded.len(),
+                                if submission.excluded.len() == 1 {
+                                    ""
+                                } else {
+                                    "s"
+                                },
+                            )),
+                    )
                     .children(
                         submission
                             .excluded
                             .iter()
                             .map(|ExcludedDraft { draft, reason }| {
-                                div().text_xs().text_color(rgb(0x94a3b8)).child(format!(
-                                    "{} line {} — {reason}: {}",
-                                    draft.anchor.path, draft.anchor.line, draft.body,
-                                ))
+                                div()
+                                    .text_xs()
+                                    .text_color(rgb(theme::text::SECONDARY))
+                                    .child(format!(
+                                        "{} line {} — {reason}: {}",
+                                        draft.anchor.path, draft.anchor.line, draft.body,
+                                    ))
                             }),
                     )
             }))
@@ -2786,8 +2834,8 @@ impl SessionView {
                             .px_3()
                             .py_2()
                             .rounded_md()
-                            .bg(rgb(0x2563eb))
-                            .text_color(rgb(0xffffff))
+                            .bg(rgb(theme::accent::BASE))
+                            .text_color(rgb(theme::text::ON_ACCENT))
                             .cursor_pointer()
                             .on_mouse_down(MouseButton::Left, move |_, _window, cx| {
                                 cx.stop_propagation();
@@ -2802,8 +2850,8 @@ impl SessionView {
                             .py_2()
                             .rounded_md()
                             .border_1()
-                            .border_color(rgb(0x475569))
-                            .text_color(rgb(0xcbd5e1))
+                            .border_color(rgb(theme::border::STRONG))
+                            .text_color(rgb(theme::text::SECONDARY))
                             .cursor_pointer()
                             .on_mouse_down(MouseButton::Left, move |_, _window, cx| {
                                 cx.stop_propagation();
@@ -2823,7 +2871,7 @@ impl SessionView {
             .items_center()
             .justify_center()
             .gap_3()
-            .bg(rgb(0x020617))
+            .bg(rgb(theme::surface::BASE))
             .font_family("SF Mono")
             .text_size(px(13.0))
             .children(children)
@@ -2847,12 +2895,12 @@ impl Render for SessionView {
         match &self.state {
             SessionState::Loading { description, stage } => Self::render_centered(vec![
                 div()
-                    .text_color(rgb(0xf8fafc))
+                    .text_color(rgb(theme::text::PRIMARY))
                     .font_weight(gpui::FontWeight::SEMIBOLD)
                     .child(format!("Opening {description}"))
                     .into_any(),
                 div()
-                    .text_color(rgb(0x93c5fd))
+                    .text_color(rgb(theme::accent::TEXT))
                     .child(format!("{stage}…"))
                     .into_any(),
             ])
@@ -2866,7 +2914,7 @@ impl Render for SessionView {
                     .gap_3()
                     .child(
                         div()
-                            .text_color(rgb(0xf87171))
+                            .text_color(rgb(theme::severity::ERROR_TEXT))
                             .font_weight(gpui::FontWeight::SEMIBOLD)
                             .child(SharedString::from(failure.summary.clone())),
                     )
@@ -2877,15 +2925,15 @@ impl Render for SessionView {
                             .p_3()
                             .rounded_md()
                             .border_l_2()
-                            .border_color(rgb(0xfbbf24))
-                            .bg(rgb(0x131c31))
-                            .text_color(rgb(0xfde68a))
+                            .border_color(rgb(theme::severity::WARNING))
+                            .bg(rgb(theme::surface::RAISED))
+                            .text_color(rgb(theme::severity::WARNING_TEXT))
                             .child(SharedString::from(remediation.clone()))
                     }))
                     .children(failure.detail.as_ref().map(|detail| {
                         div()
                             .text_xs()
-                            .text_color(rgb(0x94a3b8))
+                            .text_color(rgb(theme::text::SECONDARY))
                             .child(SharedString::from(detail.clone()))
                     }))
                     .into_any(),
@@ -2899,14 +2947,14 @@ impl Render for SessionView {
                 .size_full()
                 .flex()
                 .flex_col()
-                .bg(rgb(0x020617))
+                .bg(rgb(theme::surface::BASE))
                 .children(self.draft_write_failure().map(|failure| {
                     div()
                         .flex_shrink_0()
                         .px_4()
                         .py_2()
-                        .bg(rgb(0x7f1d1d))
-                        .text_color(rgb(0xfee2e2))
+                        .bg(rgb(theme::severity::ERROR_DIM))
+                        .text_color(rgb(theme::severity::ERROR_TEXT))
                         .font_family("SF Mono")
                         .text_size(px(13.0))
                         .child(format!("Drafts are not being saved: {failure}"))

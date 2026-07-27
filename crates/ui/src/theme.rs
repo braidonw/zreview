@@ -134,6 +134,11 @@ pub mod proposed {
 /// which is what most of the chrome had wrong when it was all `SF Mono`.
 pub mod font {
     /// Diff content, paths, numbers, keys.
+    ///
+    /// The design specifies `JetBrains Mono`. We stay on SF Mono deliberately: it
+    /// ships with macOS, and bundling a face would mean shipping a font asset and
+    /// loading it through GPUI for a difference the reviewer would not name. The
+    /// metrics are close enough that the design's 46px gutters and 20px rows hold.
     pub const MONO: &str = "SF Mono";
     /// Prose: comment bodies, findings, dialogs.
     pub const SANS: &str = ".SystemUIFont";

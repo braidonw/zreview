@@ -65,16 +65,22 @@ impl ReviewRunState {
     }
 }
 
-const PANEL_BACKGROUND: u32 = 0x0b1220;
-const BORDER: u32 = 0x1e293b;
-const TEXT: u32 = 0xf8fafc;
-const MUTED: u32 = 0x94a3b8;
+use crate::theme;
 
+const PANEL_BACKGROUND: u32 = theme::surface::BASE;
+const BORDER: u32 = theme::border::DEFAULT;
+const TEXT: u32 = theme::text::PRIMARY;
+const MUTED: u32 = theme::text::SECONDARY;
+
+/// The text value of each severity, which clears 4.5:1 on the panel background.
+///
+/// The design pairs every severity with a dim fill and a text value; a panel row
+/// is unfilled, so it takes the text value.
 const fn severity_colour(severity: Severity) -> u32 {
     match severity {
-        Severity::Error => 0xf87171,
-        Severity::Warning => 0xfbbf24,
-        Severity::Info => 0x60a5fa,
+        Severity::Error => theme::severity::ERROR_TEXT,
+        Severity::Warning => theme::severity::WARNING_TEXT,
+        Severity::Info => theme::severity::INFO_TEXT,
     }
 }
 
@@ -176,11 +182,15 @@ fn render_guidance(session: &ReviewSession, expanded: bool, view: &Entity<Review
                         .py_1()
                         .flex()
                         .flex_col()
-                        .child(div().text_color(rgb(0x64748b)).child(skip.path.to_string()))
+                        .child(
+                            div()
+                                .text_color(rgb(theme::text::TERTIARY))
+                                .child(skip.path.to_string()),
+                        )
                         .child(
                             div()
                                 .text_xs()
-                                .text_color(rgb(0x64748b))
+                                .text_color(rgb(theme::text::TERTIARY))
                                 .child(skip.reason.to_string()),
                         )
                 }))
@@ -190,7 +200,7 @@ fn render_guidance(session: &ReviewSession, expanded: bool, view: &Entity<Review
                             .px_3()
                             .py_1()
                             .text_xs()
-                            .text_color(rgb(0xfbbf24))
+                            .text_color(rgb(theme::severity::WARNING))
                             .child(format!(
                                 "{excluded} file{} excluded from review by .zreview.toml",
                                 if excluded == 1 { "" } else { "s" }
@@ -233,7 +243,7 @@ fn render_guidance_entry(
                 .rounded_sm()
                 .border_1()
                 .border_color(rgb(if included { 0x4ade80 } else { 0x475569 }))
-                .when(included, |box_| box_.bg(rgb(0x4ade80))),
+                .when(included, |box_| box_.bg(rgb(theme::severity::SUCCESS))),
         )
         .child(
             div()
@@ -345,7 +355,7 @@ fn render_run_button(run: &ReviewRunState, view: &Entity<ReviewView>) -> AnyElem
         .rounded_md()
         .bg(rgb(colour))
         .text_xs()
-        .text_color(rgb(0xffffff))
+        .text_color(rgb(theme::text::ON_ACCENT))
         .cursor_pointer()
         .on_mouse_down(MouseButton::Left, move |_, _window, cx| {
             cx.stop_propagation();
@@ -386,7 +396,7 @@ fn render_finding(finding: &Finding, is_selected: bool, view: &Entity<ReviewView
         .gap_1()
         .border_b_1()
         .border_color(rgb(BORDER))
-        .when(is_selected, |row| row.bg(rgb(0x172554)))
+        .when(is_selected, |row| row.bg(rgb(theme::diff::hunk::BG)))
         .cursor_pointer()
         .on_mouse_down(MouseButton::Left, {
             let view = view.clone();
@@ -433,7 +443,7 @@ fn render_finding(finding: &Finding, is_selected: bool, view: &Entity<ReviewView
             row.child(
                 div()
                     .text_xs()
-                    .text_color(rgb(0x64748b))
+                    .text_color(rgb(theme::text::TERTIARY))
                     .child(format!("per {}", citations.join(", "))),
             )
         })
@@ -477,7 +487,7 @@ fn action_button(
         .rounded_md()
         .bg(rgb(colour))
         .text_xs()
-        .text_color(rgb(0xffffff))
+        .text_color(rgb(theme::text::ON_ACCENT))
         .cursor_pointer()
         .on_mouse_down(MouseButton::Left, move |_, window, cx| {
             cx.stop_propagation();
@@ -573,7 +583,7 @@ fn render_footer(session: &ReviewSession, run: &ReviewRunState) -> Option<Div> {
             .when(!unreviewed.is_empty(), |footer| {
                 footer.child(
                     div()
-                        .text_color(rgb(0xfbbf24))
+                        .text_color(rgb(theme::severity::WARNING))
                         .child(format!("{} file(s) not reviewed", unreviewed.len())),
                 )
             }),
