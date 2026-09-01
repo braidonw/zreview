@@ -6,12 +6,9 @@
 //! foreground task wakes on a timer to publish the stage it reports and, once it
 //! finishes, the session itself.
 
-use std::{
-    sync::{Arc, Mutex, PoisonError},
-    time::Duration,
-};
+use std::{sync::Arc, time::Duration};
 
-use domain::{LoadStage, LoadedSession, SessionFailure};
+use app::Handoff;
 use gpui::{App, WindowHandle};
 use session::{ReviewStorage, SessionRequest};
 use ui::SessionView;
@@ -22,17 +19,6 @@ use ui::SessionView;
 /// next to the subprocesses being waited on.
 const POLL_INTERVAL: Duration = Duration::from_millis(100);
 
-/// What the background load hands to the foreground task.
-///
-/// A lock rather than a channel keeps this to the standard library: the
-/// foreground side only ever needs the *latest* stage, so there is nothing to
-/// queue.
-#[derive(Default)]
-struct Handoff {
-    stage: LoadStage,
-    result: Option<Result<LoadedSession, SessionFailure>>,
-}
-
 /// Loads `request` in the background and publishes the outcome into `window`.
 pub fn spawn(
     window: WindowHandle<SessionView>,
@@ -40,16 +26,14 @@ pub fn spawn(
     drafts: ReviewStorage,
     cx: &mut App,
 ) {
-    let handoff = Arc::new(Mutex::new(Handoff::default()));
+    let handoff = Handoff::new();
 
     cx.background_executor()
         .spawn({
             let handoff = Arc::clone(&handoff);
             async move {
-                let result = session::load(&request, &drafts, &|stage| {
-                    lock(&handoff).stage = stage;
-                });
-                lock(&handoff).result = Some(result);
+                let result = session::load(&request, &drafts, &|stage| handoff.publish(stage));
+                handoff.finish(result);
             }
         })
         .detach();
@@ -58,17 +42,17 @@ pub fn spawn(
         loop {
             cx.background_executor().timer(POLL_INTERVAL).await;
 
-            let (stage, result) = {
-                let mut handoff = lock(&handoff);
-                (handoff.stage, handoff.result.take())
-            };
+            let (stage, result) = handoff.poll();
 
             let published = window.update(cx, |view, window, cx| {
                 if let Some(result) = result {
                     view.finish(result, window, cx);
                     true
                 } else {
-                    view.set_stage(stage.label(), cx);
+                    // Only what the loader has actually reported, so the stage the view already shows is left alone between reports.
+                    if let Some(stage) = stage {
+                        view.set_stage(stage.label(), cx);
+                    }
                     false
                 }
             });
@@ -83,19 +67,11 @@ pub fn spawn(
     .detach();
 }
 
-/// Takes the lock, recovering from poisoning.
-///
-/// A panic while loading would poison the mutex; the guarded data is still
-/// consistent, and refusing to show the outcome would be a worse failure than
-/// the one that caused it.
-fn lock(handoff: &Mutex<Handoff>) -> std::sync::MutexGuard<'_, Handoff> {
-    handoff.lock().unwrap_or_else(PoisonError::into_inner)
-}
-
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
 
+    use app::lock;
     use gpui::TestAppContext;
     use ui::SessionView;
 
@@ -115,19 +91,20 @@ mod tests {
     fn a_successful_load_reaches_the_window(cx: &mut TestAppContext) {
         cx.update(ui::init);
         let window = cx.add_window(|_window, cx| SessionView::loading("the fixture", cx));
-        window
-            .update(cx, |view, _window, _cx| assert!(view.is_loading()))
+        let model = window
+            .update(cx, |view, _window, _cx| view.model())
             .unwrap();
+        assert!(lock(&model).is_loading());
 
         cx.update(|cx| spawn(window, SessionRequest::Demo, ReviewStorage::Disabled, cx));
         settle(cx);
 
-        window
-            .update(cx, |view, _window, _cx| {
-                assert!(!view.is_loading(), "the session should have been published");
-                assert!(view.failure().is_none());
-            })
-            .unwrap();
+        let session = lock(&model);
+        assert!(
+            !session.is_loading(),
+            "the session should have been published"
+        );
+        assert!(session.failure().is_none());
     }
 
     /// A failure has to travel the same path as a success, or a broken load would
@@ -152,12 +129,12 @@ mod tests {
         });
         settle(cx);
 
-        window
-            .update(cx, |view, _window, _cx| {
-                assert!(!view.is_loading());
-                let failure = view.failure().expect("the failure should be shown");
-                assert!(!failure.summary.is_empty());
-            })
+        let model = window
+            .update(cx, |view, _window, _cx| view.model())
             .unwrap();
+        let session = lock(&model);
+        assert!(!session.is_loading());
+        let failure = session.failure().expect("the failure should be shown");
+        assert!(!failure.summary.is_empty());
     }
 }

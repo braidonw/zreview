@@ -4,16 +4,17 @@ mod findings;
 mod text;
 pub mod theme;
 
-pub use findings::ReviewRunState;
 pub use text::TextBuffer;
 
-use std::sync::{Arc, atomic::AtomicBool};
+use std::sync::{Arc, Mutex};
 
+use app::{
+    FindingDisposition, PendingSend, ReviewModel, SessionModel, SessionPhase, SubmissionState, lock,
+};
 use domain::{
     ChangeCounts, CommentThread, DiffAnchor, DiffFile, DiffLine, DiffLineKind, DraftComment,
-    Drafts, ExcludedDraft, FileStatus, FindingAcceptance, FindingId, FindingProvenance, Findings,
-    LoadStage, LoadedSession, PlacedComments, ReviewEvent, ReviewSession, ReviewStateSink,
-    ReviewSubmission, ReviewSubmitter, SessionFailure, SessionSource, SubmissionOutcome,
+    Drafts, ExcludedDraft, FileStatus, FindingId, LoadedSession, PlacedComments, ReviewEvent,
+    ReviewSession, ReviewSubmission, SessionFailure, SessionSource,
 };
 use gpui::{
     App, ClipboardItem, Context, ElementInputHandler, Entity, EntityInputHandler, EventEmitter,
@@ -72,8 +73,18 @@ fn short_sha(value: &str) -> &str {
     value.get(..7).unwrap_or(value)
 }
 
+/// The review a loaded session is showing.
+///
+/// A [`ReviewView`] is built when the session becomes ready and dropped if it ever
+/// stops being ready, so the phase cannot have moved on underneath one.
+fn loaded_review(model: &SessionModel) -> &ReviewModel {
+    model
+        .review()
+        .expect("a review view outlives its session's ready phase")
+}
+
 /// `CommentEditor` renders inside `DiffView`, so a bare `DiffView` predicate also
-/// matches while the composer is focused — which would make `j`, `k`, and `c`
+/// matches while the composer is focused. That would make `j`, `k`, and `c`
 /// impossible to type into a review comment. Negating the composer's context
 /// excludes it, because GPUI evaluates `!` against the whole focus path.
 const DIFF_CONTEXT: &str = "DiffView && !CommentEditor";
@@ -127,7 +138,7 @@ pub fn init(cx: &mut App) {
 ///
 /// Carried as an event rather than polled so a draft is stored as it is typed,
 /// which is what makes the text survive a crash.
-pub struct CommentEdited;
+pub(crate) struct CommentEdited;
 
 /// A multi-line text field for writing a review comment.
 ///
@@ -514,7 +525,7 @@ impl Render for CommentEditor {
                 vec![
                     div()
                         .text_color(rgb(theme::text::TERTIARY))
-                        .child("Write a review comment…"),
+                        .child("Write a review comment..."),
                 ]
             } else {
                 lines
@@ -536,24 +547,24 @@ struct DiffRow<'a> {
     in_selection: bool,
 }
 
-/// What the diff view asks the session to do about drafts.
+/// What the diff view asks the model to do about drafts.
 ///
 /// The diff view renders a read-only snapshot and never mutates the session
-/// directly, so the session stays the single owner of draft state.
-pub enum DiffViewEvent {
+/// directly, so the model stays the single owner of draft state.
+pub(crate) enum DiffViewEvent {
     /// The composer's text changed. `rows` is the span it covers, which is one row
     /// for an ordinary comment.
-    DraftEdited {
+    Edited {
         rows: std::ops::RangeInclusive<usize>,
         body: String,
     },
     /// The reviewer discarded a row's draft.
-    DraftDiscarded { row: usize },
+    Discarded { row: usize },
     /// A stale draft should move onto a row in the current diff.
-    DraftReanchored { stale: DiffAnchor, row: usize },
+    Reanchored { stale: DiffAnchor, row: usize },
 }
 
-pub struct DiffView {
+pub(crate) struct DiffView {
     file: Arc<DiffFile>,
     /// Index of `file` in the session, which is how threads and drafts are keyed.
     file_index: usize,
@@ -594,7 +605,7 @@ impl DiffView {
                 return;
             };
             let body = editor.read(cx).content().to_owned();
-            cx.emit(DiffViewEvent::DraftEdited { rows, body });
+            cx.emit(DiffViewEvent::Edited { rows, body });
         });
 
         Self {
@@ -616,11 +627,6 @@ impl DiffView {
     pub fn set_drafts(&mut self, drafts: Arc<Drafts>, cx: &mut Context<Self>) {
         self.drafts = drafts;
         cx.notify();
-    }
-
-    #[must_use]
-    pub const fn selected_line(&self) -> usize {
-        self.selected_line
     }
 
     /// Switches to another file.
@@ -747,7 +753,7 @@ impl DiffView {
     /// Opens the composer over a span, showing the draft already there if any.
     ///
     /// A range's draft lives at its last row, which is also where a single-line
-    /// draft on that row would live — so extending a selection over an existing
+    /// draft on that row would live. Extending a selection over an existing
     /// comment edits it rather than starting a rival.
     fn open_composer(
         &mut self,
@@ -773,7 +779,7 @@ impl DiffView {
         self.comment_rows = None;
         self.comment_editor.update(cx, CommentEditor::clear);
         window.focus(&self.focus_handle);
-        cx.emit(DiffViewEvent::DraftDiscarded { row });
+        cx.emit(DiffViewEvent::Discarded { row });
         cx.notify();
     }
 
@@ -837,7 +843,7 @@ impl DiffView {
                             .when(comment.is_multiline(), |header| {
                                 header.child(div().text_color(rgb(theme::text::TERTIARY)).child(
                                     format!(
-                                        "lines {}–{}",
+                                        "lines {}-{}",
                                         comment.start_line.unwrap_or_default(),
                                         comment.line.unwrap_or_default(),
                                     ),
@@ -913,7 +919,7 @@ impl DiffView {
         // The accent rail: two pixels down the left of any row a comment is
         // attached to, or that the composer is about to attach one to. Without it,
         // the only cue that a line carries a comment is a background tint that is
-        // easy to miss and invisible once the thread scrolls past — the reviewer
+        // easy to miss and invisible once the thread scrolls past. The reviewer
         // could not see where a comment would land. It sits inside the gutter so
         // the content column never shifts sideways when a comment appears.
         let rail = if selected || show_comment || in_selection {
@@ -1196,7 +1202,7 @@ impl Render for DiffView {
         let drafts = Arc::clone(&self.drafts);
         let draft_count = self.drafts.for_path(&self.file.path).count();
         // Stale drafts have no row, so the panel is the only place their text can
-        // appear — and the only place the reviewer can act on it.
+        // appear. It is also the only place the reviewer can act on it.
         let stale_drafts = self
             .drafts
             .stale()
@@ -1220,7 +1226,7 @@ impl Render for DiffView {
         // Tracks the selection rather than being pinned to the first hunk, so it
         // says where the reviewer actually is.
         let current_hunk = file.hunk_at(selected_line).map_or_else(
-            || SharedString::from("—"),
+            || SharedString::from("-"),
             |hunk| SharedString::from(hunk.header.to_string()),
         );
         let hunk_count = file.hunks.len();
@@ -1473,7 +1479,7 @@ impl Render for DiffView {
                                                             let stale = stale.clone();
                                                             move_view.update(cx, |this, cx| {
                                                                 cx.emit(
-                                                                    DiffViewEvent::DraftReanchored {
+                                                                    DiffViewEvent::Reanchored {
                                                                         stale,
                                                                         row: this.selected_line,
                                                                     },
@@ -1505,50 +1511,27 @@ impl Render for DiffView {
 
 /// What the review view asks its owner to do.
 ///
-/// Persistence and submission both live outside this view, so it reports rather
-/// than acts — which is also what keeps `crates/ui` free of a database and a
-/// forge.
-pub enum ReviewViewEvent {
-    /// A draft was written or removed at an anchor.
-    DraftChanged {
-        anchor: DiffAnchor,
-        /// `None` when the draft was removed.
-        draft: Option<DraftComment>,
-    },
-    /// The review summary changed.
-    SummaryChanged { body: String },
-    /// The reviewer asked to submit. Nothing is posted until they confirm.
-    SubmitRequested { event: ReviewEvent },
+/// Running a review needs a backend and a handle to the window, neither of which
+/// this view has, so it reports rather than acts.
+pub(crate) enum ReviewViewEvent {
     /// The reviewer asked for an automated review. Whoever owns the backend runs
     /// it; this view only knows it was asked for.
     ReviewRequested,
-    /// A finding became a draft, and its provenance needs persisting alongside it.
-    FindingAccepted {
-        anchor: DiffAnchor,
-        body: String,
-        provenance: FindingProvenance,
-    },
-    /// A claim was rejected, and the decision needs remembering.
-    FindingDismissed { fingerprint: String },
 }
 
-pub struct ReviewView {
-    session: ReviewSession,
+/// The review a reviewer is working through: files on the left, diff in the
+/// middle, findings on the right.
+///
+/// Every piece of state it draws lives in the shared [`SessionModel`]; this view
+/// dispatches keys and mouse into it and renders what comes back.
+pub(crate) struct ReviewView {
+    model: Arc<Mutex<SessionModel>>,
     diff_view: Entity<DiffView>,
     summary_editor: Entity<CommentEditor>,
     file_list_state: ListState,
-    /// How far the current review run has got.
-    run: ReviewRunState,
-    /// Which finding the reviewer is looking at.
-    selected_finding: Option<FindingId>,
-    /// Whether the guidance section is open.
-    ///
-    /// Open before the first run, because PLAN wants what will be sent seen before
-    /// it is sent; collapsed afterwards, when the findings are what matters.
-    guidance_expanded: bool,
-    /// Held so draft edits keep reaching the session.
+    /// Held so draft edits keep reaching the model.
     _diff_subscription: Subscription,
-    /// Held so summary edits keep reaching the session.
+    /// Held so summary edits keep reaching the model.
     _summary_subscription: Subscription,
 }
 
@@ -1556,163 +1539,83 @@ impl EventEmitter<ReviewViewEvent> for ReviewView {}
 
 impl ReviewView {
     #[must_use]
-    pub fn new(session: ReviewSession, window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let selected_file = Arc::new(session.selected_file().clone());
-        let selected_index = session.selected_file_index();
-        let comments = session.shared_comments();
-        let drafts = session.shared_drafts();
-        let file_count = session.files().len();
-        let diff_view =
-            cx.new(|cx| DiffView::new(selected_file, selected_index, comments, drafts, window, cx));
+    pub fn new(
+        model: Arc<Mutex<SessionModel>>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let (file, file_index, comments, drafts, file_count, summary) = {
+            let guard = lock(&model);
+            let session = loaded_review(&guard).session();
+            (
+                Arc::new(session.selected_file().clone()),
+                session.selected_file_index(),
+                session.shared_comments(),
+                session.shared_drafts(),
+                session.files().len(),
+                session.summary().to_owned(),
+            )
+        };
+        let diff_view = cx.new(|cx| DiffView::new(file, file_index, comments, drafts, window, cx));
         let diff_subscription = cx.subscribe(&diff_view, Self::on_diff_event);
 
         // The summary reuses the composer, so it inherits the same
         // keybinding isolation the inline editor needed.
-        let existing_summary = session.summary().to_owned();
-        let summary_editor = cx.new(|cx| CommentEditor::with_content(existing_summary, cx));
+        let summary_editor = cx.new(|cx| CommentEditor::with_content(summary, cx));
         let summary_subscription =
             cx.subscribe(&summary_editor, |this, editor, _: &CommentEdited, cx| {
                 let body = editor.read(cx).content().to_owned();
-                this.session.set_summary(body.clone());
-                cx.emit(ReviewViewEvent::SummaryChanged { body });
+                lock(&this.model).summary_edited(body);
                 cx.notify();
             });
 
         Self {
-            session,
+            model,
             diff_view,
             summary_editor,
             file_list_state: ListState::new(file_count, ListAlignment::Top, px(36.0)),
-            run: ReviewRunState::default(),
-            selected_finding: None,
-            guidance_expanded: true,
             _diff_subscription: diff_subscription,
             _summary_subscription: summary_subscription,
         }
     }
 
-    /// Records that a review run has started, with the flag that stops it.
-    pub fn review_started(&mut self, cancel: Arc<AtomicBool>, cx: &mut Context<Self>) {
-        self.run = ReviewRunState::Running {
-            detail: SharedString::from("Starting…"),
-            cancel,
-        };
-        cx.notify();
-    }
-
-    /// Publishes the backend's latest progress line.
-    ///
-    /// Ignored unless a run is in flight, so a late report cannot make a finished
-    /// review look like it is still going.
-    pub fn review_progress(&mut self, line: impl Into<SharedString>, cx: &mut Context<Self>) {
-        if let ReviewRunState::Running { detail, .. } = &mut self.run {
-            let line = line.into();
-            if *detail != line {
-                *detail = line;
-                cx.notify();
-            }
-        }
-    }
-
-    /// Takes the findings a completed run produced.
-    ///
-    /// `unreviewed` names files the run did not see — excluded, or too large to fit
-    /// in the material. They are carried into the panel so a partial review cannot
-    /// present itself as a complete one.
-    pub fn review_finished(
-        &mut self,
-        findings: Findings,
-        unreviewed: Vec<String>,
-        cx: &mut Context<Self>,
-    ) {
-        let rejected = findings.rejected().len();
-        let suppressed = self.session.set_findings(findings);
-        let accepted = self.session.findings().len();
-        self.selected_finding = self.session.findings().accepted().first().map(|f| f.id);
-        self.run = ReviewRunState::Complete {
-            accepted,
-            rejected,
-            suppressed,
-            unreviewed: unreviewed.into_iter().map(SharedString::from).collect(),
-        };
-        // The disclosure has served its purpose; the findings are what the reviewer
-        // wants the space for now. The summary line stays visible either way.
-        self.guidance_expanded = false;
-        cx.notify();
-    }
-
-    /// Reports a run that produced nothing, with what to do about it.
-    pub fn review_failed(
-        &mut self,
-        summary: impl Into<SharedString>,
-        remediation: Option<String>,
-        cx: &mut Context<Self>,
-    ) {
-        self.run = ReviewRunState::Failed {
-            summary: summary.into(),
-            remediation: remediation.map(SharedString::from),
-        };
-        cx.notify();
-    }
-
     /// Opens or closes the guidance section.
     pub fn toggle_guidance_panel(&mut self, cx: &mut Context<Self>) {
-        self.guidance_expanded = !self.guidance_expanded;
+        lock(&self.model).toggle_guidance_panel();
         cx.notify();
-    }
-
-    #[must_use]
-    pub const fn guidance_expanded(&self) -> bool {
-        self.guidance_expanded
     }
 
     /// Turns one guidance file on or off for the next run.
-    ///
-    /// Not persisted: it is a decision about this sitting, and a choice that
-    /// silently outlived the session would be a worse surprise than re-making it.
     pub fn toggle_guidance(&mut self, path: &str, cx: &mut Context<Self>) {
-        if self.session.toggle_guidance(path).is_some() {
+        let toggled = lock(&self.model).toggle_guidance(path);
+        if toggled {
             cx.notify();
         }
     }
 
     /// Asks the running review to stop.
     pub fn cancel_review(&mut self, cx: &mut Context<Self>) {
-        self.run.cancel();
+        lock(&self.model).cancel_review();
         cx.notify();
-    }
-
-    #[must_use]
-    pub const fn review_run(&self) -> &ReviewRunState {
-        &self.run
-    }
-
-    #[must_use]
-    pub const fn selected_finding(&self) -> Option<FindingId> {
-        self.selected_finding
     }
 
     /// Scrolls the diff to a finding's line and selects it in the panel.
     pub fn reveal_finding(&mut self, id: FindingId, window: &mut Window, cx: &mut Context<Self>) {
-        self.selected_finding = Some(id);
-        let Some(location) = self
-            .session
-            .findings()
-            .get(id)
-            .and_then(|finding| finding.location)
-        else {
-            // A finding about the whole change has nowhere to scroll to.
-            cx.notify();
-            return;
-        };
-        self.select_file_at(location.file, cx);
-        self.diff_view
-            .update(cx, |view, cx| view.reveal_row(location.row, window, cx));
+        let location = lock(&self.model).reveal_finding(id);
+        // A finding about the whole change has nowhere to scroll to.
+        if let Some(location) = location {
+            self.show_file(location.file, cx);
+            self.diff_view
+                .update(cx, |view, cx| view.reveal_row(location.row, window, cx));
+        }
         cx.notify();
     }
 
     fn run_review(&mut self, _: &RunReview, _: &mut Window, cx: &mut Context<Self>) {
-        if self.run.is_running() {
+        let running = lock(&self.model)
+            .review()
+            .is_some_and(|review| review.run().is_running());
+        if running {
             return;
         }
         cx.emit(ReviewViewEvent::ReviewRequested);
@@ -1724,21 +1627,9 @@ impl ReviewView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let findings = self.session.findings();
-        if findings.is_empty() {
-            return;
-        }
-        let next = self
-            .selected_finding
-            .and_then(|current| {
-                let position = findings
-                    .accepted()
-                    .iter()
-                    .position(|finding| finding.id == current)?;
-                findings.accepted().get(position + 1)
-            })
-            .or_else(|| findings.accepted().first())
-            .map(|finding| finding.id);
+        let next = lock(&self.model)
+            .review()
+            .and_then(ReviewModel::next_finding);
         if let Some(next) = next {
             self.reveal_finding(next, window, cx);
         }
@@ -1750,7 +1641,10 @@ impl ReviewView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if let Some(id) = self.selected_finding {
+        let selected = lock(&self.model)
+            .review()
+            .and_then(ReviewModel::selected_finding);
+        if let Some(id) = selected {
             self.accept_finding_by_id(id, window, cx);
         }
     }
@@ -1761,7 +1655,10 @@ impl ReviewView {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if let Some(id) = self.selected_finding {
+        let selected = lock(&self.model)
+            .review()
+            .and_then(ReviewModel::selected_finding);
+        if let Some(id) = selected {
             self.dismiss_finding_by_id(id, cx);
         }
     }
@@ -1774,188 +1671,100 @@ impl ReviewView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        match self.session.accept_finding(id) {
-            FindingAcceptance::Drafted { anchor, body } => {
-                let provenance = self
-                    .session
-                    .drafts()
-                    .get(&anchor)
-                    .and_then(|draft| draft.provenance.clone());
-                self.after_findings_changed(cx);
-                if let Some(provenance) = provenance {
-                    cx.emit(ReviewViewEvent::FindingAccepted {
-                        anchor,
-                        body,
-                        provenance,
-                    });
-                }
+        // Bound before the match so the model is not still locked when the
+        // handling of a disposition reaches back into it.
+        let disposition = lock(&self.model).accept_finding(id);
+        match disposition {
+            FindingDisposition::Drafted => {
+                self.publish_drafts(cx);
+                cx.notify();
             }
-            FindingAcceptance::Occupied {
-                location,
-                existing,
-                proposed,
-                ..
-            } => {
-                // The reviewer already wrote something here. Both texts go into the
-                // composer and they decide; nothing is saved until they do.
-                self.selected_finding = Some(id);
-                self.select_file_at(location.file, cx);
-                let merged = format!("{}\n\n{proposed}", existing.trim_end());
+            FindingDisposition::Composer { location, seed } => {
+                self.show_file(location.file, cx);
                 self.diff_view.update(cx, |view, cx| {
-                    view.open_composer_with(location.row, merged, window, cx);
+                    view.open_composer_with(location.row, seed, window, cx);
                 });
                 cx.notify();
             }
-            FindingAcceptance::NotInline { proposed } => {
-                // Nowhere to anchor it, so it belongs in the review summary — which
-                // the reviewer can still edit or delete before submitting.
-                let existing = self.session.summary().trim_end().to_owned();
-                let merged = if existing.is_empty() {
-                    proposed
-                } else {
-                    format!("{existing}\n\n{proposed}")
-                };
-                self.session.set_summary(merged.clone());
+            FindingDisposition::Summary { body } => {
                 self.summary_editor
-                    .update(cx, |editor, cx| editor.load(merged.clone(), cx));
-                self.session.retire_finding(id);
-                self.after_findings_changed(cx);
-                cx.emit(ReviewViewEvent::SummaryChanged { body: merged });
+                    .update(cx, |editor, cx| editor.load(body, cx));
+                self.publish_drafts(cx);
+                cx.notify();
             }
-            FindingAcceptance::Unknown => {}
+            FindingDisposition::Unknown => {}
         }
     }
 
     pub fn dismiss_finding_by_id(&mut self, id: FindingId, cx: &mut Context<Self>) {
-        if let Some(fingerprint) = self.session.dismiss_finding(id) {
-            self.after_findings_changed(cx);
-            cx.emit(ReviewViewEvent::FindingDismissed { fingerprint });
+        let dismissed = lock(&self.model).dismiss_finding(id);
+        if dismissed {
+            self.publish_drafts(cx);
+            cx.notify();
         }
     }
 
-    /// Republishes drafts for rendering and moves the selection off a finding that
-    /// has been acted on.
-    fn after_findings_changed(&mut self, cx: &mut Context<Self>) {
-        let drafts = self.session.shared_drafts();
-        self.diff_view
-            .update(cx, |view, cx| view.set_drafts(drafts, cx));
-        self.selected_finding = self
-            .session
-            .findings()
-            .accepted()
-            .first()
-            .map(|finding| finding.id);
-        cx.notify();
+    /// Hands the diff the drafts it should now be drawing.
+    fn publish_drafts(&mut self, cx: &mut Context<Self>) {
+        let drafts = lock(&self.model)
+            .review()
+            .map(|review| review.session().shared_drafts());
+        if let Some(drafts) = drafts {
+            self.diff_view
+                .update(cx, |view, cx| view.set_drafts(drafts, cx));
+        }
     }
 
-    /// Forgets what a forge accepted, and reports the anchors it consumed.
-    pub fn mark_submitted(
-        &mut self,
-        submission: &ReviewSubmission,
-        cx: &mut Context<Self>,
-    ) -> Vec<DiffAnchor> {
-        let anchors = submission.submitted_anchors();
-        self.session.mark_submitted(submission);
+    /// Clears what a forge has accepted out of the composer and the diff.
+    fn submission_cleared(&mut self, cx: &mut Context<Self>) {
         self.summary_editor
             .update(cx, |editor, cx| editor.load(String::new(), cx));
-        let drafts = self.session.shared_drafts();
-        self.diff_view
-            .update(cx, |view, cx| view.set_drafts(drafts, cx));
+        self.publish_drafts(cx);
         cx.notify();
-        anchors
     }
 
-    /// Applies a draft change to the session, then republishes it for rendering
-    /// and for persistence.
+    /// Applies a draft change to the model, then republishes it for rendering.
     fn on_diff_event(
         &mut self,
         _diff_view: Entity<DiffView>,
         event: &DiffViewEvent,
         cx: &mut Context<Self>,
     ) {
-        let file = self.session.selected_file_index();
-
-        // Moving a draft touches two positions, so it reports both: the old one is
-        // now empty and the new one holds the text. Persistence needs both or the
-        // draft would come back twice.
-        if let DiffViewEvent::DraftReanchored { stale, row } = event {
-            if let Some(moved) = self.session.reanchor_draft(stale, file, *row) {
-                let drafts = self.session.shared_drafts();
-                let draft = drafts.get(&moved.anchored).cloned();
-                self.diff_view
-                    .update(cx, |view, cx| view.set_drafts(drafts, cx));
-                cx.emit(ReviewViewEvent::DraftChanged {
-                    draft: None,
-                    anchor: moved.vacated,
-                });
-                cx.emit(ReviewViewEvent::DraftChanged {
-                    draft,
-                    anchor: moved.anchored,
-                });
-                cx.notify();
+        let changed = {
+            let mut model = lock(&self.model);
+            match event {
+                DiffViewEvent::Edited { rows, body } => {
+                    model.draft_edited(rows.clone(), body.clone())
+                }
+                DiffViewEvent::Discarded { row } => model.draft_discarded(*row),
+                DiffViewEvent::Reanchored { stale, row } => model.draft_reanchored(stale, *row),
             }
-            return;
-        }
-
-        let rows = match event {
-            DiffViewEvent::DraftEdited { rows, .. } => rows.clone(),
-            DiffViewEvent::DraftDiscarded { row } => *row..=*row,
-            DiffViewEvent::DraftReanchored { .. } => return,
         };
-        // The anchor is read before the change so a discarded draft still reports
-        // which position it was removed from. It covers the whole span, so a range
-        // is persisted and cleared as one comment.
-        let Some(anchor) = self.session.anchor_for_span(file, rows.clone()) else {
-            return;
-        };
-
-        match event {
-            DiffViewEvent::DraftEdited { body, .. } => {
-                self.session.set_draft_over(file, rows, body.clone());
-            }
-            DiffViewEvent::DraftDiscarded { .. } | DiffViewEvent::DraftReanchored { .. } => {
-                self.session.clear_draft(file, *rows.end());
-            }
+        if changed {
+            self.publish_drafts(cx);
+            cx.notify();
         }
-
-        let drafts = self.session.shared_drafts();
-        let draft = drafts.get(&anchor).cloned();
-        self.diff_view
-            .update(cx, |view, cx| view.set_drafts(drafts, cx));
-        cx.emit(ReviewViewEvent::DraftChanged { draft, anchor });
-        cx.notify();
-    }
-
-    #[must_use]
-    pub const fn session(&self) -> &ReviewSession {
-        &self.session
-    }
-
-    #[must_use]
-    pub const fn selected_file_index(&self) -> usize {
-        self.session.selected_file_index()
     }
 
     /// Switches the displayed file without moving focus.
     ///
     /// Focus belongs where the reviewer put it: clicking a finding in the panel
     /// should not yank the keyboard into the diff.
-    fn select_file_at(&mut self, index: usize, cx: &mut Context<Self>) {
-        if self.session.select_file(index) {
-            let file = Arc::new(self.session.selected_file().clone());
-            self.diff_view
-                .update(cx, |view, cx| view.set_file(file, index, cx));
-            self.file_list_state.scroll_to_reveal_item(index);
-        }
+    fn show_file(&mut self, index: usize, cx: &mut Context<Self>) {
+        let file = {
+            let mut model = lock(&self.model);
+            if !model.select_file(index) {
+                return;
+            }
+            Arc::new(loaded_review(&model).session().selected_file().clone())
+        };
+        self.diff_view
+            .update(cx, |view, cx| view.set_file(file, index, cx));
+        self.file_list_state.scroll_to_reveal_item(index);
     }
 
     fn select_file(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
-        if self.session.select_file(index) {
-            let file = Arc::new(self.session.selected_file().clone());
-            self.diff_view
-                .update(cx, |view, cx| view.set_file(file, index, cx));
-            self.file_list_state.scroll_to_reveal_item(index);
-        }
+        self.show_file(index, cx);
         let focus_handle = self.diff_view.read(cx).focus_handle.clone();
         window.focus(&focus_handle);
         cx.notify();
@@ -1967,11 +1776,14 @@ impl ReviewView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let next = self
-            .session
-            .selected_file_index()
-            .saturating_add(1)
-            .min(self.session.files().len().saturating_sub(1));
+        let next = {
+            let model = lock(&self.model);
+            let session = loaded_review(&model).session();
+            session
+                .selected_file_index()
+                .saturating_add(1)
+                .min(session.files().len().saturating_sub(1))
+        };
         self.select_file(next, window, cx);
     }
 
@@ -1981,15 +1793,18 @@ impl ReviewView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.select_file(
-            self.session.selected_file_index().saturating_sub(1),
-            window,
-            cx,
-        );
+        let previous = {
+            let model = lock(&self.model);
+            loaded_review(&model)
+                .session()
+                .selected_file_index()
+                .saturating_sub(1)
+        };
+        self.select_file(previous, window, cx);
     }
 
     fn toggle_viewed(&mut self, _: &ToggleViewed, _: &mut Window, cx: &mut Context<Self>) {
-        self.session.toggle_selected_viewed();
+        lock(&self.model).toggle_viewed();
         cx.notify();
     }
 
@@ -1997,11 +1812,11 @@ impl ReviewView {
     ///
     /// Each event is its own button rather than a menu, so choosing to approve is
     /// as deliberate as choosing to request changes.
-    fn render_submit_bar(&self, cx: &mut Context<Self>) -> gpui::Div {
-        let drafts = self.session.drafts();
+    fn render_submit_bar(&self, session: &ReviewSession, cx: &mut Context<Self>) -> gpui::Div {
+        let drafts = session.drafts();
         let stale = drafts.stale_count();
         let ready = drafts.len() - stale;
-        let can_submit = self.session.source().head_sha().is_some();
+        let can_submit = session.source().head_sha().is_some();
         let review_view = cx.entity();
 
         div()
@@ -2063,8 +1878,9 @@ impl ReviewView {
                             .cursor_pointer()
                             .on_mouse_down(MouseButton::Left, move |_, _window, cx| {
                                 cx.stop_propagation();
-                                view.update(cx, |_review, cx| {
-                                    cx.emit(ReviewViewEvent::SubmitRequested { event });
+                                view.update(cx, |review, cx| {
+                                    lock(&review.model).request_submission(event);
+                                    cx.notify();
                                 });
                             })
                             .child(event.label())
@@ -2074,8 +1890,8 @@ impl ReviewView {
     }
 
     /// The sidebar header: what is under review, and its overall counts.
-    fn render_source_header(&self) -> gpui::Div {
-        let (label, title) = match self.session.source() {
+    fn render_source_header(session: &ReviewSession) -> gpui::Div {
+        let (label, title) = match session.source() {
             SessionSource::Demo => (
                 SharedString::from("Generated fixture"),
                 SharedString::from("Diff virtualization demo"),
@@ -2084,8 +1900,8 @@ impl ReviewView {
                 base_sha, head_sha, ..
             } => (
                 SharedString::from("Local comparison"),
-                // `…` is the merge-base notation this comparison actually uses.
-                SharedString::from(format!("{}…{}", short_sha(base_sha), short_sha(head_sha))),
+                // `...` is the merge-base notation this comparison actually uses.
+                SharedString::from(format!("{}...{}", short_sha(base_sha), short_sha(head_sha))),
             ),
             SessionSource::GitHubPullRequest {
                 owner,
@@ -2098,9 +1914,9 @@ impl ReviewView {
                 SharedString::from(title.to_string()),
             ),
         };
-        let file_count = self.session.files().len();
-        let viewed_count = self.session.viewed_count();
-        let thread_count = self.session.comments().thread_count();
+        let file_count = session.files().len();
+        let viewed_count = session.viewed_count();
+        let thread_count = session.comments().thread_count();
 
         div()
             .flex_shrink_0()
@@ -2139,7 +1955,7 @@ impl ReviewView {
             // Conversations that would not load, or drafts that are not being
             // saved, must be visible: a session that quietly lacks either looks
             // exactly like one that has nothing to show.
-            .children(self.session.warnings().iter().map(|warning| {
+            .children(session.warnings().iter().map(|warning| {
                 div()
                     .text_xs()
                     .text_color(rgb(theme::severity::WARNING))
@@ -2257,16 +2073,31 @@ impl Focusable for ReviewView {
 
 impl Render for ReviewView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let files = self.session.shared_files();
-        let selected = self.session.selected_file_index();
-        let viewed = (0..files.len())
-            .map(|index| self.session.is_viewed(index))
-            .collect::<Vec<_>>();
-        let comments = self.session.shared_comments();
-        let header = self.render_source_header();
         let review_view = cx.entity();
         // Cloned before the file list takes ownership of its own copy.
         let panel_view = review_view.clone();
+        // Held across this render, so callees must not lock the model themselves.
+        let model = lock(&self.model);
+        let review = loaded_review(&model);
+        let session = review.session();
+        let files = session.shared_files();
+        let selected = session.selected_file_index();
+        let viewed = (0..files.len())
+            .map(|index| session.is_viewed(index))
+            .collect::<Vec<_>>();
+        let comments = session.shared_comments();
+        let header = Self::render_source_header(session);
+        let submit_bar = self.render_submit_bar(session, cx);
+        // Only takes space once there is something to say.
+        let panel = review.findings_panel_visible().then(|| {
+            findings::render(
+                session,
+                review.run(),
+                review.selected_finding(),
+                review.guidance_expanded(),
+                &panel_view,
+            )
+        });
 
         div()
             .id("review-session")
@@ -2313,90 +2144,60 @@ impl Render for ReviewView {
                     .flex()
                     .flex_col()
                     .child(div().flex_1().min_h_0().child(self.diff_view.clone()))
-                    .child(self.render_submit_bar(cx)),
+                    .child(submit_bar),
             )
-            // Only takes space once there is something to say.
-            .children(findings::is_visible(&self.session, &self.run).then(|| {
-                findings::render(
-                    &self.session,
-                    &self.run,
-                    self.selected_finding,
-                    self.guidance_expanded,
-                    &panel_view,
-                )
-            }))
+            .children(panel)
     }
-}
-
-/// The root view, and the session state machine PLAN section 9 calls for.
-///
-/// The window opens on this in [`SessionState::Loading`] before any Git or
-/// GitHub work starts, so a slow or failing load is something the reviewer
-/// watches rather than a terminal they may not be looking at.
-enum SessionState {
-    Loading {
-        /// What is being opened, known from the request alone.
-        description: SharedString,
-        /// The stage the loader last reported.
-        stage: SharedString,
-    },
-    Ready {
-        review: Entity<ReviewView>,
-        /// Held so draft changes keep reaching storage.
-        _drafts_subscription: Subscription,
-    },
-    Failed(SessionFailure),
-}
-
-/// How far a submission has got.
-///
-/// `Confirming` exists because nothing may be posted without an explicit human
-/// action. It holds the exact request that will be sent, so what the reviewer
-/// approves is what leaves the machine — not a re-derivation of it.
-enum SubmissionState {
-    Idle,
-    Confirming(Box<ReviewSubmission>),
-    Sending,
-    Sent(SubmissionOutcome),
-    Failed(SessionFailure),
 }
 
 /// How a review run is started.
 ///
-/// Installed by whoever owns a backend, after the window exists — a view cannot
+/// Installed by whoever owns a backend, after the window exists. A view cannot
 /// hold a handle to the window it lives in at construction time. Absent until then,
 /// and absent for good in a build with no backend, in which case asking for a review
 /// does nothing rather than failing.
-pub type ReviewLauncher = Box<dyn Fn(&Entity<ReviewView>, ReviewSession, &mut App)>;
+pub type ReviewLauncher = Box<dyn Fn(ReviewSession, &mut App)>;
 
+/// The root view: the loading screen, the failure screen, or the review.
+///
+/// The window opens on this before any Git or GitHub work starts, so a slow or
+/// failing load is something the reviewer watches rather than a terminal they may
+/// not be looking at.
 pub struct SessionView {
-    state: SessionState,
-    /// Where draft changes are written, once the session is ready.
-    review_sink: Option<Box<dyn ReviewStateSink>>,
-    /// Where a confirmed review is posted. Absent when the session is not a pull
-    /// request, in which case submitting is not offered at all.
-    submitter: Option<Arc<dyn ReviewSubmitter>>,
-    submission: SubmissionState,
+    model: Arc<Mutex<SessionModel>>,
+    /// The review, once the session is loaded.
+    review: Option<LoadedReview>,
     /// How to start a review, once something has said how.
     review_launcher: Option<ReviewLauncher>,
     focus_handle: FocusHandle,
 }
 
+/// The review view, and what keeps it talking to the session view.
+///
+/// Held together because they are only correct together: a subscription outliving
+/// the review it watches is dead weight, and a review with none is deaf.
+struct LoadedReview {
+    view: Entity<ReviewView>,
+    /// Held so the review's requests and its repaints keep arriving.
+    _subscriptions: [Subscription; 2],
+}
+
 impl SessionView {
     /// Opens on the loading screen for a request that has not started yet.
     #[must_use]
-    pub fn loading(description: impl Into<SharedString>, cx: &mut Context<Self>) -> Self {
+    pub fn loading(description: impl Into<String>, cx: &mut Context<Self>) -> Self {
         Self {
-            state: SessionState::Loading {
-                description: description.into(),
-                stage: SharedString::from(LoadStage::default().label()),
-            },
-            review_sink: None,
-            submitter: None,
-            submission: SubmissionState::Idle,
+            model: Arc::new(Mutex::new(SessionModel::loading(description))),
+            review: None,
             review_launcher: None,
             focus_handle: cx.focus_handle(),
         }
+    }
+
+    /// The state every view of this session shares.
+    #[must_use]
+    pub fn model(&self) -> Arc<Mutex<SessionModel>> {
+        Arc::clone(&self.model)
     }
 
     /// Says how to run a review. Without this, asking for one does nothing.
@@ -2405,16 +2206,9 @@ impl SessionView {
     }
 
     /// Records the stage the loader has reached.
-    ///
-    /// Ignored once the session has finished, so a late report cannot move a
-    /// ready or failed view back to loading.
-    pub fn set_stage(&mut self, label: impl Into<SharedString>, cx: &mut Context<Self>) {
-        if let SessionState::Loading { stage, .. } = &mut self.state {
-            let label = label.into();
-            if *stage != label {
-                *stage = label;
-                cx.notify();
-            }
+    pub fn set_stage(&mut self, label: impl Into<String>, cx: &mut Context<Self>) {
+        if lock(&self.model).set_stage(label) {
+            cx.notify();
         }
     }
 
@@ -2425,134 +2219,69 @@ impl SessionView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.state = match result {
-            Ok(loaded) => {
-                self.review_sink = loaded.review_sink;
-                self.submitter = loaded.submitter;
-                let review = cx.new(|cx| ReviewView::new(loaded.session, window, cx));
-                let subscription = cx.subscribe(&review, |this, review, event, cx| {
-                    this.on_review_event(&review, event, cx);
-                });
-                let focus_handle = review.read(cx).diff_view.read(cx).focus_handle.clone();
-                window.focus(&focus_handle);
-                SessionState::Ready {
-                    review,
-                    _drafts_subscription: subscription,
-                }
-            }
-            Err(failure) => {
-                window.focus(&self.focus_handle);
-                SessionState::Failed(failure)
-            }
-        };
+        let loaded = result.is_ok();
+        lock(&self.model).finish(result);
+        if loaded {
+            let view = cx.new(|cx| ReviewView::new(Arc::clone(&self.model), window, cx));
+            let subscriptions = [
+                cx.subscribe(&view, |this, _review, event, cx| {
+                    this.on_review_event(event, cx);
+                }),
+                // The banners above the review are drawn from state the review
+                // changes, so this view repaints whenever it does.
+                cx.observe(&view, |_, _, cx| cx.notify()),
+            ];
+            // Hand focus to the diff so its keybindings work immediately.
+            let focus_handle = view.read(cx).diff_view.read(cx).focus_handle.clone();
+            window.focus(&focus_handle);
+            self.review = Some(LoadedReview {
+                view,
+                _subscriptions: subscriptions,
+            });
+        } else {
+            window.focus(&self.focus_handle);
+            self.review = None;
+        }
         cx.notify();
     }
 
-    /// Writes a draft change through to storage.
-    ///
-    /// The sink is asked to save on every keystroke, which is what makes the text
-    /// survive a crash; it is required not to block, so this stays cheap.
-    fn on_review_event(
-        &mut self,
-        review: &Entity<ReviewView>,
-        event: &ReviewViewEvent,
-        cx: &mut Context<Self>,
-    ) {
+    /// Starts the review the panel asked for.
+    fn on_review_event(&mut self, event: &ReviewViewEvent, cx: &mut Context<Self>) {
         match event {
-            ReviewViewEvent::DraftChanged { anchor, draft } => {
-                if let Some(sink) = &self.review_sink {
-                    match draft {
-                        Some(draft) => sink.save(anchor, &draft.body),
-                        None => sink.discard(anchor),
-                    }
-                }
-            }
-            ReviewViewEvent::SummaryChanged { body } => {
-                if let Some(sink) = &self.review_sink
-                    && let Some(head_sha) = review.read(cx).session().source().head_sha()
-                {
-                    sink.save_summary(head_sha, body);
-                }
-            }
-            ReviewViewEvent::SubmitRequested { event } => self.begin_confirmation(*event, cx),
-            ReviewViewEvent::FindingAccepted {
-                anchor,
-                body,
-                provenance,
-            } => {
-                if let Some(sink) = &self.review_sink {
-                    // Text first, then where it came from: an attribution without
-                    // the comment it belongs to is worth nothing.
-                    sink.save(anchor, body);
-                    sink.save_provenance(anchor, provenance);
-                }
-            }
-            ReviewViewEvent::FindingDismissed { fingerprint } => {
-                if let Some(sink) = &self.review_sink
-                    && let Some(head_sha) = review.read(cx).session().source().head_sha()
-                {
-                    sink.dismiss_finding(head_sha, fingerprint);
-                }
-            }
             ReviewViewEvent::ReviewRequested => {
+                // Read out here rather than inside the launcher, which is handed
+                // the same model and would deadlock on a lock still held.
+                let Some(session) = lock(&self.model).review_request() else {
+                    return;
+                };
                 if let Some(launcher) = self.review_launcher.take() {
-                    let session = review.read(cx).session().clone();
-                    launcher(review, session, cx);
+                    launcher(session, cx);
                     self.review_launcher = Some(launcher);
                 }
+                // The panel has to show the run it just asked for.
+                cx.notify();
             }
         }
-        // Renders the alarm if writing has started failing.
-        cx.notify();
-    }
-
-    /// The loaded review, once there is one.
-    fn review(&self) -> Option<&Entity<ReviewView>> {
-        match &self.state {
-            SessionState::Ready { review, .. } => Some(review),
-            _ => None,
-        }
-    }
-
-    /// Assembles what submitting would post and shows it for approval.
-    ///
-    /// Deliberately stops here. PLAN requires that nothing is ever posted without
-    /// an explicit human submission action, so building the request and sending it
-    /// are two separate steps with a person in between.
-    fn begin_confirmation(&mut self, event: ReviewEvent, cx: &mut Context<Self>) {
-        let Some(review) = self.review().cloned() else {
-            return;
-        };
-        self.submission = match review.read(cx).session().prepare_submission(event) {
-            Ok(submission) => SubmissionState::Confirming(Box::new(submission)),
-            Err(refused) => SubmissionState::Failed(
-                SessionFailure::new("This review cannot be submitted yet")
-                    .with_remediation(refused.to_string()),
-            ),
-        };
-        cx.notify();
     }
 
     fn cancel_submission(&mut self, cx: &mut Context<Self>) {
-        self.submission = SubmissionState::Idle;
+        lock(&self.model).cancel_submission();
         cx.notify();
     }
 
     /// Posts the confirmed review.
     ///
     /// The request is sent on a background thread because it is network I/O, and
-    /// local drafts are forgotten only after the forge has accepted it — until
+    /// local drafts are forgotten only after the forge has accepted it. Until
     /// then the local copy is the only copy.
     fn send_confirmed(&mut self, cx: &mut Context<Self>) {
-        let (SubmissionState::Confirming(submission), Some(submitter), Some(review)) = (
-            &self.submission,
-            self.submitter.clone(),
-            self.review().cloned(),
-        ) else {
+        let Some(PendingSend {
+            submission,
+            submitter,
+        }) = lock(&self.model).begin_send()
+        else {
             return;
         };
-        let submission = submission.clone();
-        self.submission = SubmissionState::Sending;
         cx.notify();
 
         cx.spawn(async move |this, cx| {
@@ -2564,73 +2293,17 @@ impl SessionView {
             };
 
             this.update(cx, |this, cx| {
-                this.submission = match posted {
-                    Ok(outcome) => {
-                        // Only now is it safe to forget them.
-                        let anchors =
-                            review.update(cx, |review, cx| review.mark_submitted(&submission, cx));
-                        if let (Some(sink), Some(head_sha)) = (
-                            this.review_sink.as_ref(),
-                            review.read(cx).session().source().head_sha(),
-                        ) {
-                            sink.clear_submitted(head_sha, &anchors);
-                        }
-                        SubmissionState::Sent(outcome)
-                    }
-                    // Nothing local was touched, so every draft is still there.
-                    Err(failure) => SubmissionState::Failed(failure),
-                };
+                let accepted = posted.is_ok();
+                lock(&this.model).complete_send(&submission, posted);
+                // Only now is it safe for the view to forget them too.
+                if accepted && let Some(loaded) = &this.review {
+                    loaded.view.update(cx, ReviewView::submission_cleared);
+                }
                 cx.notify();
             })
             .ok();
         })
         .detach();
-    }
-
-    /// The review awaiting confirmation, if one is.
-    #[must_use]
-    pub fn confirming(&self) -> Option<&ReviewSubmission> {
-        match &self.submission {
-            SubmissionState::Confirming(submission) => Some(submission),
-            _ => None,
-        }
-    }
-
-    /// The outcome of a review the forge accepted.
-    #[must_use]
-    pub fn submitted(&self) -> Option<&SubmissionOutcome> {
-        match &self.submission {
-            SubmissionState::Sent(outcome) => Some(outcome),
-            _ => None,
-        }
-    }
-
-    /// Why submitting failed or was refused.
-    #[must_use]
-    pub fn submission_failure(&self) -> Option<&SessionFailure> {
-        match &self.submission {
-            SubmissionState::Failed(failure) => Some(failure),
-            _ => None,
-        }
-    }
-
-    /// The reason drafts are not reaching storage, if they are not.
-    #[must_use]
-    pub fn draft_write_failure(&self) -> Option<String> {
-        self.review_sink.as_ref().and_then(|sink| sink.failure())
-    }
-
-    #[must_use]
-    pub fn is_loading(&self) -> bool {
-        matches!(self.state, SessionState::Loading { .. })
-    }
-
-    #[must_use]
-    pub fn failure(&self) -> Option<&SessionFailure> {
-        match &self.state {
-            SessionState::Failed(failure) => Some(failure),
-            _ => None,
-        }
     }
 
     /// Everything about the submission that belongs above the diff.
@@ -2657,7 +2330,7 @@ impl SessionView {
                 .text_size(px(13.0))
         };
 
-        match &self.submission {
+        match lock(&self.model).submission() {
             SubmissionState::Idle => None,
 
             SubmissionState::Sending => Some(
@@ -2665,7 +2338,7 @@ impl SessionView {
                     .child(
                         div()
                             .text_color(rgb(theme::accent::TEXT))
-                            .child("Submitting the review…"),
+                            .child("Submitting the review..."),
                     )
                     .into_any(),
             ),
@@ -2817,7 +2490,7 @@ impl SessionView {
                                     .text_xs()
                                     .text_color(rgb(theme::text::SECONDARY))
                                     .child(format!(
-                                        "{} line {} — {reason}: {}",
+                                        "{} line {} ({reason}): {}",
                                         draft.anchor.path, draft.anchor.line, draft.body,
                                     ))
                             }),
@@ -2880,20 +2553,22 @@ impl SessionView {
 
 impl Focusable for SessionView {
     fn focus_handle(&self, cx: &App) -> FocusHandle {
-        match &self.state {
+        match &self.review {
             // Hand focus to the diff so its keybindings work immediately.
-            SessionState::Ready { review, .. } => {
-                review.read(cx).diff_view.read(cx).focus_handle.clone()
-            }
-            _ => self.focus_handle.clone(),
+            Some(loaded) => loaded.view.read(cx).diff_view.read(cx).focus_handle.clone(),
+            None => self.focus_handle.clone(),
         }
     }
 }
 
 impl Render for SessionView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        match &self.state {
-            SessionState::Loading { description, stage } => Self::render_centered(vec![
+        let banner = self.render_submission_banner(cx);
+        // Held across this render, so callees must not lock the model themselves.
+        let model = lock(&self.model);
+
+        match model.phase() {
+            SessionPhase::Loading { description, stage } => Self::render_centered(vec![
                 div()
                     .text_color(rgb(theme::text::PRIMARY))
                     .font_weight(gpui::FontWeight::SEMIBOLD)
@@ -2901,12 +2576,12 @@ impl Render for SessionView {
                     .into_any(),
                 div()
                     .text_color(rgb(theme::accent::TEXT))
-                    .child(format!("{stage}…"))
+                    .child(format!("{stage}..."))
                     .into_any(),
             ])
             .into_any(),
 
-            SessionState::Failed(failure) => Self::render_centered(vec![
+            SessionPhase::Failed(failure) => Self::render_centered(vec![
                 div()
                     .max_w(px(680.0))
                     .flex()
@@ -2943,12 +2618,12 @@ impl Render for SessionView {
             // A banner rather than a line in the sidebar: writes failing means
             // the reviewer's work is being lost as they type, which outranks
             // anything else on screen.
-            SessionState::Ready { review, .. } => div()
+            SessionPhase::Ready(_) => div()
                 .size_full()
                 .flex()
                 .flex_col()
                 .bg(rgb(theme::surface::BASE))
-                .children(self.draft_write_failure().map(|failure| {
+                .children(model.draft_write_failure().map(|failure| {
                     div()
                         .flex_shrink_0()
                         .px_4()
@@ -2959,8 +2634,12 @@ impl Render for SessionView {
                         .text_size(px(13.0))
                         .child(format!("Drafts are not being saved: {failure}"))
                 }))
-                .children(self.render_submission_banner(cx))
-                .child(div().flex_1().min_h_0().child(review.clone()))
+                .children(banner)
+                .children(
+                    self.review
+                        .as_ref()
+                        .map(|loaded| div().flex_1().min_h_0().child(loaded.view.clone())),
+                )
                 .into_any(),
         }
     }
@@ -2970,6 +2649,54 @@ impl Render for SessionView {
 mod tests {
     use super::*;
     use gpui::TestAppContext;
+
+    fn repository_backed_session(paths: &[&str]) -> ReviewSession {
+        let head_sha: Arc<str> = "a".repeat(40).into();
+        let files = paths
+            .iter()
+            .map(|path| {
+                let mut file = DiffFile::demo(40);
+                file.path = (*path).into();
+                file
+            })
+            .collect::<Vec<_>>();
+        ReviewSession::new(
+            SessionSource::LocalComparison {
+                repository_root: std::path::PathBuf::from("/tmp/repository"),
+                base_sha: Arc::clone(&head_sha),
+                diff_base_sha: Arc::clone(&head_sha),
+                head_sha,
+            },
+            files.into(),
+        )
+        .unwrap()
+    }
+
+    /// A review view on a model that has just become ready.
+    fn ready_review(
+        cx: &mut TestAppContext,
+        session: ReviewSession,
+    ) -> (Entity<ReviewView>, &mut gpui::VisualTestContext) {
+        let model = Arc::new(Mutex::new(SessionModel::loading("a review")));
+        lock(&model).finish(Ok(LoadedSession::unsaved(session)));
+        cx.add_window_view(move |window, cx| ReviewView::new(model, window, cx))
+    }
+
+    /// Reads the session a review view is drawing.
+    fn with_session<R>(
+        view: &Entity<ReviewView>,
+        app: &App,
+        read: impl FnOnce(&ReviewSession) -> R,
+    ) -> R {
+        let model = lock(&view.read(app).model);
+        read(loaded_review(&model).session())
+    }
+
+    fn body_at(view: &Entity<ReviewView>, app: &App, file: usize, row: usize) -> Option<String> {
+        with_session(view, app, |session| {
+            session.draft_at(file, row).map(|draft| draft.body.clone())
+        })
+    }
 
     #[gpui::test]
     fn renders_and_navigates_a_large_diff(cx: &mut TestAppContext) {
@@ -2990,7 +2717,7 @@ mod tests {
             window.focus(&view.read(app).focus_handle(app));
         });
         cx.dispatch_action(SelectNextLine);
-        assert_eq!(cx.read(|app| view.read(app).selected_line()), 1);
+        assert_eq!(cx.read(|app| view.read(app).selected_line), 1);
 
         cx.dispatch_action(ToggleComment);
         cx.simulate_input("hello");
@@ -3006,7 +2733,7 @@ mod tests {
     }
 
     /// The composer renders inside `DiffView`, so navigation bindings used to
-    /// swallow every `j`, `k`, and `c` typed into a review comment — and `c`
+    /// swallow every `j`, `k`, and `c` typed into a review comment. `c` also
     /// closed the composer mid-sentence.
     #[gpui::test]
     fn comment_editor_receives_keys_that_the_diff_binds(cx: &mut TestAppContext) {
@@ -3034,7 +2761,7 @@ mod tests {
             "jerky code",
         );
         // Typing must not have navigated the diff or dismissed the composer.
-        assert_eq!(cx.read(|app| view.read(app).selected_line()), 0);
+        assert_eq!(cx.read(|app| view.read(app).selected_line), 0);
         assert_eq!(
             cx.read(|app| view.read(app).comment_rows.clone()),
             Some(0..=0)
@@ -3061,14 +2788,14 @@ mod tests {
         });
         cx.dispatch_action(ToggleComment);
         cx.simulate_input("k");
-        assert_eq!(cx.read(|app| view.read(app).selected_line()), 0);
+        assert_eq!(cx.read(|app| view.read(app).selected_line), 0);
 
         cx.simulate_keystrokes("escape");
         assert_eq!(cx.read(|app| view.read(app).comment_rows.clone()), None);
 
         // With the composer gone, the same key navigates again.
         cx.simulate_input("j");
-        assert_eq!(cx.read(|app| view.read(app).selected_line()), 1);
+        assert_eq!(cx.read(|app| view.read(app).selected_line), 1);
     }
 
     #[gpui::test]
@@ -3078,9 +2805,8 @@ mod tests {
         first.path = "src/first.rs".into();
         let mut second = DiffFile::demo(30);
         second.path = "src/second.rs".into();
-        let session =
-            ReviewSession::new(domain::SessionSource::Demo, vec![first, second].into()).unwrap();
-        let (view, cx) = cx.add_window_view(|window, cx| ReviewView::new(session, window, cx));
+        let session = ReviewSession::new(SessionSource::Demo, vec![first, second].into()).unwrap();
+        let (view, cx) = ready_review(cx, session);
 
         cx.update(|window, app| {
             let focus = view.read(app).diff_view.read(app).focus_handle.clone();
@@ -3089,53 +2815,24 @@ mod tests {
         cx.dispatch_action(SelectNextFile);
         cx.dispatch_action(ToggleViewed);
 
-        assert_eq!(cx.read(|app| view.read(app).selected_file_index()), 1);
-        assert!(cx.read(|app| view.read(app).session.is_viewed(1)));
+        assert_eq!(
+            cx.read(|app| with_session(&view, app, ReviewSession::selected_file_index)),
+            1,
+        );
+        assert!(cx.read(|app| with_session(&view, app, |session| session.is_viewed(1))));
         assert_eq!(
             cx.read(|app| { view.read(app).diff_view.read(app).file.path.to_string() }),
             "src/second.rs",
         );
     }
 
-    fn repository_backed_session(paths: &[&str]) -> ReviewSession {
-        let head_sha: Arc<str> = "a".repeat(40).into();
-        let files = paths
-            .iter()
-            .map(|path| {
-                let mut file = DiffFile::demo(40);
-                file.path = (*path).into();
-                file
-            })
-            .collect::<Vec<_>>();
-        ReviewSession::new(
-            domain::SessionSource::LocalComparison {
-                repository_root: std::path::PathBuf::from("/tmp/repository"),
-                base_sha: Arc::clone(&head_sha),
-                diff_base_sha: Arc::clone(&head_sha),
-                head_sha,
-            },
-            files.into(),
-        )
-        .unwrap()
-    }
-
-    /// The window opens before loading starts, so the view has to begin in a
-    /// state that has no session at all.
+    /// The diff takes focus as soon as the session is ready, so its keybindings
+    /// work without a click.
     #[gpui::test]
-    fn a_session_view_starts_loading_then_becomes_ready(cx: &mut TestAppContext) {
+    fn finishing_focuses_the_diff(cx: &mut TestAppContext) {
         cx.update(init);
         let (view, cx) =
             cx.add_window_view(|_window, cx| SessionView::loading("pull request #42", cx));
-
-        assert!(cx.read(|app| view.read(app).is_loading()));
-        assert!(cx.read(|app| view.read(app).failure().is_none()));
-
-        cx.update(|_window, app| {
-            view.update(app, |view, cx| {
-                view.set_stage(LoadStage::BuildingDiff.label(), cx);
-            });
-        });
-        assert!(cx.read(|app| view.read(app).is_loading()));
 
         cx.update(|window, app| {
             view.update(app, |view, cx| {
@@ -3148,605 +2845,28 @@ mod tests {
                 );
             });
         });
-
-        assert!(!cx.read(|app| view.read(app).is_loading()));
-        assert!(cx.read(|app| view.read(app).failure().is_none()));
-        // The diff takes focus, so its keybindings work without a click.
         cx.dispatch_action(SelectNextLine);
-    }
-
-    /// Records what a session view asks storage to do.
-    #[derive(Clone, Default)]
-    struct RecordingSink {
-        calls: Arc<std::sync::Mutex<Vec<String>>>,
-        failure: Option<String>,
-    }
-
-    impl RecordingSink {
-        fn calls(&self) -> Vec<String> {
-            self.calls.lock().unwrap().clone()
-        }
-    }
-
-    impl domain::ReviewStateSink for RecordingSink {
-        fn save(&self, anchor: &DiffAnchor, body: &str) {
-            self.calls
-                .lock()
-                .unwrap()
-                .push(format!("save {} {} {body}", anchor.path, anchor.line));
-        }
-
-        fn discard(&self, anchor: &DiffAnchor) {
-            self.calls
-                .lock()
-                .unwrap()
-                .push(format!("discard {} {}", anchor.path, anchor.line));
-        }
-
-        fn save_summary(&self, _head_sha: &str, body: &str) {
-            self.calls.lock().unwrap().push(format!("summary {body}"));
-        }
-
-        fn save_provenance(&self, anchor: &DiffAnchor, provenance: &domain::FindingProvenance) {
-            self.calls.lock().unwrap().push(format!(
-                "provenance {} {} {}",
-                anchor.path, anchor.line, provenance.origin
-            ));
-        }
-
-        fn dismiss_finding(&self, _head_sha: &str, fingerprint: &str) {
-            self.calls
-                .lock()
-                .unwrap()
-                .push(format!("dismiss {fingerprint}"));
-        }
-
-        fn clear_submitted(&self, _head_sha: &str, anchors: &[DiffAnchor]) {
-            let positions = anchors
-                .iter()
-                .map(|anchor| format!("{} {}", anchor.path, anchor.line))
-                .collect::<Vec<_>>()
-                .join(", ");
-            self.calls
-                .lock()
-                .unwrap()
-                .push(format!("clear submitted [{positions}]"));
-        }
-
-        fn failure(&self) -> Option<String> {
-            self.failure.clone()
-        }
-    }
-
-    fn review_of(view: &Entity<SessionView>, app: &mut App) -> Entity<ReviewView> {
-        view.read(app)
-            .review()
-            .expect("the session should be ready")
-            .clone()
-    }
-
-    fn ready_session_view(
-        cx: &mut TestAppContext,
-        sink: Option<Box<dyn domain::ReviewStateSink>>,
-    ) -> (Entity<SessionView>, &mut gpui::VisualTestContext) {
-        let (view, cx) = cx.add_window_view(|_window, cx| SessionView::loading("a review", cx));
-        cx.update(|window, app| {
-            view.update(app, |view, cx| {
-                view.finish(
-                    Ok(LoadedSession {
-                        session: repository_backed_session(&["src/review.rs"]),
-                        review_sink: sink,
-                        submitter: None,
-                    }),
-                    window,
-                    cx,
-                );
-            });
-        });
-        (view, cx)
-    }
-
-    /// Puts one finding on the review, anchored to the row a comment can go on.
-    fn give_one_finding(
-        review: &Entity<ReviewView>,
-        cx: &mut gpui::VisualTestContext,
-        title: &str,
-    ) -> FindingId {
-        cx.update(|_window, app| {
-            review.update(app, |view, cx| {
-                let anchor = view
-                    .session()
-                    .anchor_for(0, 1)
-                    .expect("row 1 can carry a comment");
-                let raw = domain::RawFinding {
-                    location: Some(domain::RawLocation {
-                        path: anchor.path.clone(),
-                        side: anchor.side,
-                        line: anchor.line,
-                        start_line: None,
-                    }),
-                    severity: domain::Severity::Warning,
-                    confidence: 0.8,
-                    title: title.to_owned(),
-                    rationale: "because".to_owned(),
-                    proposed_comment: "Handle the failure here.".to_owned(),
-                    guidance_sources: vec![domain::GuidanceCitation {
-                        path: "AGENTS.md".into(),
-                        content_hash: "hash".into(),
-                    }],
-                };
-                let anchors = view.session().anchors().expect("anchored").clone();
-                let findings = Findings::validate(
-                    vec![raw],
-                    &anchors,
-                    &domain::FindingOrigin::Ai("claude-code".into()),
-                );
-                let id = findings.accepted()[0].id;
-                view.review_finished(findings, Vec::new(), cx);
-                id
-            })
-        })
-    }
-
-    #[gpui::test]
-    fn accepting_a_finding_writes_the_draft_and_its_provenance_to_the_sink(
-        cx: &mut TestAppContext,
-    ) {
-        cx.update(init);
-        let sink = RecordingSink::default();
-        let (view, cx) = ready_session_view(cx, Some(Box::new(sink.clone())));
-        let review = cx.update(|_window, app| review_of(&view, app));
-        let id = give_one_finding(&review, cx, "unchecked index");
-
-        cx.update(|window, app| {
-            review.update(app, |view, cx| {
-                view.accept_finding_by_id(id, window, cx);
-            });
-        });
-
-        // The text is written before the note about where it came from.
-        assert_eq!(
-            sink.calls(),
-            [
-                "save src/review.rs 2 Handle the failure here.".to_owned(),
-                "provenance src/review.rs 2 claude-code".to_owned(),
-            ]
-        );
-        cx.update(|_window, app| {
-            let view = review.read(app);
-            assert!(view.session().findings().is_empty(), "acted on");
-            let draft = view.session().draft_at(0, 1).expect("the draft is there");
-            assert!(draft.is_proposed());
-        });
-    }
-
-    #[gpui::test]
-    fn dismissing_a_finding_records_the_decision(cx: &mut TestAppContext) {
-        cx.update(init);
-        let sink = RecordingSink::default();
-        let (view, cx) = ready_session_view(cx, Some(Box::new(sink.clone())));
-        let review = cx.update(|_window, app| review_of(&view, app));
-        let id = give_one_finding(&review, cx, "unchecked index");
-
-        cx.update(|_window, app| {
-            review.update(app, |view, cx| view.dismiss_finding_by_id(id, cx));
-        });
-
-        assert_eq!(sink.calls().len(), 1);
-        assert!(sink.calls()[0].starts_with("dismiss "));
-        cx.update(|_window, app| {
-            assert!(review.read(app).session().findings().is_empty());
-            assert!(review.read(app).session().drafts().is_empty());
-        });
-    }
-
-    /// The reviewer's own words are never overwritten; both texts go to the
-    /// composer instead, and nothing is saved until they commit.
-    #[gpui::test]
-    fn accepting_onto_an_occupied_line_opens_the_composer_pre_filled(cx: &mut TestAppContext) {
-        cx.update(init);
-        let sink = RecordingSink::default();
-        let (view, cx) = ready_session_view(cx, Some(Box::new(sink.clone())));
-        let review = cx.update(|_window, app| review_of(&view, app));
-
-        // The reviewer writes on the line first.
-        cx.dispatch_action(SelectNextLine);
-        cx.dispatch_action(ToggleComment);
-        cx.simulate_input("mine");
-        cx.dispatch_action(CloseComment);
-        let id = give_one_finding(&review, cx, "unchecked index");
-        let before = sink.calls().len();
-
-        cx.update(|window, app| {
-            review.update(app, |view, cx| {
-                view.accept_finding_by_id(id, window, cx);
-            });
-        });
-
-        cx.update(|_window, app| {
-            let view = review.read(app);
-            // Untouched, and the finding is still waiting.
-            assert_eq!(
-                view.session().draft_at(0, 1).map(|d| d.body.as_str()),
-                Some("mine")
-            );
-            assert_eq!(view.session().findings().len(), 1);
-            // The composer holds both texts for the reviewer to reconcile.
-            let composer = view.diff_view.read(app).comment_editor.read(app);
-            assert_eq!(composer.content(), "mine\n\nHandle the failure here.");
-        });
-        assert_eq!(sink.calls().len(), before, "nothing was written");
-    }
-
-    #[gpui::test]
-    fn a_finding_about_the_whole_change_goes_into_the_summary(cx: &mut TestAppContext) {
-        cx.update(init);
-        let sink = RecordingSink::default();
-        let (view, cx) = ready_session_view(cx, Some(Box::new(sink.clone())));
-        let review = cx.update(|_window, app| review_of(&view, app));
-
-        let id = cx.update(|_window, app| {
-            review.update(app, |view, cx| {
-                let raw = domain::RawFinding {
-                    location: None,
-                    severity: domain::Severity::Info,
-                    confidence: 0.5,
-                    title: "no tests".to_owned(),
-                    rationale: String::new(),
-                    proposed_comment: "Consider adding a test.".to_owned(),
-                    guidance_sources: Vec::new(),
-                };
-                let anchors = view.session().anchors().expect("anchored").clone();
-                let findings = Findings::validate(
-                    vec![raw],
-                    &anchors,
-                    &domain::FindingOrigin::Ai("claude-code".into()),
-                );
-                let id = findings.accepted()[0].id;
-                view.review_finished(findings, Vec::new(), cx);
-                id
-            })
-        });
-
-        cx.update(|window, app| {
-            review.update(app, |view, cx| view.accept_finding_by_id(id, window, cx));
-        });
-
-        cx.update(|_window, app| {
-            let view = review.read(app);
-            assert_eq!(view.session().summary(), "Consider adding a test.");
-            assert!(view.session().drafts().is_empty(), "nowhere to anchor it");
-            assert!(view.session().findings().is_empty());
-        });
-        assert!(sink.calls().iter().any(|call| call.starts_with("summary ")));
-    }
-
-    fn guidance_selection() -> domain::GuidanceSelection {
-        let entry = |path: &str, content: &str| domain::GuidanceEntry {
-            excerpt: domain::GuidanceExcerpt {
-                path: path.into(),
-                scope: "whole repository".into(),
-                content: content.to_owned(),
-                content_hash: "hash".into(),
-            },
-            included: true,
-        };
-        domain::GuidanceSelection::new(
-            vec![
-                entry("AGENTS.md", &"a".repeat(2048)),
-                entry("CLAUDE.md", "b"),
-            ],
-            vec![domain::GuidanceSkip {
-                path: "HUGE.md".into(),
-                reason: "90000 bytes, over the 65536-byte limit".into(),
-            }],
-            vec!["vendor/lib.rs".into()],
-        )
-    }
-
-    /// The panel is the disclosure notice, so turning a file off has to change what
-    /// a run would send — not just how the row is drawn.
-    #[gpui::test]
-    fn toggling_guidance_changes_what_would_be_sent(cx: &mut TestAppContext) {
-        cx.update(init);
-        let (view, cx) = ready_session_view(cx, None);
-        let review = cx.update(|_window, app| review_of(&view, app));
-
-        cx.update(|_window, app| {
-            review.update(app, |view, _cx| {
-                view.session.set_guidance(guidance_selection());
-            });
-        });
-        cx.update(|_window, app| {
-            let guidance = review.read(app).session().guidance();
-            assert_eq!(guidance.included_count(), 2);
-            assert_eq!(guidance.included_bytes(), 2049);
-        });
-
-        cx.update(|_window, app| {
-            review.update(app, |view, cx| view.toggle_guidance("AGENTS.md", cx));
-        });
-
-        cx.update(|_window, app| {
-            let guidance = review.read(app).session().guidance();
-            assert_eq!(guidance.included_count(), 1);
-            assert_eq!(guidance.included_bytes(), 1);
-            let sent: Vec<_> = guidance
-                .included()
-                .map(|excerpt| excerpt.path.to_string())
-                .collect();
-            assert_eq!(sent, vec!["CLAUDE.md".to_owned()]);
-        });
-    }
-
-    #[gpui::test]
-    fn the_guidance_section_starts_open_and_collapses_once_a_run_finishes(cx: &mut TestAppContext) {
-        cx.update(init);
-        let (view, cx) = ready_session_view(cx, None);
-        let review = cx.update(|_window, app| review_of(&view, app));
-
-        // Open before a run: PLAN wants what will be sent seen before it is sent.
-        cx.update(|_window, app| assert!(review.read(app).guidance_expanded()));
-
-        cx.update(|_window, app| {
-            review.update(app, |view, cx| {
-                view.review_finished(Findings::default(), Vec::new(), cx);
-            });
-        });
-
-        cx.update(|_window, app| assert!(!review.read(app).guidance_expanded()));
-
-        // And it can be reopened.
-        cx.update(|_window, app| {
-            review.update(app, ReviewView::toggle_guidance_panel);
-        });
-        cx.update(|_window, app| assert!(review.read(app).guidance_expanded()));
-    }
-
-    /// The panel carries the only Review button, so it must not depend on there
-    /// being something to show yet.
-    #[gpui::test]
-    fn the_panel_is_reachable_whenever_a_review_is_possible(cx: &mut TestAppContext) {
-        cx.update(init);
-        let (view, cx) = ready_session_view(cx, None);
-        let review = cx.update(|_window, app| review_of(&view, app));
-
-        cx.update(|_window, app| {
-            let view = review.read(app);
-            // A repository-backed snapshot can be reviewed, so the panel — and the
-            // only Review button — must be reachable before anything is discovered.
-            assert!(findings::is_visible(view.session(), view.review_run()));
-        });
-
-        cx.update(|_window, app| {
-            review.update(app, |view, cx| {
-                view.session.set_guidance(guidance_selection());
-                cx.notify();
-            });
-        });
-
-        cx.update(|_window, app| {
-            let view = review.read(app);
-            assert!(findings::is_visible(view.session(), view.review_run()));
-        });
-    }
-
-    /// The fixture has no commit, so there is nothing to review and no panel.
-    #[gpui::test]
-    fn the_generated_fixture_offers_no_review(cx: &mut TestAppContext) {
-        cx.update(init);
-        let (view, cx) = cx.add_window_view(|_window, cx| SessionView::loading("demo", cx));
-        cx.update(|window, app| {
-            view.update(app, |view, cx| {
-                view.finish(
-                    Ok(LoadedSession {
-                        session: ReviewSession::new(
-                            SessionSource::Demo,
-                            vec![DiffFile::demo(8)].into(),
-                        )
-                        .expect("the fixture has files"),
-                        review_sink: None,
-                        submitter: None,
-                    }),
-                    window,
-                    cx,
-                );
-            });
-        });
-        let review = cx.update(|_window, app| review_of(&view, app));
-
-        cx.update(|_window, app| {
-            let view = review.read(app);
-            assert!(!findings::is_visible(view.session(), view.review_run()));
-        });
-    }
-
-    #[gpui::test]
-    fn cancelling_sets_the_flag_the_backend_polls(cx: &mut TestAppContext) {
-        cx.update(init);
-        let (view, cx) = ready_session_view(cx, None);
-        let review = cx.update(|_window, app| review_of(&view, app));
-        let cancel = Arc::new(AtomicBool::new(false));
-
-        cx.update(|_window, app| {
-            review.update(app, |view, cx| {
-                view.review_started(Arc::clone(&cancel), cx);
-                assert!(view.review_run().is_running());
-                view.cancel_review(cx);
-            });
-        });
-
-        assert!(cancel.load(std::sync::atomic::Ordering::Relaxed));
-    }
-
-    #[gpui::test]
-    fn a_failed_run_keeps_its_remediation(cx: &mut TestAppContext) {
-        cx.update(init);
-        let (view, cx) = ready_session_view(cx, None);
-        let review = cx.update(|_window, app| review_of(&view, app));
-
-        cx.update(|_window, app| {
-            review.update(app, |view, cx| {
-                view.review_failed(
-                    "claude is not installed",
-                    Some("Install it.".to_owned()),
-                    cx,
-                );
-            });
-        });
-
-        cx.update(|_window, app| {
-            let ReviewRunState::Failed {
-                summary,
-                remediation,
-            } = review.read(app).review_run()
-            else {
-                panic!("the run should have failed");
-            };
-            assert_eq!(summary.as_ref(), "claude is not installed");
-            assert_eq!(
-                remediation.as_ref().map(SharedString::as_ref),
-                Some("Install it.")
-            );
-        });
-    }
-
-    /// The last link in the chain: a keystroke reaching storage.
-    #[gpui::test]
-    fn draft_changes_reach_the_sink(cx: &mut TestAppContext) {
-        cx.update(init);
-        let sink = RecordingSink::default();
-        let (_view, cx) = ready_session_view(cx, Some(Box::new(sink.clone())));
-
-        cx.dispatch_action(ToggleComment);
-        cx.simulate_input("hi");
-
-        // One write per keystroke, each with the text so far.
-        assert_eq!(
-            sink.calls(),
-            [
-                "save src/review.rs 1 h".to_owned(),
-                "save src/review.rs 1 hi".to_owned(),
-            ],
-        );
-    }
-
-    #[gpui::test]
-    fn discarding_a_draft_reaches_the_sink(cx: &mut TestAppContext) {
-        cx.update(init);
-        let sink = RecordingSink::default();
-        let (_view, cx) = ready_session_view(cx, Some(Box::new(sink.clone())));
-
-        cx.dispatch_action(ToggleComment);
-        cx.simulate_input("x");
-        cx.simulate_keystrokes("backspace");
-
-        // An emptied draft is a removal, not a blank comment.
-        assert_eq!(
-            sink.calls().last().map(String::as_str),
-            Some("discard src/review.rs 1"),
-        );
-    }
-
-    /// Writes failing means work is being lost as it is typed, so the view has to
-    /// be able to say so.
-    #[gpui::test]
-    fn a_failing_sink_is_reported(cx: &mut TestAppContext) {
-        cx.update(init);
-        let sink = RecordingSink {
-            failure: Some("disk is full".to_owned()),
-            ..RecordingSink::default()
-        };
-        let (view, cx) = ready_session_view(cx, Some(Box::new(sink)));
 
         assert_eq!(
-            cx.read(|app| view.read(app).draft_write_failure()),
-            Some("disk is full".to_owned()),
-        );
-    }
-
-    #[gpui::test]
-    fn a_session_without_a_sink_still_accepts_drafts(cx: &mut TestAppContext) {
-        cx.update(init);
-        let (view, cx) = ready_session_view(cx, None);
-
-        cx.dispatch_action(ToggleComment);
-        cx.simulate_input("in memory only");
-
-        assert_eq!(cx.read(|app| view.read(app).draft_write_failure()), None);
-    }
-
-    #[gpui::test]
-    fn a_failed_load_shows_its_remediation_instead_of_a_session(cx: &mut TestAppContext) {
-        cx.update(init);
-        let (view, cx) =
-            cx.add_window_view(|_window, cx| SessionView::loading("pull request #42", cx));
-
-        let failure = SessionFailure::from_error(
-            "GitHub is not authenticated",
-            &std::io::Error::other("The token in GH_TOKEN is invalid."),
-        )
-        .with_remediation("Run `gh auth login`, then reopen the pull request.");
-        cx.update(|window, app| {
-            view.update(app, |view, cx| view.finish(Err(failure), window, cx));
-        });
-
-        assert!(!cx.read(|app| view.read(app).is_loading()));
-        let shown = cx.read(|app| view.read(app).failure().cloned()).unwrap();
-        assert_eq!(shown.summary, "GitHub is not authenticated");
-        assert!(shown.remediation.unwrap().contains("gh auth login"));
-        assert!(shown.detail.unwrap().contains("GH_TOKEN"));
-    }
-
-    /// A stage report can arrive after the load finished; it must not drag a
-    /// ready or failed view back to loading.
-    #[gpui::test]
-    fn a_late_stage_report_cannot_reopen_a_finished_session(cx: &mut TestAppContext) {
-        cx.update(init);
-        let (view, cx) =
-            cx.add_window_view(|_window, cx| SessionView::loading("pull request #42", cx));
-
-        cx.update(|window, app| {
-            view.update(app, |view, cx| {
-                view.finish(Err(SessionFailure::new("Could not load")), window, cx);
-            });
-        });
-        cx.update(|_window, app| {
-            view.update(app, |view, cx| {
-                view.set_stage(LoadStage::BuildingDiff.label(), cx);
-            });
-        });
-
-        assert!(!cx.read(|app| view.read(app).is_loading()));
-        assert!(cx.read(|app| view.read(app).failure().is_some()));
-    }
-
-    #[gpui::test]
-    fn a_conversation_load_failure_is_visible_on_a_ready_session(cx: &mut TestAppContext) {
-        cx.update(init);
-        let mut session = repository_backed_session(&["src/review.rs"]);
-        session.push_warning(SessionFailure::new("GitHub's rate limit is exhausted"));
-
-        let (view, cx) = cx.add_window_view(|window, cx| ReviewView::new(session, window, cx));
-
-        // Rendered from the session, so the sidebar cannot silently show zero
-        // conversations as though there were none.
-        assert_eq!(
-            cx.read(|app| view
-                .read(app)
-                .session
-                .warnings()
-                .first()
-                .map(|warning| warning.summary.clone())),
-            Some("GitHub's rate limit is exhausted".to_owned()),
+            cx.read(|app| {
+                view.read(app)
+                    .review
+                    .as_ref()
+                    .expect("the session is ready")
+                    .view
+                    .read(app)
+                    .diff_view
+                    .read(app)
+                    .selected_line
+            }),
+            1,
         );
     }
 
     fn open_composer_on(
         cx: &mut TestAppContext,
     ) -> (Entity<ReviewView>, &mut gpui::VisualTestContext) {
-        let session = repository_backed_session(&["src/review.rs"]);
-        let (view, cx) = cx.add_window_view(|window, cx| ReviewView::new(session, window, cx));
+        let (view, cx) = ready_review(cx, repository_backed_session(&["src/review.rs"]));
         cx.update(|window, app| {
             let focus = view.read(app).diff_view.read(app).focus_handle.clone();
             window.focus(&focus);
@@ -3870,14 +2990,14 @@ mod tests {
         cx.simulate_input("l");
         cx.simulate_keystrokes("cmd-a");
         cx.simulate_keystrokes("backspace");
+
+        // Emptying the composer removes the draft, not just its text.
+        assert_eq!(cx.read(|app| body_at(&view, app, 0, 0)), None);
+
         cx.simulate_input("done");
 
         assert_eq!(
-            cx.read(|app| view
-                .read(app)
-                .session()
-                .draft_at(0, 0)
-                .map(|d| d.body.clone())),
+            cx.read(|app| body_at(&view, app, 0, 0)),
             Some("done".to_owned()),
         );
     }
@@ -3887,8 +3007,7 @@ mod tests {
     #[gpui::test]
     fn shift_navigation_builds_a_range_comment(cx: &mut TestAppContext) {
         cx.update(init);
-        let session = repository_backed_session(&["src/review.rs"]);
-        let (view, cx) = cx.add_window_view(|window, cx| ReviewView::new(session, window, cx));
+        let (view, cx) = ready_review(cx, repository_backed_session(&["src/review.rs"]));
         cx.update(|window, app| {
             let focus = view.read(app).diff_view.read(app).focus_handle.clone();
             window.focus(&focus);
@@ -3906,13 +3025,16 @@ mod tests {
         cx.simulate_input("this block");
 
         let draft = cx
-            .read(|app| view.read(app).session().draft_at(0, 2).cloned())
+            .read(|app| with_session(&view, app, |session| session.draft_at(0, 2).cloned()))
             .expect("the draft is keyed at the span's last row");
         assert_eq!(draft.body, "this block");
         assert!(draft.anchor.is_multiline());
         assert_eq!(draft.anchor.start_line, Some(1));
         assert_eq!(draft.anchor.line, 3);
-        assert_eq!(cx.read(|app| view.read(app).session().drafts().len()), 1);
+        assert_eq!(
+            cx.read(|app| with_session(&view, app, |session| session.drafts().len())),
+            1,
+        );
     }
 
     /// Plain navigation after extending must abandon the range rather than leave it
@@ -3920,8 +3042,7 @@ mod tests {
     #[gpui::test]
     fn moving_without_shift_collapses_the_selection(cx: &mut TestAppContext) {
         cx.update(init);
-        let session = repository_backed_session(&["src/review.rs"]);
-        let (view, cx) = cx.add_window_view(|window, cx| ReviewView::new(session, window, cx));
+        let (view, cx) = ready_review(cx, repository_backed_session(&["src/review.rs"]));
         cx.update(|window, app| {
             let focus = view.read(app).diff_view.read(app).focus_handle.clone();
             window.focus(&focus);
@@ -3936,39 +3057,14 @@ mod tests {
 
         cx.dispatch_action(ToggleComment);
         cx.simulate_input("one line");
-        let draft = cx
-            .read(|app| view.read(app).session().draft_at(0, 2).cloned())
-            .unwrap();
-        assert!(!draft.anchor.is_multiline());
-    }
-
-    /// The point of the whole path: what is typed becomes a draft anchored to the
-    /// row, without the reviewer doing anything to save it.
-    #[gpui::test]
-    fn typing_in_the_composer_stores_an_anchored_draft(cx: &mut TestAppContext) {
-        cx.update(init);
-        let session = repository_backed_session(&["src/review.rs"]);
-        let (view, cx) = cx.add_window_view(|window, cx| ReviewView::new(session, window, cx));
-        cx.update(|window, app| {
-            let focus = view.read(app).diff_view.read(app).focus_handle.clone();
-            window.focus(&focus);
+        let multiline = cx.read(|app| {
+            with_session(&view, app, |session| {
+                session
+                    .draft_at(0, 2)
+                    .map(|draft| draft.anchor.is_multiline())
+            })
         });
-
-        // Row 6 of the fixture is an addition, so it anchors on the right.
-        for _ in 0..6 {
-            cx.dispatch_action(SelectNextLine);
-        }
-        cx.dispatch_action(ToggleComment);
-        cx.simulate_input("needs a test");
-
-        let draft = cx
-            .read(|app| view.read(app).session().draft_at(0, 6).cloned())
-            .expect("typing should have stored a draft");
-        assert_eq!(draft.body, "needs a test");
-        assert_eq!(draft.anchor.side, domain::DiffSide::Right);
-        assert_eq!(draft.anchor.path.as_ref(), "src/review.rs");
-        assert!(!draft.is_stale);
-        assert_eq!(cx.read(|app| view.read(app).session().drafts().len()), 1);
+        assert_eq!(multiline, Some(false));
     }
 
     /// Closing the composer and switching files used to lose the text. It is now
@@ -3976,8 +3072,10 @@ mod tests {
     #[gpui::test]
     fn a_draft_survives_closing_the_composer_and_changing_files(cx: &mut TestAppContext) {
         cx.update(init);
-        let session = repository_backed_session(&["src/first.rs", "src/second.rs"]);
-        let (view, cx) = cx.add_window_view(|window, cx| ReviewView::new(session, window, cx));
+        let (view, cx) = ready_review(
+            cx,
+            repository_backed_session(&["src/first.rs", "src/second.rs"]),
+        );
         cx.update(|window, app| {
             let focus = view.read(app).diff_view.read(app).focus_handle.clone();
             window.focus(&focus);
@@ -3990,11 +3088,7 @@ mod tests {
         cx.simulate_keystrokes("cmd-shift-k");
 
         assert_eq!(
-            cx.read(|app| view
-                .read(app)
-                .session()
-                .draft_at(0, 0)
-                .map(|d| d.body.clone())),
+            cx.read(|app| body_at(&view, app, 0, 0)),
             Some("a thought".to_owned()),
         );
     }
@@ -4004,430 +3098,23 @@ mod tests {
     #[gpui::test]
     fn reopening_the_composer_loads_the_existing_draft(cx: &mut TestAppContext) {
         cx.update(init);
-        let session = repository_backed_session(&["src/review.rs"]);
-        let (view, cx) = cx.add_window_view(|window, cx| ReviewView::new(session, window, cx));
-        cx.update(|window, app| {
-            let focus = view.read(app).diff_view.read(app).focus_handle.clone();
-            window.focus(&focus);
-        });
+        let (view, cx) = open_composer_on(cx);
 
-        cx.dispatch_action(ToggleComment);
         cx.simulate_input("first half");
         cx.simulate_keystrokes("escape");
         cx.dispatch_action(ToggleComment);
 
-        assert_eq!(
-            cx.read(|app| view
-                .read(app)
-                .diff_view
-                .read(app)
-                .comment_editor
-                .read(app)
-                .content()
-                .to_owned()),
-            "first half",
-        );
+        assert_eq!(composed_text(&view, cx), "first half");
 
         // Appending continues the same draft rather than starting another.
         cx.simulate_input(" and second");
         assert_eq!(
-            cx.read(|app| view
-                .read(app)
-                .session()
-                .draft_at(0, 0)
-                .map(|d| d.body.clone())),
+            cx.read(|app| body_at(&view, app, 0, 0)),
             Some("first half and second".to_owned()),
         );
-        assert_eq!(cx.read(|app| view.read(app).session().drafts().len()), 1);
-    }
-
-    #[gpui::test]
-    fn emptying_the_composer_removes_the_draft(cx: &mut TestAppContext) {
-        cx.update(init);
-        let session = repository_backed_session(&["src/review.rs"]);
-        let (view, cx) = cx.add_window_view(|window, cx| ReviewView::new(session, window, cx));
-        cx.update(|window, app| {
-            let focus = view.read(app).diff_view.read(app).focus_handle.clone();
-            window.focus(&focus);
-        });
-
-        cx.dispatch_action(ToggleComment);
-        cx.simulate_input("oops");
-        assert_eq!(cx.read(|app| view.read(app).session().drafts().len()), 1);
-
-        for _ in 0..4 {
-            cx.simulate_keystrokes("backspace");
-        }
-
-        assert!(cx.read(|app| view.read(app).session().drafts().is_empty()));
-    }
-
-    /// Records every submission attempt, so a test can prove one did not happen.
-    #[derive(Clone, Default)]
-    struct RecordingSubmitter {
-        posted: Arc<std::sync::Mutex<Vec<ReviewSubmission>>>,
-        failure: Option<SessionFailure>,
-    }
-
-    impl RecordingSubmitter {
-        fn posted(&self) -> Vec<ReviewSubmission> {
-            self.posted.lock().unwrap().clone()
-        }
-    }
-
-    impl ReviewSubmitter for RecordingSubmitter {
-        fn submit(
-            &self,
-            submission: &ReviewSubmission,
-        ) -> Result<SubmissionOutcome, SessionFailure> {
-            self.posted.lock().unwrap().push(submission.clone());
-            self.failure.clone().map_or_else(
-                || {
-                    Ok(SubmissionOutcome {
-                        state: "COMMENTED".to_owned(),
-                        url: "https://github.com/acme/widgets/pull/42".to_owned(),
-                        comment_count: submission.comments.len(),
-                    })
-                },
-                Err,
-            )
-        }
-    }
-
-    fn submittable_session() -> ReviewSession {
-        let head_sha: Arc<str> = "a".repeat(40).into();
-        let mut file = DiffFile::demo(40);
-        file.path = "src/review.rs".into();
-        ReviewSession::new(
-            domain::SessionSource::GitHubPullRequest {
-                repository_root: std::path::PathBuf::from("/tmp/repository"),
-                owner: "acme".into(),
-                repository: "widgets".into(),
-                number: 42,
-                title: "Improve the review flow".into(),
-                url: "https://github.com/acme/widgets/pull/42".into(),
-                base_ref: "main".into(),
-                head_ref: "feature".into(),
-                base_sha: Arc::clone(&head_sha),
-                recorded_base_sha: Arc::clone(&head_sha),
-                diff_base_sha: Arc::clone(&head_sha),
-                head_sha,
-            },
-            vec![file].into(),
-        )
-        .unwrap()
-    }
-
-    fn submittable_view(
-        cx: &mut TestAppContext,
-        session: ReviewSession,
-        submitter: RecordingSubmitter,
-        sink: RecordingSink,
-    ) -> (Entity<SessionView>, &mut gpui::VisualTestContext) {
-        let (view, cx) = cx.add_window_view(|_window, cx| SessionView::loading("a review", cx));
-        cx.update(|window, app| {
-            view.update(app, |view, cx| {
-                view.finish(
-                    Ok(LoadedSession {
-                        session,
-                        review_sink: Some(Box::new(sink)),
-                        submitter: Some(Arc::new(submitter)),
-                    }),
-                    window,
-                    cx,
-                );
-            });
-        });
-        (view, cx)
-    }
-
-    /// The property the whole design turns on: asking to submit posts nothing.
-    #[gpui::test]
-    fn requesting_submission_does_not_post_anything(cx: &mut TestAppContext) {
-        cx.update(init);
-        let submitter = RecordingSubmitter::default();
-        let mut session = submittable_session();
-        session.set_draft(0, 6, "needs a test");
-        session.set_summary("Two notes.");
-        let (view, cx) = submittable_view(cx, session, submitter.clone(), RecordingSink::default());
-
-        cx.update(|_window, app| {
-            let review = review_of(&view, app);
-            review.update(app, |_review, cx| {
-                cx.emit(ReviewViewEvent::SubmitRequested {
-                    event: ReviewEvent::Comment,
-                });
-            });
-        });
-
-        // Waiting on a human, not on the network.
-        assert!(
-            submitter.posted().is_empty(),
-            "nothing may be posted before confirmation",
-        );
-        cx.update(|_window, app| {
-            let submission = view.read(app).confirming().expect("should be confirming");
-            assert_eq!(submission.event, ReviewEvent::Comment);
-            assert_eq!(submission.comments.len(), 1);
-            assert_eq!(submission.body, "Two notes.");
-        });
-    }
-
-    #[gpui::test]
-    fn confirming_posts_the_review_and_clears_what_was_sent(cx: &mut TestAppContext) {
-        cx.update(init);
-        let submitter = RecordingSubmitter::default();
-        let sink = RecordingSink::default();
-        let mut session = submittable_session();
-        session.set_draft(0, 6, "needs a test");
-        session.set_summary("Two notes.");
-        let (view, cx) = submittable_view(cx, session, submitter.clone(), sink.clone());
-
-        cx.update(|_window, app| {
-            let review = review_of(&view, app);
-            review.update(app, |_review, cx| {
-                cx.emit(ReviewViewEvent::SubmitRequested {
-                    event: ReviewEvent::Comment,
-                });
-            });
-        });
-        cx.update(|_window, app| {
-            view.update(app, SessionView::send_confirmed);
-        });
-        cx.run_until_parked();
-
-        let posted = submitter.posted();
-        assert_eq!(posted.len(), 1, "posted exactly once");
-        assert_eq!(posted[0].comments.len(), 1);
-        assert_eq!(posted[0].head_sha.as_ref(), "a".repeat(40));
-
-        cx.update(|_window, app| {
-            assert!(
-                view.read(app).submitted().is_some(),
-                "should report success"
-            );
-            let session = review_of(&view, app).read(app).session();
-            // Forgotten only after the forge accepted it.
-            assert!(session.drafts().is_empty());
-            assert_eq!(session.summary(), "");
-        });
-        assert!(
-            sink.calls()
-                .iter()
-                .any(|call| call.starts_with("clear submitted [src/review.rs 6")),
-            "storage should be told what was posted: {:?}",
-            sink.calls(),
-        );
-    }
-
-    /// A failed submission must leave every draft exactly where it was.
-    #[gpui::test]
-    fn a_failed_submission_keeps_every_draft(cx: &mut TestAppContext) {
-        cx.update(init);
-        let submitter = RecordingSubmitter {
-            failure: Some(
-                SessionFailure::new("The pull request moved on")
-                    .with_remediation("Your drafts are unchanged."),
-            ),
-            ..RecordingSubmitter::default()
-        };
-        let sink = RecordingSink::default();
-        let mut session = submittable_session();
-        session.set_draft(0, 6, "needs a test");
-        session.set_summary("Two notes.");
-        let (view, cx) = submittable_view(cx, session, submitter.clone(), sink.clone());
-
-        cx.update(|_window, app| {
-            let review = review_of(&view, app);
-            review.update(app, |_review, cx| {
-                cx.emit(ReviewViewEvent::SubmitRequested {
-                    event: ReviewEvent::Comment,
-                });
-            });
-        });
-        cx.update(|_window, app| {
-            view.update(app, SessionView::send_confirmed);
-        });
-        cx.run_until_parked();
-
-        cx.update(|_window, app| {
-            let failure = view
-                .read(app)
-                .submission_failure()
-                .expect("the failure should be shown");
-            assert_eq!(failure.summary, "The pull request moved on");
-
-            let session = review_of(&view, app).read(app).session();
-            assert_eq!(session.drafts().len(), 1, "the draft is still here");
-            assert_eq!(session.summary(), "Two notes.", "so is the summary");
-        });
-        assert!(
-            !sink.calls().iter().any(|call| call.contains("clear")),
-            "nothing may be cleared when the post failed: {:?}",
-            sink.calls(),
-        );
-    }
-
-    #[gpui::test]
-    fn a_review_that_cannot_be_assembled_explains_itself_without_posting(cx: &mut TestAppContext) {
-        cx.update(init);
-        let submitter = RecordingSubmitter::default();
-        // A comment review with a draft but no summary: GitHub requires a body.
-        let mut session = submittable_session();
-        session.set_draft(0, 6, "needs a test");
-        let (view, cx) = submittable_view(cx, session, submitter.clone(), RecordingSink::default());
-
-        cx.update(|_window, app| {
-            let review = review_of(&view, app);
-            review.update(app, |_review, cx| {
-                cx.emit(ReviewViewEvent::SubmitRequested {
-                    event: ReviewEvent::Comment,
-                });
-            });
-        });
-
-        cx.update(|_window, app| {
-            let failure = view.read(app).submission_failure().expect("should refuse");
-            assert!(
-                failure
-                    .remediation
-                    .as_ref()
-                    .unwrap()
-                    .contains("needs a summary"),
-                "unexpected remediation: {:?}",
-                failure.remediation,
-            );
-            assert!(view.read(app).confirming().is_none());
-        });
-        assert!(submitter.posted().is_empty());
-    }
-
-    #[gpui::test]
-    fn cancelling_a_confirmation_posts_nothing(cx: &mut TestAppContext) {
-        cx.update(init);
-        let submitter = RecordingSubmitter::default();
-        let mut session = submittable_session();
-        session.set_summary("Just a note.");
-        let (view, cx) = submittable_view(cx, session, submitter.clone(), RecordingSink::default());
-
-        cx.update(|_window, app| {
-            let review = review_of(&view, app);
-            review.update(app, |_review, cx| {
-                cx.emit(ReviewViewEvent::SubmitRequested {
-                    event: ReviewEvent::Approve,
-                });
-            });
-        });
-        cx.update(|_window, app| {
-            view.update(app, SessionView::cancel_submission);
-        });
-        cx.run_until_parked();
-
-        assert!(submitter.posted().is_empty());
-        cx.update(|_window, app| {
-            assert!(view.read(app).confirming().is_none());
-            // The summary survives cancelling.
-            assert_eq!(
-                review_of(&view, app).read(app).session().summary(),
-                "Just a note.",
-            );
-        });
-    }
-
-    /// Typing in the summary must reach both the session and storage.
-    #[gpui::test]
-    fn the_summary_is_stored_as_it_is_typed(cx: &mut TestAppContext) {
-        cx.update(init);
-        let sink = RecordingSink::default();
-        let (view, cx) = submittable_view(
-            cx,
-            submittable_session(),
-            RecordingSubmitter::default(),
-            sink.clone(),
-        );
-
-        cx.update(|window, app| {
-            let review = review_of(&view, app);
-            let editor = review.read(app).summary_editor.clone();
-            window.focus(&editor.read(app).focus_handle);
-        });
-        cx.simulate_input("ok");
-
-        cx.update(|_window, app| {
-            assert_eq!(review_of(&view, app).read(app).session().summary(), "ok");
-        });
         assert_eq!(
-            sink.calls(),
-            ["summary o".to_owned(), "summary ok".to_owned()],
-        );
-    }
-
-    /// Moving a stale draft has to reach storage as a removal *and* a write, or
-    /// reopening would show the draft in both places.
-    #[gpui::test]
-    fn re_anchoring_a_stale_draft_reaches_the_sink_from_both_sides(cx: &mut TestAppContext) {
-        cx.update(init);
-        let sink = RecordingSink::default();
-        let mut session = repository_backed_session(&["src/review.rs"]);
-        let stale = DiffAnchor {
-            path: "src/review.rs".into(),
-            side: domain::DiffSide::Right,
-            line: 9_999,
-            start_line: None,
-            head_sha: "a".repeat(40).into(),
-        };
-        session.restore_drafts([(stale.clone(), "written last week".to_owned())]);
-        assert_eq!(session.drafts().stale_count(), 1);
-
-        let (view, cx) = cx.add_window_view(|_window, cx| SessionView::loading("a review", cx));
-        cx.update(|window, app| {
-            view.update(app, |view, cx| {
-                view.finish(
-                    Ok(LoadedSession {
-                        session,
-                        review_sink: Some(Box::new(sink.clone())),
-                        submitter: None,
-                    }),
-                    window,
-                    cx,
-                );
-            });
-        });
-
-        // Select a commentable row, then move the stale draft onto it.
-        for _ in 0..6 {
-            cx.dispatch_action(SelectNextLine);
-        }
-        cx.update(|_window, app| {
-            let review = review_of(&view, app);
-            review.update(app, |review, cx| {
-                let diff = review.diff_view.clone();
-                diff.update(cx, |_diff, cx| {
-                    cx.emit(DiffViewEvent::DraftReanchored {
-                        stale: stale.clone(),
-                        row: 6,
-                    });
-                });
-            });
-        });
-
-        cx.update(|_window, app| {
-            let session = review_of(&view, app).read(app).session();
-            assert_eq!(session.drafts().stale_count(), 0, "no longer stale");
-            assert_eq!(
-                session.draft_at(0, 6).map(|draft| draft.body.clone()),
-                Some("written last week".to_owned()),
-            );
-            assert_eq!(session.drafts().len(), 1, "moved, not duplicated");
-        });
-
-        assert_eq!(
-            sink.calls(),
-            [
-                // The position it left, then the one it now occupies.
-                "discard src/review.rs 9999".to_owned(),
-                "save src/review.rs 6 written last week".to_owned(),
-            ],
+            cx.read(|app| with_session(&view, app, |session| session.drafts().len())),
+            1,
         );
     }
 
@@ -4464,7 +3151,7 @@ mod tests {
         // Navigating an empty file stays put rather than panicking on an index.
         cx.dispatch_action(SelectNextLine);
         cx.dispatch_action(SelectPreviousLine);
-        assert_eq!(cx.read(|app| view.read(app).selected_line()), 0);
+        assert_eq!(cx.read(|app| view.read(app).selected_line), 0);
 
         // And there is no row to comment on.
         cx.dispatch_action(ToggleComment);
@@ -4482,7 +3169,7 @@ mod tests {
         let mut file = DiffFile::demo(200);
         file.path = "src/review.rs".into();
         let head_sha: Arc<str> = "a".repeat(40).into();
-        let source = domain::SessionSource::LocalComparison {
+        let source = SessionSource::LocalComparison {
             repository_root: std::path::PathBuf::from("/tmp/repository"),
             base_sha: Arc::clone(&head_sha),
             diff_base_sha: Arc::clone(&head_sha),
@@ -4512,7 +3199,7 @@ mod tests {
         assert_eq!(session.comments().threads_at(0, 6).len(), 1);
         assert_eq!(session.comments().unplaced().len(), 1);
 
-        let (view, cx) = cx.add_window_view(|window, cx| ReviewView::new(session, window, cx));
+        let (view, cx) = ready_review(cx, session);
         cx.update(|window, app| {
             let focus = view.read(app).diff_view.read(app).focus_handle.clone();
             window.focus(&focus);
@@ -4526,20 +3213,10 @@ mod tests {
         cx.simulate_input("also check the edge case");
 
         assert_eq!(
-            cx.read(|app| view.read(app).diff_view.read(app).selected_line()),
+            cx.read(|app| view.read(app).diff_view.read(app).selected_line),
             6,
         );
-        assert_eq!(
-            cx.read(|app| view
-                .read(app)
-                .diff_view
-                .read(app)
-                .comment_editor
-                .read(app)
-                .content()
-                .to_owned()),
-            "also check the edge case",
-        );
+        assert_eq!(composed_text(&view, cx), "also check the edge case");
     }
 
     /// Switching files resets the composer, so file navigation must not fire
@@ -4551,9 +3228,8 @@ mod tests {
         first.path = "src/first.rs".into();
         let mut second = DiffFile::demo(30);
         second.path = "src/second.rs".into();
-        let session =
-            ReviewSession::new(domain::SessionSource::Demo, vec![first, second].into()).unwrap();
-        let (view, cx) = cx.add_window_view(|window, cx| ReviewView::new(session, window, cx));
+        let session = ReviewSession::new(SessionSource::Demo, vec![first, second].into()).unwrap();
+        let (view, cx) = ready_review(cx, session);
 
         cx.update(|window, app| {
             let focus = view.read(app).diff_view.read(app).focus_handle.clone();
@@ -4562,7 +3238,10 @@ mod tests {
         cx.dispatch_action(ToggleComment);
         cx.simulate_keystrokes("cmd-shift-j");
 
-        assert_eq!(cx.read(|app| view.read(app).selected_file_index()), 0);
+        assert_eq!(
+            cx.read(|app| with_session(&view, app, ReviewSession::selected_file_index)),
+            0,
+        );
         assert_eq!(
             cx.read(|app| view.read(app).diff_view.read(app).comment_rows.clone()),
             Some(0..=0),
@@ -4571,6 +3250,9 @@ mod tests {
         // Dismissing the composer hands file navigation back.
         cx.simulate_keystrokes("escape");
         cx.simulate_keystrokes("cmd-shift-j");
-        assert_eq!(cx.read(|app| view.read(app).selected_file_index()), 1);
+        assert_eq!(
+            cx.read(|app| with_session(&view, app, ReviewSession::selected_file_index)),
+            1,
+        );
     }
 }

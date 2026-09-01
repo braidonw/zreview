@@ -1,4 +1,4 @@
-use std::{env, path::Path, process::ExitCode};
+use std::{env, path::Path, process::ExitCode, sync::Arc};
 
 use github::PullRequestSelector;
 use gpui::{App, AppContext, Application, Bounds, WindowBounds, WindowOptions, px, size};
@@ -45,11 +45,13 @@ fn main() -> ExitCode {
             .expect("failed to open ZReview window");
 
         // Installed after the window exists, because running a review needs a
-        // handle to the window its progress is published into.
+        // handle to the window its progress is published into, and the model that
+        // progress lands in.
         window
             .update(cx, |view, _window, _cx| {
-                view.set_review_launcher(Box::new(move |review, session, cx| {
-                    review::spawn(window, review.clone(), session, cx);
+                let model = view.model();
+                view.set_review_launcher(Box::new(move |session, cx| {
+                    review::spawn(window, Arc::clone(&model), session, cx);
                 }));
             })
             .expect("the window was just opened");

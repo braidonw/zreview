@@ -3,19 +3,20 @@
 //! The same shape as [`crate::loading`], and for the same reason: a review is
 //! subprocess work that takes minutes, so it runs on the background executor while
 //! a foreground task publishes what it reports. The difference is that a review can
-//! be abandoned, so the cancellation flag is created here and handed to both sides —
-//! the view sets it, the backend polls it.
+//! be abandoned, so the cancellation flag is created here and handed to both sides.
+//! The reviewer sets it, the backend polls it.
 
 use std::{
     sync::{
-        Arc, Mutex, PoisonError,
+        Arc, Mutex,
         atomic::{AtomicBool, Ordering},
     },
     time::Duration,
 };
 
+use app::{Handoff, SessionModel, lock};
 use domain::{Findings, ReviewError, ReviewEventSink, ReviewProgress, ReviewSession};
-use gpui::{App, Entity, WindowHandle};
+use gpui::{App, WindowHandle};
 use review::{Agent, CodingAgent};
 use ui::SessionView;
 
@@ -25,14 +26,7 @@ use ui::SessionView;
 /// is about the delay before a line appears, not about how much is displayed.
 const POLL_INTERVAL: Duration = Duration::from_millis(100);
 
-/// What the background review hands to the foreground task.
-#[derive(Default)]
-struct Handoff {
-    detail: Option<String>,
-    result: Option<Result<Outcome, ReviewError>>,
-}
-
-/// A finished run, in the shape the view needs.
+/// A finished run, in the shape the model needs.
 struct Outcome {
     findings: Findings,
     /// Files the review did not see, so a partial review cannot present itself as
@@ -42,13 +36,13 @@ struct Outcome {
 
 /// Publishes progress into the handoff and reports cancellation back out.
 struct Channel {
-    handoff: Arc<Mutex<Handoff>>,
+    handoff: Arc<Handoff<String, Result<Outcome, ReviewError>>>,
     cancel: Arc<AtomicBool>,
 }
 
 impl ReviewEventSink for Channel {
     fn progress(&self, progress: ReviewProgress) {
-        lock(&self.handoff).detail = Some(progress.to_string());
+        self.handoff.publish(progress.to_string());
     }
 
     fn is_cancelled(&self) -> bool {
@@ -56,32 +50,35 @@ impl ReviewEventSink for Channel {
     }
 }
 
-/// Runs a review of `session` in the background and publishes it into `window`.
+/// Runs a review of `session` in the background and publishes it into `model`.
 ///
-/// The session is cloned rather than borrowed: the background thread must not hold
+/// The session is cloned rather than borrowed. The background thread must not hold
 /// anything the UI thread is also mutating, and a snapshot's files are behind `Arc`
 /// so the copy is cheap.
+///
+/// The model is passed in rather than reached through `window`, because this is
+/// called from inside an update of the window's root view. Going back in through
+/// the handle would be a second update of the same view, which panics. Only the
+/// polling task below, which runs on its own, may use the handle.
 pub fn spawn(
     window: WindowHandle<SessionView>,
-    review_view: Entity<ui::ReviewView>,
+    model: Arc<Mutex<SessionModel>>,
     session: ReviewSession,
     cx: &mut App,
 ) {
-    let handoff = Arc::new(Mutex::new(Handoff::default()));
+    let handoff = Handoff::new();
     let cancel = Arc::new(AtomicBool::new(false));
 
     // Told before the work starts, so the panel shows a running review immediately
-    // rather than after the first progress report.
-    review_view.update(cx, |review, cx| {
-        review.review_started(Arc::clone(&cancel), cx);
-    });
+    // rather than after the first progress report. Whoever asked for the review
+    // repaints once this returns.
+    lock(&model).review_started(Arc::clone(&cancel));
 
     let backend = CodingAgent::new(Agent::ClaudeCode, repository_root(&session));
 
     cx.background_executor()
         .spawn({
             let handoff = Arc::clone(&handoff);
-            let cancel = Arc::clone(&cancel);
             async move {
                 let events = Channel {
                     handoff: Arc::clone(&handoff),
@@ -91,7 +88,7 @@ pub fn spawn(
                     findings: run.findings,
                     unreviewed: run.excluded.into_iter().chain(run.omitted).collect(),
                 });
-                lock(&handoff).result = Some(result);
+                handoff.finish(result);
             }
         })
         .detach();
@@ -100,28 +97,31 @@ pub fn spawn(
         loop {
             cx.background_executor().timer(POLL_INTERVAL).await;
 
-            let (detail, result) = {
-                let mut state = lock(&handoff);
-                (state.detail.take(), state.result.take())
-            };
+            let (detail, result) = handoff.poll();
 
-            let published = window.update(cx, |_, _window, cx| {
-                review_view.update(cx, |review, cx| {
-                    if let Some(detail) = detail {
-                        review.review_progress(detail, cx);
-                    }
-                    match result {
+            let published = window.update(cx, |_view, _window, cx| {
+                let (finished, moved) = {
+                    let mut model = lock(&model);
+                    let moved = detail.is_some_and(|detail| model.review_progress(detail));
+                    let finished = match result {
                         None => false,
                         Some(Ok(outcome)) => {
-                            review.review_finished(outcome.findings, outcome.unreviewed, cx);
+                            model.review_finished(outcome.findings, outcome.unreviewed);
                             true
                         }
                         Some(Err(error)) => {
-                            review.review_failed(error.to_string(), error.remediation(), cx);
+                            model.review_failed(error.to_string(), error.remediation());
                             true
                         }
-                    }
-                })
+                    };
+                    (finished, moved)
+                };
+                // Polled ten times a second, so a repaint has to be earned: a
+                // progress line that has not moved is not worth a frame.
+                if finished || moved {
+                    cx.notify();
+                }
+                finished
             });
 
             // The window closing ends the run's reporting; the background task
@@ -149,8 +149,4 @@ fn repository_root(session: &ReviewSession) -> std::path::PathBuf {
         } => repository_root.clone(),
         domain::SessionSource::Demo => std::path::PathBuf::from("."),
     }
-}
-
-fn lock(handoff: &Arc<Mutex<Handoff>>) -> std::sync::MutexGuard<'_, Handoff> {
-    handoff.lock().unwrap_or_else(PoisonError::into_inner)
 }

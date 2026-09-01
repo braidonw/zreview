@@ -76,6 +76,13 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "330a5ed07fa54e4702c9d6c4174f74427fc0ef6e214bbd677ae50a5099946470"
 
 [[package]]
+name = "app"
+version = "0.1.0"
+dependencies = [
+ "domain",
+]
+
+[[package]]
 name = "ar_archive_writer"
 version = "0.5.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5841,6 +5848,7 @@ dependencies = [
 name = "ui"
 version = "0.1.0"
 dependencies = [
+ "app",
  "domain",
  "gpui",
  "unicode-segmentation",
@@ -7290,6 +7298,7 @@ checksum = "29666d0abbfad1e3dc4dcf6144730dd3a3ab225bbbdac83319345b1b44ccfc1b"
 name = "zreview"
 version = "0.1.0"
 dependencies = [
+ "app",
  "domain",
  "github",
  "gpui",

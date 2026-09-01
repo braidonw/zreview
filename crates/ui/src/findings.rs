@@ -1,9 +1,9 @@
 //! Showing what a review engine proposed, so a reviewer can act on it.
 //!
 //! PLAN section 8's last stage: findings are presented for acceptance, editing, or
-//! dismissal. Nothing here decides anything — every button hands back to
-//! [`ReviewView`], which owns the session, and a finding only becomes a comment
-//! because the reviewer said so.
+//! dismissal. Nothing here decides anything. Every button hands back to
+//! [`ReviewView`], which passes it to the model that owns the session, and a
+//! finding only becomes a comment because the reviewer said so.
 //!
 //! Two things this panel is careful to show rather than hide:
 //!
@@ -15,57 +15,12 @@
 //!
 //! [`ReviewView`]: crate::ReviewView
 
-use std::sync::{Arc, atomic::AtomicBool};
-
+use app::ReviewRunState;
 use domain::{Finding, FindingId, ReviewSession, Severity};
 use gpui::{AnyElement, Div, Entity, MouseButton, SharedString, div, prelude::*, px, rgb};
 
-use crate::{ReviewView, ReviewViewEvent};
-
-/// How far a review run has got.
-#[derive(Clone, Debug, Default)]
-pub enum ReviewRunState {
-    /// No review has been asked for, or the last one has been dealt with.
-    #[default]
-    Idle,
-    Running {
-        /// The backend's most recent progress line.
-        detail: SharedString,
-        /// Set to stop the run. Shared with the background thread, which polls it
-        /// between steps, so cancelling costs nothing until the backend next looks.
-        cancel: Arc<AtomicBool>,
-    },
-    /// The run finished. Counts are kept so the panel can report the shape of the
-    /// outcome even when nothing was accepted.
-    Complete {
-        accepted: usize,
-        rejected: usize,
-        /// Claims suppressed because the reviewer dismissed them before.
-        suppressed: usize,
-        /// Files the review did not see.
-        unreviewed: Vec<SharedString>,
-    },
-    Failed {
-        summary: SharedString,
-        remediation: Option<SharedString>,
-    },
-}
-
-impl ReviewRunState {
-    #[must_use]
-    pub const fn is_running(&self) -> bool {
-        matches!(self, Self::Running { .. })
-    }
-
-    /// Asks a running review to stop.
-    pub fn cancel(&self) {
-        if let Self::Running { cancel, .. } = self {
-            cancel.store(true, std::sync::atomic::Ordering::Relaxed);
-        }
-    }
-}
-
 use crate::theme;
+use crate::{ReviewView, ReviewViewEvent};
 
 const PANEL_BACKGROUND: u32 = theme::surface::BASE;
 const BORDER: u32 = theme::border::DEFAULT;
@@ -84,28 +39,12 @@ const fn severity_colour(severity: Severity) -> u32 {
     }
 }
 
-/// Whether the panel has anything worth the screen space.
-///
-/// Shown whenever a review is possible at all, which means whenever the snapshot
-/// has anchors to validate findings against. An earlier version required guidance
-/// or findings to exist first, which hid the panel — and with it the only Review
-/// button — on any repository that happens to carry no `AGENTS.md`. The feature
-/// was invisible exactly where a reviewer had no other way to discover it.
-///
-/// The generated fixture has no commit, so it cannot be reviewed and gets nothing.
-#[must_use]
-pub fn is_visible(session: &ReviewSession, run: &ReviewRunState) -> bool {
-    session.anchors().is_some()
-        || !matches!(run, ReviewRunState::Idle)
-        || !session.findings().is_empty()
-}
-
 /// The guidance section: what this review would be held to, and what of it will be
 /// sent.
 ///
 /// PLAN section 8 requires this before a run, and requires that the reviewer can
 /// turn any of it off without editing configuration. Collapsed once a run has
-/// happened, because by then the findings are what they came for — but the summary
+/// happened, because by then the findings are what they came for. The summary
 /// line stays, so what was sent is never off screen entirely.
 fn render_guidance(session: &ReviewSession, expanded: bool, view: &Entity<ReviewView>) -> Div {
     let guidance = session.guidance();
@@ -121,7 +60,7 @@ fn render_guidance(session: &ReviewSession, expanded: bool, view: &Entity<Review
             .border_color(rgb(BORDER))
             .text_xs()
             .text_color(rgb(MUTED))
-            .child("No guidance files found — the review will judge the diff alone.");
+            .child("No guidance files found. The review will judge the diff alone.");
     }
     let count = guidance.included_count();
     let kilobytes = guidance.included_bytes() / 1024;
@@ -332,10 +271,15 @@ fn render_header(session: &ReviewSession, run: &ReviewRunState, view: &Entity<Re
                 .child(render_run_button(run, view)),
         )
         .children(match run {
-            ReviewRunState::Running { detail, .. } => {
-                Some(div().text_xs().text_color(rgb(MUTED)).child(detail.clone()))
-            }
-            _ => None,
+            ReviewRunState::Running { detail, .. } => Some(
+                div()
+                    .text_xs()
+                    .text_color(rgb(MUTED))
+                    .child(SharedString::from(detail.clone())),
+            ),
+            ReviewRunState::Idle
+            | ReviewRunState::Complete { .. }
+            | ReviewRunState::Failed { .. } => None,
         })
 }
 
@@ -511,7 +455,7 @@ fn render_empty_note(session: &ReviewSession, run: &ReviewRunState) -> Option<Di
             "No review has been run.".into(),
             Some("Press Review to check this change against the repository's guidance.".into()),
         ),
-        ReviewRunState::Running { .. } => ("Reviewing…".into(), None),
+        ReviewRunState::Running { .. } => ("Reviewing...".into(), None),
         ReviewRunState::Complete {
             rejected,
             suppressed,
@@ -539,7 +483,10 @@ fn render_empty_note(session: &ReviewSession, run: &ReviewRunState) -> Option<Di
         ReviewRunState::Failed {
             summary,
             remediation,
-        } => (summary.clone(), remediation.clone()),
+        } => (
+            SharedString::from(summary.clone()),
+            remediation.clone().map(SharedString::from),
+        ),
     };
 
     Some(

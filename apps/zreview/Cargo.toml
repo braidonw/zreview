@@ -8,6 +8,7 @@ repository.workspace = true
 publish = false
 
 [dependencies]
+app.workspace = true
 domain.workspace = true
 github.workspace = true
 gpui.workspace = true

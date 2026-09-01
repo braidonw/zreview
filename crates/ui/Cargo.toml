@@ -10,6 +10,7 @@ repository.workspace = true
 publish = false
 
 [dependencies]
+app.workspace = true
 domain.workspace = true
 gpui.workspace = true
 # Grapheme boundaries, so a caret cannot land inside an emoji and deleting one
