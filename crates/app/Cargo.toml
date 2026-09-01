@@ -1,0 +1,15 @@
+[package]
+name = "app"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+# Internal to the application; not reserved on crates.io and nothing outside this workspace depends on it.
+publish = false
+
+[dependencies]
+domain.workspace = true
+
+[lints]
+workspace = true

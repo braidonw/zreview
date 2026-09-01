@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "apps/zreview",
+    "crates/app",
     "crates/domain",
     "crates/git",
     "crates/github",
@@ -18,6 +19,7 @@ license = "MIT OR Apache-2.0"
 repository = "https://github.com/braidon/zreview"
 
 [workspace.dependencies]
+app = { path = "crates/app" }
 domain = { path = "crates/domain" }
 git = { path = "crates/git" }
 github = { path = "crates/github" }
