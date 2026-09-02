@@ -7,6 +7,7 @@
 //! a second time.
 
 use std::{
+    collections::HashSet,
     io::Read,
     process::{Command, Output, Stdio},
     sync::Arc,
@@ -66,7 +67,7 @@ pub struct HomeRepository {
 }
 
 /// Which of the two searches returned a row.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum HomeSearch {
     ReviewRequested,
     Authored,
@@ -184,12 +185,9 @@ impl GithubClient {
             if fetched.rate_limit.is_some() {
                 fetch.rate_limit = fetched.rate_limit;
             }
-            for (repository, rows) in batch.iter().zip(fetched.pull_requests) {
-                fetch.repositories.push(HomeRepository {
-                    repository: repository.clone(),
-                    pull_requests: rows.map(strip_cursors),
-                });
-            }
+            fetch
+                .repositories
+                .extend(into_repositories(batch, fetched.pull_requests));
         }
 
         fetch
@@ -257,7 +255,8 @@ impl GithubClient {
         collected: &mut Collected,
     ) -> Result<(), GithubError> {
         let mut cursor = first_cursor;
-        for _ in 0..MAX_SEARCH_PAGES {
+        // The caller collected the first page, so this loop covers the rest.
+        for _ in 1..MAX_SEARCH_PAGES {
             let payload = self.graphql(
                 &[
                     ("query", &search.page_document()),
@@ -320,7 +319,8 @@ impl GithubClient {
     ) -> Result<Vec<ReviewThread>, GithubError> {
         let mut threads = Vec::new();
         let mut cursor = first_cursor;
-        for _ in 0..MAX_THREAD_PAGES {
+        // The list query returned the first page, so this loop covers the rest.
+        for _ in 1..MAX_THREAD_PAGES {
             let payload = self.graphql(
                 &[
                     ("query", THREADS_DOCUMENT),
@@ -330,7 +330,12 @@ impl GithubClient {
                 ],
                 &[("number", number)],
             )?;
-            let page = payload
+            // An error here means threads are missing, and there is no way to
+            // tell which, so it is reported rather than read past.
+            if let Some(error) = payload.errors.first() {
+                return Err(error.classify(payload.status));
+            }
+            let answered = payload
                 .data
                 .repository
                 .and_then(|holder| holder.pull_request)
@@ -339,9 +344,15 @@ impl GithubClient {
                         "GitHub returned no pull request {}#{number}",
                         repository.full_name()
                     ),
-                })?
-                .review_threads;
-            let next = page.page_info.next_cursor();
+                })?;
+            if answered.number != number {
+                return Err(GithubError::UnexpectedPullRequest {
+                    expected: number,
+                    actual: answered.number,
+                });
+            }
+            let page = answered.review_threads;
+            let next = page.page_info.next_cursor()?;
             threads.extend(page.nodes.into_iter().map(ReviewThread::from));
             match next {
                 Some(following) => cursor = following,
@@ -418,10 +429,12 @@ impl GithubClient {
         loop {
             match child.try_wait() {
                 Ok(Some(status)) => {
+                    // A process gh started can outlive it holding these pipes, so
+                    // reading them is bounded by the same deadline as the wait.
                     return Ok(Output {
                         status,
-                        stdout: stdout.collect()?,
-                        stderr: stderr.collect()?,
+                        stdout: stdout.collect(deadline, self.graphql_timeout)?,
+                        stderr: stderr.collect(deadline, self.graphql_timeout)?,
                     });
                 }
                 Ok(None) => {}
@@ -480,7 +493,6 @@ impl Collected {
             status,
         } = payload;
         self.status = status;
-        self.errors.extend(errors);
         if let Some(viewer) = data.viewer {
             self.viewer_login = Some(viewer.login);
         }
@@ -488,10 +500,12 @@ impl Collected {
             self.rate_limit = data.rate_limit;
         }
 
-        Ok(Cursors {
-            to_review: self.absorb_search(HomeSearch::ReviewRequested, data.to_review)?,
-            authored: self.absorb_search(HomeSearch::Authored, data.authored)?,
-        })
+        let cursors = Cursors {
+            to_review: self.absorb_search(HomeSearch::ReviewRequested, data.to_review, &errors)?,
+            authored: self.absorb_search(HomeSearch::Authored, data.authored, &errors)?,
+        };
+        self.errors.extend(errors);
+        Ok(cursors)
     }
 
     fn absorb_page(
@@ -505,7 +519,6 @@ impl Collected {
             status,
         } = payload;
         self.status = status;
-        self.errors.extend(errors);
         if data.rate_limit.is_some() {
             self.rate_limit = data.rate_limit;
         }
@@ -514,29 +527,35 @@ impl Collected {
             HomeSearch::ReviewRequested => data.to_review,
             HomeSearch::Authored => data.authored,
         };
-        self.absorb_search(search, page)
+        let next = self.absorb_search(search, page, &errors)?;
+        self.errors.extend(errors);
+        Ok(next)
     }
 
     /// Reads one search alias, keeping its rows and counting the nodes GitHub
     /// could not show.
+    ///
+    /// `errors` are the ones this payload carried, which are what explain a
+    /// missing alias. Errors accumulated earlier in the batch explain their own
+    /// pages, not this one.
     fn absorb_search(
         &mut self,
         search: HomeSearch,
         page: Option<GraphSearch>,
+        errors: &[GraphError],
     ) -> Result<Option<String>, GithubError> {
         let Some(page) = page else {
             // The whole alias is missing, so no repository in this batch has an
             // answer and there is nothing honest to attribute.
-            return Err(self.errors.first().map_or_else(
-                || GithubError::Command {
-                    status: self.status,
-                    stderr: format!("GitHub returned no {} results", search.query_variable()),
+            return Err(errors.first().map_or_else(
+                || GithubError::InvalidGraphResponse {
+                    detail: format!("no {} results were returned", search.query_variable()),
                 },
                 |error| error.classify(self.status),
             ));
         };
 
-        let next = page.page_info.next_cursor();
+        let next = page.page_info.next_cursor()?;
         for node in page.nodes {
             match node {
                 Some(node) => self.rows.push(CollectedRow::build(search, node)?),
@@ -548,12 +567,17 @@ impl Collected {
 
     /// Splits the batch's rows and errors across the repositories that asked for
     /// them.
+    ///
+    /// Rows are placed first, because everything that can go wrong here is about
+    /// something missing. A refusal naming only an organisation, and a row that
+    /// turns up under a slug nobody asked for, are both about the entries that
+    /// came back with nothing, so a repository that answered is never emptied on
+    /// their account.
     fn distribute(self, batch: &[RepositorySlug]) -> Result<Batch, GithubError> {
         if self.null_nodes > 0 && self.errors.is_empty() {
-            return Err(GithubError::Command {
-                status: self.status,
-                stderr: format!(
-                    "GitHub hid {} search results without saying why",
+            return Err(GithubError::InvalidGraphResponse {
+                detail: format!(
+                    "{} search results were hidden with no error",
                     self.null_nodes
                 ),
             });
@@ -563,36 +587,32 @@ impl Collected {
             .iter()
             .map(|repository| repository.full_name().to_lowercase())
             .collect::<Vec<_>>();
-
-        // Rows are placed first, because an error that names only an
-        // organisation is about the repositories of it that came back empty.
         let mut collected = batch.iter().map(|_| Vec::new()).collect::<Vec<_>>();
-        for row in self.rows {
+        let mut unexpected = Vec::new();
+        for row in deduplicated(self.rows) {
             let key = row.row.repository.full_name().to_lowercase();
-            let Some(index) = keys.iter().position(|candidate| *candidate == key) else {
-                return Err(GithubError::UnexpectedRepository {
-                    expected: batch
-                        .iter()
-                        .map(RepositorySlug::full_name)
-                        .collect::<Vec<_>>()
-                        .join(", "),
-                    actual: row.row.repository.full_name(),
-                });
-            };
-            collected[index].push(row);
+            match keys.iter().position(|candidate| *candidate == key) {
+                Some(index) => collected[index].push(row),
+                None => unexpected.push(row.row.repository.full_name()),
+            }
         }
 
         let empty = collected.iter().map(Vec::is_empty).collect::<Vec<_>>();
         let mut pull_requests = collected.into_iter().map(Ok).collect::<Vec<_>>();
         for error in &self.errors {
             let named = error.matching_indices(batch, &keys, &empty);
-            if named.is_empty() {
-                return Err(error.classify(self.status));
-            }
-            let shared = Arc::new(error.classify(self.status));
-            for index in named {
-                pull_requests[index] = Err(Arc::clone(&shared));
-            }
+            blame(&mut pull_requests, named, error.classify(self.status))?;
+        }
+        if !unexpected.is_empty() {
+            let error = GithubError::UnexpectedRepository {
+                expected: batch
+                    .iter()
+                    .map(RepositorySlug::full_name)
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                actual: unexpected.join(", "),
+            };
+            blame(&mut pull_requests, empty_indices(&empty), error)?;
         }
 
         Ok(Batch {
@@ -601,6 +621,52 @@ impl Collected {
             pull_requests,
         })
     }
+}
+
+/// Fails the repositories a problem is about.
+///
+/// A problem about nothing anyone asked for leaves every row in doubt, so it is
+/// reported for the whole batch rather than quietly set aside.
+fn blame(
+    pull_requests: &mut [Result<Vec<CollectedRow>, Arc<GithubError>>],
+    named: Vec<usize>,
+    error: GithubError,
+) -> Result<(), GithubError> {
+    if named.is_empty() {
+        return Err(error);
+    }
+    let shared = Arc::new(error);
+    for index in named {
+        pull_requests[index] = Err(Arc::clone(&shared));
+    }
+    Ok(())
+}
+
+fn empty_indices(empty: &[bool]) -> Vec<usize> {
+    empty
+        .iter()
+        .enumerate()
+        .filter(|(_, empty)| **empty)
+        .map(|(index, _)| index)
+        .collect()
+}
+
+/// Drops the rows a later page repeated.
+///
+/// Paging is not one snapshot, so a pull request updated between two calls can
+/// be served on both pages. The first copy is kept, because it is the one whose
+/// page the cursor came from.
+fn deduplicated(rows: Vec<CollectedRow>) -> Vec<CollectedRow> {
+    let mut seen = HashSet::new();
+    rows.into_iter()
+        .filter(|row| {
+            seen.insert((
+                row.row.search,
+                row.row.repository.full_name().to_lowercase(),
+                row.row.number,
+            ))
+        })
+        .collect()
 }
 
 impl CollectedRow {
@@ -612,9 +678,10 @@ impl CollectedRow {
             }
         })?;
         let threads = node.review_threads;
-        let threads_after = threads
-            .as_ref()
-            .and_then(|threads| threads.page_info.next_cursor());
+        let threads_after = match threads.as_ref() {
+            Some(threads) => threads.page_info.next_cursor()?,
+            None => None,
+        };
 
         Ok(Self {
             threads_after,
@@ -701,6 +768,26 @@ impl From<GraphThread> for ReviewThread {
     }
 }
 
+/// Pairs a batch's repositories with what came back for them.
+fn into_repositories(
+    batch: &[RepositorySlug],
+    fetched: Vec<Result<Vec<CollectedRow>, Arc<GithubError>>>,
+) -> Vec<HomeRepository> {
+    assert_eq!(
+        batch.len(),
+        fetched.len(),
+        "a batch answers for exactly the repositories it was given",
+    );
+    batch
+        .iter()
+        .zip(fetched)
+        .map(|(repository, rows)| HomeRepository {
+            repository: repository.clone(),
+            pull_requests: rows.map(strip_cursors),
+        })
+        .collect()
+}
+
 fn strip_cursors(rows: Vec<CollectedRow>) -> Vec<HomePullRequest> {
     rows.into_iter().map(|row| row.row).collect()
 }
@@ -750,26 +837,53 @@ fn spawn_error(source: std::io::Error) -> GithubError {
 }
 
 /// A pipe being read to its end on its own thread.
-struct Drain(std::thread::JoinHandle<std::io::Result<Vec<u8>>>);
+///
+/// The result arrives over a channel rather than through a join, so waiting for
+/// it can be given up on. A process `gh` started can hold the pipe open after
+/// `gh` itself has exited, and a refresh must not wait on it forever.
+struct Drain(std::sync::mpsc::Receiver<Result<Vec<u8>, GithubError>>);
 
 fn drain(pipe: Option<impl Read + Send + 'static>) -> Drain {
-    Drain(std::thread::spawn(move || {
-        let mut buffer = Vec::new();
-        if let Some(mut pipe) = pipe {
-            pipe.read_to_end(&mut buffer)?;
-        }
-        Ok(buffer)
-    }))
+    let (sender, receiver) = std::sync::mpsc::channel();
+    std::thread::spawn(move || sender.send(read_bounded(pipe)));
+    Drain(receiver)
 }
 
 impl Drain {
-    fn collect(self) -> Result<Vec<u8>, GithubError> {
-        match self.0.join() {
-            Ok(read) => read.map_err(spawn_error),
-            Err(panic) => std::panic::resume_unwind(panic),
+    fn collect(self, deadline: Instant, timeout: Duration) -> Result<Vec<u8>, GithubError> {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        match self.0.recv_timeout(remaining) {
+            Ok(read) => read,
+            // The reader is left detached, as the kill path leaves it.
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Err(GithubError::Timeout {
+                timeout_ms: timeout_ms(timeout),
+            }),
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => Err(GithubError::Spawn {
+                source: std::io::Error::other("the reader for gh output stopped"),
+            }),
         }
     }
 }
+
+/// Reads a pipe to its end, refusing a body past [`MAX_RESPONSE_BYTES`].
+fn read_bounded(pipe: Option<impl Read>) -> Result<Vec<u8>, GithubError> {
+    let mut buffer = Vec::new();
+    if let Some(pipe) = pipe {
+        pipe.take(MAX_RESPONSE_BYTES as u64 + 1)
+            .read_to_end(&mut buffer)
+            .map_err(spawn_error)?;
+    }
+    if buffer.len() > MAX_RESPONSE_BYTES {
+        return Err(GithubError::InvalidGraphResponse {
+            detail: format!("gh returned more than {MAX_RESPONSE_BYTES} bytes"),
+        });
+    }
+    Ok(buffer)
+}
+
+/// One batch's rows and their reviews run to a few hundred kilobytes, so a body
+/// approaching this is a runaway rather than a long list.
+const MAX_RESPONSE_BYTES: usize = 32 * 1024 * 1024;
 
 /// Whether `text` names this exact repository rather than a longer slug that
 /// merely starts with it.
@@ -845,6 +959,7 @@ const THREADS_DOCUMENT: &str = r"query($owner: String!, $name: String!, $number:
   rateLimit { cost remaining resetAt }
   repository(owner: $owner, name: $name) {
     pullRequest(number: $number) {
+      number
       reviewThreads(first: 50, after: $after) {
         pageInfo { hasNextPage endCursor }
         nodes { isResolved comments(last: 1) { nodes { author { login } } } }
@@ -983,13 +1098,20 @@ struct GraphPageInfo {
 }
 
 impl GraphPageInfo {
-    /// GitHub only omits the cursor on an empty connection, which never has a
-    /// next page, so there is no case where paging stops early.
-    fn next_cursor(&self) -> Option<String> {
-        if self.has_next_page {
-            self.end_cursor.clone()
-        } else {
-            None
+    /// Where the next page starts, if there is one.
+    ///
+    /// GitHub omits the cursor only on a connection with no next page, so the
+    /// two together mean the rest of the list cannot be reached. Reading that as
+    /// the end would drop rows without saying so.
+    fn next_cursor(&self) -> Result<Option<String>, GithubError> {
+        if !self.has_next_page {
+            return Ok(None);
+        }
+        match self.end_cursor.as_deref() {
+            Some(cursor) if !cursor.is_empty() => Ok(Some(cursor.to_owned())),
+            Some(_) | None => Err(GithubError::InvalidGraphResponse {
+                detail: "a page claims a successor but carries no cursor to it".to_owned(),
+            }),
         }
     }
 }
@@ -1085,6 +1207,7 @@ struct GraphThreadRepository {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct GraphThreadedPullRequest {
+    number: u64,
     review_threads: GraphThreadConnection,
 }
 
@@ -1304,6 +1427,120 @@ mod tests {
         );
     }
 
+    /// A repository renamed on GitHub answers under its new slug, so the entry
+    /// naming the old one gets nothing. That is the same shape as an
+    /// organisation refusal, and it gets the same answer.
+    #[test]
+    fn a_renamed_repository_fails_only_the_entries_that_got_nothing() {
+        let fake = FakeGh::new();
+        fake.respond(&response(&[
+            alias(
+                "toReview",
+                &[
+                    requested_node("acme/gizmos", 42),
+                    requested_node("acme/gadgets", 7),
+                ],
+                None,
+            ),
+            alias("authored", &[], None),
+        ]));
+
+        let fetch = GithubClient::new(fake.path()).fetch_home_pull_requests(&[
+            RepositorySlug::new("acme", "widgets"),
+            RepositorySlug::new("acme", "gadgets"),
+        ]);
+
+        assert_eq!(
+            rows(&fetch, "acme/gadgets").len(),
+            1,
+            "a repository that answered is untouched",
+        );
+        let error = fetch.repositories[0].pull_requests.as_ref().unwrap_err();
+        assert!(
+            matches!(&**error, GithubError::UnexpectedRepository { actual, .. }
+                if actual.contains("acme/gizmos")),
+            "the error should name the slug that turned up: {error}",
+        );
+    }
+
+    /// A credential helper that outlives `gh` keeps the pipe open, and waiting on
+    /// it forever would hang the refresh with nothing to show for it.
+    #[test]
+    fn a_grandchild_holding_the_pipe_open_cannot_hang_the_call() {
+        let fake = FakeGh::new();
+        fake.respond_holding_pipe(EMPTY_RESPONSE, 10);
+
+        let started = Instant::now();
+        let fetch = GithubClient::new(fake.path())
+            .with_graphql_timeout(Duration::from_millis(200))
+            .fetch_home_pull_requests(&[RepositorySlug::new("acme", "widgets")]);
+        let elapsed = started.elapsed();
+
+        let error = fetch.repositories[0].pull_requests.as_ref().unwrap_err();
+        assert!(
+            matches!(&**error, GithubError::Timeout { .. }),
+            "unexpected error: {error}",
+        );
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "the read waited on the grandchild, after {elapsed:?}",
+        );
+    }
+
+    /// GitHub only omits a cursor on a connection with no next page, so the two
+    /// together mean the rest of the list cannot be reached.
+    #[test]
+    fn a_next_page_with_no_cursor_is_reported_rather_than_truncating() {
+        for cursor in ["null", "\"\""] {
+            let fake = FakeGh::new();
+            fake.respond(&response(&[
+                uncursored_alias("toReview", cursor),
+                alias("authored", &[], None),
+            ]));
+
+            let fetch = GithubClient::new(fake.path())
+                .fetch_home_pull_requests(&[RepositorySlug::new("acme", "widgets")]);
+
+            let error = fetch.repositories[0].pull_requests.as_ref().unwrap_err();
+            assert!(
+                matches!(&**error, GithubError::InvalidGraphResponse { .. }),
+                "endCursor {cursor} was accepted as the end of the list: {error}",
+            );
+        }
+    }
+
+    /// Paging is not one snapshot, so a pull request updated between two calls
+    /// can be served on both pages.
+    #[test]
+    fn a_row_served_on_two_pages_is_kept_once() {
+        let fake = FakeGh::new();
+        fake.respond(&response(&[
+            alias(
+                "toReview",
+                &[requested_node("acme/widgets", 1)],
+                Some("PAGE-2"),
+            ),
+            alias("authored", &[], None),
+        ]))
+        .respond(&response(&[alias(
+            "toReview",
+            &[
+                requested_node("acme/widgets", 1),
+                requested_node("acme/widgets", 2),
+            ],
+            None,
+        )]));
+
+        let fetch = GithubClient::new(fake.path())
+            .fetch_home_pull_requests(&[RepositorySlug::new("acme", "widgets")]);
+
+        let numbers = rows(&fetch, "acme/widgets")
+            .iter()
+            .map(|row| row.number)
+            .collect::<Vec<_>>();
+        assert_eq!(numbers, [1, 2], "the repeated row is kept once");
+    }
+
     /// An error nobody in the batch is named by leaves every row in doubt, so it
     /// is reported rather than quietly dropping whatever did not arrive.
     #[test]
@@ -1399,10 +1636,11 @@ mod tests {
             ),
         ]))
         .respond(&threads_response(
+            91,
             &[thread(false, "maintainer")],
             Some("T-3"),
         ))
-        .respond(&threads_response(&[thread(true, "reviewer")], None));
+        .respond(&threads_response(91, &[thread(true, "reviewer")], None));
 
         let fetch = GithubClient::new(fake.path())
             .fetch_home_pull_requests(&[RepositorySlug::new("acme", "widgets")]);
@@ -1597,7 +1835,7 @@ mod tests {
             alias("toReview", &[], Some("PAGE")),
             alias("authored", &[], None),
         ]));
-        for _ in 0..MAX_SEARCH_PAGES {
+        for _ in 1..MAX_SEARCH_PAGES {
             fake.respond(&response(&[alias("toReview", &[], Some("PAGE"))]));
         }
 
@@ -1606,8 +1844,8 @@ mod tests {
 
         assert_eq!(
             fake.calls(),
-            MAX_SEARCH_PAGES + 1,
-            "the ceiling is honoured"
+            MAX_SEARCH_PAGES,
+            "the ceiling counts the page the batch query already returned",
         );
         let error = fetch.repositories[0].pull_requests.as_ref().unwrap_err();
         assert!(
@@ -1790,11 +2028,11 @@ mod tests {
         )
     }
 
-    fn threads_response(threads: &[String], next: Option<&str>) -> String {
+    fn threads_response(number: u64, threads: &[String], next: Option<&str>) -> String {
         format!(
             r#"{{"data": {{
               "rateLimit": {{"cost": 1, "remaining": 4993, "resetAt": "2026-09-02T13:00:00Z"}},
-              "repository": {{"pullRequest": {{"reviewThreads": {{
+              "repository": {{"pullRequest": {{"number": {number}, "reviewThreads": {{
                 "pageInfo": {{"hasNextPage": {has_next}, "endCursor": {cursor}}},
                 "nodes": [{nodes}]
               }}}}}}
@@ -1821,6 +2059,16 @@ mod tests {
               "type": "FORBIDDEN",
               "path": ["toReview", "nodes", 0],
               "message": "{message}"
+            }}"#
+        )
+    }
+
+    /// A page that claims more results but hands over no cursor to reach them.
+    fn uncursored_alias(name: &str, cursor: &str) -> String {
+        format!(
+            r#""{name}": {{
+              "pageInfo": {{"hasNextPage": true, "endCursor": {cursor}}},
+              "nodes": []
             }}"#
         )
     }
@@ -1866,6 +2114,7 @@ printf '%s<<ARG>>' "$@" > "$dir/args-$call"
 printf '%s' "$GH_PROMPT_DISABLED" > "$dir/prompt-$call"
 if [ -t 0 ]; then printf 'tty' > "$dir/stdin-$call"; else cat > "$dir/stdin-$call"; fi
 if [ -f "$dir/sleep-$call" ]; then sleep "$(cat "$dir/sleep-$call")"; fi
+if [ -f "$dir/hold-$call" ]; then sleep "$(cat "$dir/hold-$call")" & fi
 if [ ! -f "$dir/response-$call" ] && [ ! -f "$dir/stderr-$call" ]; then
   echo "no recorded response for call $call" >&2
   exit 64
@@ -1913,6 +2162,15 @@ exit 0
             let call = self.queue();
             self.write(&format!("stderr-{call}"), stderr);
             self.write(&format!("status-{call}"), "1");
+            self
+        }
+
+        /// Queues a call that answers and exits, leaving a background process
+        /// holding stdout open the way a credential helper does.
+        fn respond_holding_pipe(&self, body: &str, seconds: u32) -> &Self {
+            let call = self.queue();
+            self.write(&format!("response-{call}"), body);
+            self.write(&format!("hold-{call}"), &seconds.to_string());
             self
         }
 

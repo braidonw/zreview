@@ -133,6 +133,11 @@ pub enum GithubError {
     #[error("GitHub returned invalid pull request JSON: {0}")]
     InvalidResponse(#[from] serde_json::Error),
 
+    /// A GraphQL response that parsed but cannot be trusted, such as a page that
+    /// claims a successor it gives no cursor for.
+    #[error("GitHub returned an unusable response: {detail}")]
+    InvalidGraphResponse { detail: String },
+
     #[error("GitHub review comment {id} is unusable: {message}")]
     InvalidComment { id: u64, message: String },
 
@@ -189,6 +194,7 @@ impl GithubError {
             ),
             Self::Command { .. }
             | Self::Execute { .. }
+            | Self::InvalidGraphResponse { .. }
             | Self::PagingLimit { .. }
             | Self::Spawn { .. }
             | Self::Validation { .. }
