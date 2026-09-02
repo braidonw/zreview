@@ -92,6 +92,14 @@ pub enum GithubError {
         source: std::io::Error,
     },
 
+    /// As [`GithubError::Execute`], for the calls that name repositories by slug
+    /// and so run in no repository of their own.
+    #[error("failed to run gh: {source}")]
+    Spawn {
+        #[source]
+        source: std::io::Error,
+    },
+
     #[error("GitHub rejected the request as unauthenticated: {detail}")]
     Unauthenticated { detail: String },
 
@@ -182,6 +190,7 @@ impl GithubError {
             Self::Command { .. }
             | Self::Execute { .. }
             | Self::PagingLimit { .. }
+            | Self::Spawn { .. }
             | Self::Validation { .. }
             | Self::InvalidResponse(_)
             | Self::InvalidComment { .. }
@@ -795,15 +804,17 @@ fn parse_full_name(value: &str) -> Option<RepositorySlug> {
 }
 
 fn validate_slug_component(component: &str, selector: &str) -> Result<(), GithubError> {
-    let valid = !component.is_empty()
-        && component
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'));
+    let valid = !component.is_empty() && component.bytes().all(is_slug_byte);
     if valid {
         Ok(())
     } else {
         Err(GithubError::InvalidSelector(selector.to_owned()))
     }
+}
+
+/// The bytes GitHub allows in an owner or a repository name.
+const fn is_slug_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.')
 }
 
 fn validate_sha(value: &str) -> Result<(), String> {

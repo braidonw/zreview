@@ -8,7 +8,6 @@
 
 use std::{
     io::Read,
-    path::PathBuf,
     process::{Command, Output, Stdio},
     sync::Arc,
     time::{Duration, Instant},
@@ -16,7 +15,9 @@ use std::{
 
 use serde::Deserialize;
 
-use crate::{GithubClient, GithubError, RepositorySlug, classify_failure, parse_full_name};
+use crate::{
+    GithubClient, GithubError, RepositorySlug, classify_failure, is_slug_byte, parse_full_name,
+};
 
 /// Repositories per `gh api graphql` call.
 ///
@@ -38,9 +39,6 @@ pub const DEFAULT_GRAPHQL_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// How often a running `gh` is checked for having exited.
 const POLL_INTERVAL: Duration = Duration::from_millis(5);
-
-/// GitHub's placeholder for a deleted account, matching what its own UI shows.
-const DELETED_USER: &str = "ghost";
 
 const REVIEW_REQUESTED_FILTER: &str = "is:pr is:open draft:false review-requested:@me";
 const AUTHORED_FILTER: &str = "is:pr is:open author:@me";
@@ -84,11 +82,13 @@ pub struct HomePullRequest {
     pub url: String,
     pub draft: bool,
     pub updated_at: String,
-    pub head_oid: String,
-    pub author_login: String,
+    pub head_sha: String,
+    /// `None` once GitHub has forgotten the account, which it reports as no
+    /// author at all rather than as a name.
+    pub author_login: Option<String>,
     /// The commit the viewer's own latest review was left against, when they
     /// have reviewed and GitHub still knows which commit that was.
-    pub viewer_latest_review_oid: Option<String>,
+    pub viewer_latest_review_sha: Option<String>,
     /// `None` when the head has no checks at all, which reads differently from
     /// a pending one.
     pub check_state: Option<StatusCheckState>,
@@ -104,14 +104,16 @@ pub struct HomePullRequest {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct OpinionatedReview {
     pub state: ReviewState,
-    pub author_login: String,
+    /// `None` once GitHub has forgotten the account.
+    pub author_login: Option<String>,
 }
 
 /// One review thread, reduced to what "is the author being waited on" needs.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ReviewThread {
     pub resolved: bool,
-    /// `None` only when the thread carries no comments at all.
+    /// `None` when the thread carries no comments, or GitHub has forgotten the
+    /// account that wrote the last one.
     pub last_comment_author_login: Option<String>,
 }
 
@@ -561,22 +563,10 @@ impl Collected {
             .iter()
             .map(|repository| repository.full_name().to_lowercase())
             .collect::<Vec<_>>();
-        let mut pull_requests = batch
-            .iter()
-            .map(|_| Ok(Vec::new()))
-            .collect::<Vec<Result<Vec<CollectedRow>, Arc<GithubError>>>>();
 
-        for error in &self.errors {
-            let named = error.names(batch, &keys);
-            if named.is_empty() {
-                return Err(error.classify(self.status));
-            }
-            let shared = Arc::new(error.classify(self.status));
-            for index in named {
-                pull_requests[index] = Err(Arc::clone(&shared));
-            }
-        }
-
+        // Rows are placed first, because an error that names only an
+        // organisation is about the repositories of it that came back empty.
+        let mut collected = batch.iter().map(|_| Vec::new()).collect::<Vec<_>>();
         for row in self.rows {
             let key = row.row.repository.full_name().to_lowercase();
             let Some(index) = keys.iter().position(|candidate| *candidate == key) else {
@@ -589,8 +579,19 @@ impl Collected {
                     actual: row.row.repository.full_name(),
                 });
             };
-            if let Ok(rows) = &mut pull_requests[index] {
-                rows.push(row);
+            collected[index].push(row);
+        }
+
+        let empty = collected.iter().map(Vec::is_empty).collect::<Vec<_>>();
+        let mut pull_requests = collected.into_iter().map(Ok).collect::<Vec<_>>();
+        for error in &self.errors {
+            let named = error.matching_indices(batch, &keys, &empty);
+            if named.is_empty() {
+                return Err(error.classify(self.status));
+            }
+            let shared = Arc::new(error.classify(self.status));
+            for index in named {
+                pull_requests[index] = Err(Arc::clone(&shared));
             }
         }
 
@@ -625,9 +626,9 @@ impl CollectedRow {
                 url: node.url,
                 draft: node.is_draft,
                 updated_at: node.updated_at,
-                head_oid: node.head_ref_oid,
-                author_login: login(node.author),
-                viewer_latest_review_oid: node
+                head_sha: node.head_ref_oid,
+                author_login: node.author.map(|author| author.login),
+                viewer_latest_review_sha: node
                     .viewer_latest_review
                     .and_then(|review| review.commit)
                     .map(|commit| commit.oid),
@@ -680,7 +681,7 @@ impl From<GraphOpinionatedReview> for OpinionatedReview {
     fn from(review: GraphOpinionatedReview) -> Self {
         Self {
             state: review.state,
-            author_login: login(review.author),
+            author_login: review.author.map(|author| author.login),
         }
     }
 }
@@ -694,7 +695,8 @@ impl From<GraphThread> for ReviewThread {
                 .nodes
                 .into_iter()
                 .next_back()
-                .map(|comment| login(comment.author)),
+                .and_then(|comment| comment.author)
+                .map(|author| author.login),
         }
     }
 }
@@ -731,21 +733,20 @@ fn search_query(filter: &str, repositories: &[RepositorySlug]) -> String {
     format!("{filter} ({clause})")
 }
 
-fn login(author: Option<GraphActor>) -> String {
-    author.map_or_else(|| DELETED_USER.to_owned(), |author| author.login)
-}
-
 fn timeout_ms(timeout: Duration) -> u64 {
-    u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX)
+    u64::try_from(timeout.as_millis()).expect("a timeout fits in u64 milliseconds")
 }
 
 /// Distinguishes "gh is not installed" from other failures to run it.
 ///
-/// The GraphQL path names repositories by slug rather than by clone, so `gh`
-/// runs in whatever directory the application was started in.
+/// The GraphQL path names repositories by slug, so `gh` is given no working
+/// directory and there is none to report.
 fn spawn_error(source: std::io::Error) -> GithubError {
-    let directory = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    crate::execution_error(&directory, source)
+    if source.kind() == std::io::ErrorKind::NotFound {
+        GithubError::GhMissing
+    } else {
+        GithubError::Spawn { source }
+    }
 }
 
 /// A pipe being read to its end on its own thread.
@@ -773,11 +774,7 @@ impl Drain {
 /// Whether `text` names this exact repository rather than a longer slug that
 /// merely starts with it.
 fn mentions_repository(text: &str, full_name: &str) -> bool {
-    bounded_starts(text, full_name).any(|start| {
-        text.as_bytes()
-            .get(start + full_name.len())
-            .is_none_or(|byte| !word_byte(*byte))
-    })
+    bounded_starts(text, full_name).any(|start| slug_ends_at(text, start + full_name.len()))
 }
 
 /// Whether `text` names this owner as an organisation, the shape a SAML failure
@@ -789,11 +786,23 @@ fn mentions_owner(text: &str, owner: &str) -> bool {
 fn bounded_starts<'a>(text: &'a str, needle: &'a str) -> impl Iterator<Item = usize> + 'a {
     text.match_indices(needle)
         .map(|(start, _)| start)
-        .filter(move |start| *start == 0 || !word_byte(text.as_bytes()[start - 1]))
+        .filter(move |start| *start == 0 || !is_slug_byte(text.as_bytes()[start - 1]))
 }
 
-const fn word_byte(byte: u8) -> bool {
-    byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.')
+/// Whether a slug ends at `offset`.
+///
+/// A full stop is legal inside a repository name, so `acme/tool` does not end
+/// inside `acme/tool.js`. It is also how GitHub ends a sentence, so `acme/tool`
+/// does end in "cannot see acme/tool.".
+fn slug_ends_at(text: &str, offset: usize) -> bool {
+    let bytes = text.as_bytes();
+    match bytes.get(offset) {
+        None => true,
+        Some(b'.') => bytes
+            .get(offset + 1)
+            .is_none_or(|byte| !is_slug_byte(*byte)),
+        Some(byte) => !is_slug_byte(*byte),
+    }
 }
 
 fn batch_document() -> String {
@@ -858,7 +867,6 @@ const AUTHORED_FRAGMENT: &str = r"fragment Authored on PullRequest {
   reviewDecision
   latestOpinionatedReviews(first: 50) { nodes { state author { login } } }
   reviewThreads(first: 50) {
-    totalCount
     pageInfo { hasNextPage endCursor }
     nodes { isResolved comments(last: 1) { nodes { author { login } } } }
   }
@@ -922,9 +930,17 @@ impl GraphError {
 
     /// Which repositories of the batch this error is about.
     ///
-    /// A SAML failure names its organisation in the authorization link it offers
-    /// rather than the repository, so the owner is the fallback.
-    fn names(&self, batch: &[RepositorySlug], keys: &[String]) -> Vec<usize> {
+    /// A message naming `owner/name` is about that repository. A SAML failure
+    /// names only its organisation, in the authorization link it offers, and a
+    /// whole organisation is the ordinary shape of a batch. It is therefore
+    /// taken to be about that organisation's repositories that came back with
+    /// nothing, so one refusal cannot discard rows GitHub already returned.
+    fn matching_indices(
+        &self,
+        batch: &[RepositorySlug],
+        keys: &[String],
+        empty: &[bool],
+    ) -> Vec<usize> {
         let text = self.message.to_lowercase();
         let by_repository = keys
             .iter()
@@ -938,7 +954,9 @@ impl GraphError {
         batch
             .iter()
             .enumerate()
-            .filter(|(_, repository)| mentions_owner(&text, &repository.owner.to_lowercase()))
+            .filter(|(index, repository)| {
+                empty[*index] && mentions_owner(&text, &repository.owner.to_lowercase())
+            })
             .map(|(index, _)| index)
             .collect()
     }
@@ -1194,14 +1212,18 @@ mod tests {
     /// One organisation the token was never authorized for must not empty the
     /// whole screen.
     #[test]
-    fn a_forbidden_null_node_fails_only_the_repository_it_names() {
+    fn a_forbidden_error_fails_only_the_repositories_it_left_empty() {
         let fake = FakeGh::new();
         fake.respond_partial(
             &envelope(
                 &[
                     alias(
                         "toReview",
-                        &["null".to_owned(), requested_node("acme/widgets", 42)],
+                        &[
+                            "null".to_owned(),
+                            requested_node("acme/widgets", 42),
+                            requested_node("secure/tools", 8),
+                        ],
                         None,
                     ),
                     alias("authored", &[], None),
@@ -1214,9 +1236,19 @@ mod tests {
         let fetch = GithubClient::new(fake.path()).fetch_home_pull_requests(&[
             RepositorySlug::new("acme", "widgets"),
             RepositorySlug::new("secure", "vault"),
+            RepositorySlug::new("secure", "tools"),
         ]);
 
-        assert_eq!(rows(&fetch, "acme/widgets").len(), 1, "the rest still load");
+        assert_eq!(
+            rows(&fetch, "acme/widgets").len(),
+            1,
+            "another owner is safe"
+        );
+        assert_eq!(
+            rows(&fetch, "secure/tools").len(),
+            1,
+            "the organisation is named, but this repository answered",
+        );
 
         let refused = fetch.repositories[1].pull_requests.as_ref().unwrap_err();
         assert!(
@@ -1227,6 +1259,48 @@ mod tests {
         assert!(
             refused.remediation().unwrap().contains("SSO"),
             "the remediation is the one a Session shows",
+        );
+    }
+
+    /// A message that names the repository outright is about that repository, so
+    /// nothing else of the same owner is touched.
+    #[test]
+    fn an_error_naming_one_repository_fails_only_that_repository() {
+        let fake = FakeGh::new();
+        fake.respond_partial(
+            &envelope(
+                &[
+                    alias(
+                        "toReview",
+                        &["null".to_owned(), requested_node("acme/widgets", 42)],
+                        None,
+                    ),
+                    alias("authored", &[], None),
+                ],
+                &[forbidden_error(
+                    "You do not have permission to view acme/gadgets.",
+                )],
+            ),
+            "gh: You do not have permission to view acme/gadgets.",
+        );
+
+        let fetch = GithubClient::new(fake.path()).fetch_home_pull_requests(&[
+            RepositorySlug::new("acme", "widgets"),
+            RepositorySlug::new("acme", "gadgets"),
+            RepositorySlug::new("acme", "sprockets"),
+        ]);
+
+        assert_eq!(rows(&fetch, "acme/widgets").len(), 1);
+        assert!(
+            matches!(
+                &**fetch.repositories[1].pull_requests.as_ref().unwrap_err(),
+                GithubError::Forbidden { .. },
+            ),
+            "the named repository fails",
+        );
+        assert!(
+            rows(&fetch, "acme/sprockets").is_empty(),
+            "an unnamed repository of the same owner has no rows and no failure",
         );
     }
 
@@ -1445,10 +1519,10 @@ mod tests {
         );
     }
 
-    /// The document is what the measured cost was measured against, so the parts
-    /// that set that cost are pinned here.
+    /// The search type, the page size, and the selection are what the query plan
+    /// settled and what its cost follows from, so they are pinned here.
     #[test]
-    fn the_batch_query_matches_the_measured_plan() {
+    fn the_batch_document_pins_the_search_type_and_selection() {
         let fake = FakeGh::new();
         fake.respond(EMPTY_RESPONSE);
 
@@ -1574,10 +1648,10 @@ mod tests {
         assert_eq!(requested.url, "https://github.com/acme/widgets/pull/42");
         assert!(!requested.draft);
         assert_eq!(requested.updated_at, "2026-09-02T09:15:00Z");
-        assert_eq!(requested.author_login, "contributor");
+        assert_eq!(requested.author_login.as_deref(), Some("contributor"));
         assert_eq!(
-            requested.viewer_latest_review_oid.as_deref(),
-            Some(requested.head_oid.as_str()),
+            requested.viewer_latest_review_sha.as_deref(),
+            Some(requested.head_sha.as_str()),
             "the viewer has already reviewed this head",
         );
         assert_eq!(requested.check_state, Some(StatusCheckState::Success));
@@ -1597,14 +1671,14 @@ mod tests {
             [
                 OpinionatedReview {
                     state: ReviewState::ChangesRequested,
-                    author_login: "maintainer".to_owned(),
+                    author_login: Some("maintainer".to_owned()),
                 },
                 OpinionatedReview {
                     state: ReviewState::Approved,
-                    author_login: "ghost".to_owned(),
+                    author_login: None,
                 },
             ],
-            "a deleted reviewer falls back to GitHub's own placeholder",
+            "a reviewer GitHub has forgotten is reported as no author, not as a name",
         );
         assert_eq!(
             authored.review_threads,
@@ -1623,12 +1697,12 @@ mod tests {
 
         let gadgets = rows(&fetch, "acme/gadgets");
         assert_eq!(gadgets.len(), 2);
-        assert_eq!(
-            gadgets[0].author_login, "ghost",
-            "a deleted author falls back to the placeholder",
+        assert!(
+            gadgets[0].author_login.is_none(),
+            "an author GitHub has forgotten is not given a name",
         );
         assert!(
-            gadgets[0].viewer_latest_review_oid.is_none(),
+            gadgets[0].viewer_latest_review_sha.is_none(),
             "the viewer has not reviewed this one",
         );
         assert!(
@@ -1700,7 +1774,6 @@ mod tests {
               "reviewDecision": null,
               "latestOpinionatedReviews": {{"nodes": []}},
               "reviewThreads": {{
-                "totalCount": 52,
                 "pageInfo": {{"hasNextPage": {has_next}, "endCursor": {cursor}}},
                 "nodes": [{nodes}]
               }}
@@ -1734,12 +1807,20 @@ mod tests {
 
     /// The error GitHub pairs with a null node when the token has not been
     /// authorized for an organisation's single sign-on.
+    ///
+    /// It names the organisation only in the authorization link it offers.
     fn saml_error(owner: &str) -> String {
+        forbidden_error(&format!(
+            "Resource protected by organization SAML enforcement. You must grant your Personal Access token access to this organization. Visit https://github.com/orgs/{owner}/sso?authorization_request=ABC to do so."
+        ))
+    }
+
+    fn forbidden_error(message: &str) -> String {
         format!(
             r#"{{
               "type": "FORBIDDEN",
               "path": ["toReview", "nodes", 0],
-              "message": "Resource protected by organization SAML enforcement. You must grant your Personal Access token access to this organization. Visit https://github.com/orgs/{owner}/sso?authorization_request=ABC to do so."
+              "message": "{message}"
             }}"#
         )
     }

@@ -47,7 +47,7 @@ fn real_home_fetch_returns_rows_a_human_can_check() {
         );
     }
 
-    // Nothing is asserted about which pull requests are open: that changes daily.
+    // Which pull requests are open changes daily, so nothing here asserts on them.
     // What must hold is that GitHub answered and the repository has an answer.
     assert!(
         fetch.viewer_login.is_some(),
