@@ -3,7 +3,7 @@
 
 use std::{
     ops::RangeInclusive,
-    sync::{Arc, Mutex, MutexGuard, PoisonError, atomic::AtomicBool},
+    sync::{Arc, atomic::AtomicBool},
 };
 
 use domain::{
@@ -553,11 +553,6 @@ impl SessionModel {
             sink.save_summary(head_sha, session.summary());
         }
     }
-}
-
-/// Takes the model's lock, recovering from poisoning: the guarded state stays consistent, and refusing to use it would be worse than the panic that poisoned it.
-pub fn lock(model: &Mutex<SessionModel>) -> MutexGuard<'_, SessionModel> {
-    model.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 #[cfg(test)]

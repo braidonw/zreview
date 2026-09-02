@@ -5,6 +5,35 @@ import { invoke as __TAURI_INVOKE, Channel } from "@tauri-apps/api/core";
 /** Commands */
 export const commands = {
 	/**
+	 *  Which screen the binary was launched into, asked once before anything is
+	 *  rendered.
+	 * 
+	 *  A Session carries its request's own description, which is all the loading
+	 *  screen can say before the load reaches the pull request itself.
+	 */
+	describeLaunch: () => __TAURI_INVOKE<LaunchDto>("describe_launch"),
+	/**
+	 *  Re-reads the settings file and resolves every clone it lists.
+	 * 
+	 *  Runs when Home opens, after an Add or a Remove, and on `r`. A settings file
+	 *  that cannot be read comes back as the snapshot's failure rather than as a
+	 *  command error, because the header and footer stay on screen either way.
+	 */
+	refreshHome: () => __TAURI_INVOKE<HomeSnapshotDto>("refresh_home"),
+	/**
+	 *  Adds the folders the reviewer picked, writing the file once and refreshing.
+	 * 
+	 *  A folder that is not a clone of a GitHub repository is refused with its
+	 *  reason while the rest proceed, and one already listed is ignored.
+	 */
+	addRepositories: (folders: string[]) => __TAURI_INVOKE<HomeSnapshotDto>("add_repositories", { folders }),
+	/**  Drops one configured clone, writing the file and refreshing. */
+	removeRepository: (path: string) => __TAURI_INVOKE<HomeSnapshotDto>("remove_repository", { path }),
+	/**  Opens or closes the Repositories footer. */
+	toggleRepositoriesFooter: () => __TAURI_INVOKE<HomeSnapshotDto>("toggle_repositories_footer"),
+	/**  Clears the refusals the last Add reported. */
+	dismissRefusals: () => __TAURI_INVOKE<HomeSnapshotDto>("dismiss_refusals"),
+	/**
 	 *  Loads the review session the window was opened with, reporting each stage on
 	 *  `on_stage` as it goes.
 	 * 
@@ -29,11 +58,6 @@ export const commands = {
 	 *  Returns a failure when the session is not ready.
 	 */
 	toggleViewed: () => typedError<SidebarDto, SessionFailureDto>(__TAURI_INVOKE("toggle_viewed")),
-	/**
-	 *  The request's own description, shown by the loading screen before anything
-	 *  about the target session is known.
-	 */
-	describeSession: () => __TAURI_INVOKE<string>("describe_session"),
 	/**
 	 *  Edits the draft over rows `start..=end` of `file_index`. Persists the new
 	 *  text on every call. That is what makes a keystroke survive a crash.
@@ -67,6 +91,12 @@ export const commands = {
 };
 
 /* Types */
+/**  A picked folder Home would not add, and why. */
+export type AddRefusalDto = {
+	folder: string,
+	reason: string,
+};
+
 /**  A draft resolved to the row it is drawn on. */
 export type AnchoredDraftDto = {
 	row: number,
@@ -125,6 +155,43 @@ export type FileSummaryDto = {
 	viewed: boolean,
 	thread_count: number,
 };
+
+/**  One of Home's three groups, always rendered whether or not it has rows. */
+export type HomeGroupDto = {
+	title: string,
+	count: number,
+	/**  The one line an empty group shows in place of rows. */
+	empty_copy: string,
+};
+
+/**  One configured clone as the footer lists it. */
+export type HomeRepositoryDto = {
+	path: string,
+	slug: string | null,
+	/**  Why this clone cannot be listed, absent when it resolved. */
+	failure: string | null,
+};
+
+/**  Everything Home renders, from its header to its footer. */
+export type HomeSnapshotDto = {
+	/**  The header's count line, absent until there is something to count. */
+	count_line: string | null,
+	groups: HomeGroupDto[],
+	repositories: HomeRepositoryDto[],
+	footer_summary: string,
+	footer_expanded: boolean,
+	refusals: AddRefusalDto[],
+	/**
+	 *  What replaces the list area when Home cannot read its repositories. The
+	 *  header and footer stay either way, so Add still works.
+	 */
+	failure: SessionFailureDto | null,
+};
+
+/**  Which screen the binary was launched into. */
+export type LaunchDto = "Home" | { Session: {
+	description: string,
+} };
 
 export type RowDto = {
 	kind: DiffLineKindDto,

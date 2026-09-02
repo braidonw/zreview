@@ -277,7 +277,7 @@ impl HomeModel {
         let counted = repository_count(self.repositories.len());
         match self.failed_count() {
             0 => counted,
-            failed => format!("{counted} · {failed} failed"),
+            failed => format!("{counted} \u{00B7} {failed} failed"),
         }
     }
 }
@@ -405,7 +405,7 @@ mod tests {
             failed("/Developer/moved", "the folder no longer exists"),
         ]));
 
-        assert_eq!(home.footer_summary(), "4 repositories · 1 failed");
+        assert_eq!(home.footer_summary(), "4 repositories \u{00B7} 1 failed");
     }
 
     #[test]

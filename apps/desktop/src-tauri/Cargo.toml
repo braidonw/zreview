@@ -18,12 +18,15 @@ tauri-build = { version = "=2.6.3", features = [] }
 [dependencies]
 app.workspace = true
 domain.workspace = true
+git.workspace = true
 github.workspace = true
 session.workspace = true
+settings.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tauri = { version = "=2.11.5", features = [] }
 tauri-plugin-clipboard-manager = "=2.3.3"
+tauri-plugin-dialog = "=2.7.3"
 tauri-specta = { version = "=2.0.0-rc.25", features = ["derive", "typescript"] }
 specta = "=2.0.0-rc.25"
 specta-typescript = "=0.0.12"

@@ -1,30 +1,82 @@
 //! Tauri commands exposed to the frontend, and the specta builder that types them.
 
-use std::sync::{
-    Mutex,
-    atomic::{AtomicBool, Ordering},
+use std::{
+    path::{Path, PathBuf},
+    sync::{
+        Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 
-use app::{SessionPhase, lock};
+use app::{HomeModel, SessionPhase, SettingsWrite, lock};
 use domain::DiffSide;
 use session::{ReviewStorage, SessionRequest};
 use tauri::ipc::Channel;
 use tauri_specta::collect_commands;
 
-use crate::{ManagedSession, dto};
+use crate::{AppRoot, ManagedSession, dto, repositories};
 
 /// The specta builder, shared between the invoke handler and the bindings export.
 #[must_use]
 pub fn specta_builder() -> tauri_specta::Builder<tauri::Wry> {
     tauri_specta::Builder::<tauri::Wry>::new().commands(collect_commands![
+        describe_launch,
+        refresh_home,
+        add_repositories,
+        remove_repository,
+        toggle_repositories_footer,
+        dismiss_refusals,
         open_session,
         select_file,
         toggle_viewed,
-        describe_session,
         edit_draft,
         discard_draft,
         reanchor_draft,
     ])
+}
+
+/// Re-reads the settings file and resolves every clone it lists.
+fn refresh_home_on_model(home: &Mutex<HomeModel>, settings_path: &Path) {
+    let read = repositories::read(settings_path);
+    lock(home).refreshed(read);
+}
+
+/// Adds the folders a reviewer picked, then leaves Home showing the file.
+fn add_repositories_on_model(home: &Mutex<HomeModel>, settings_path: &Path, folders: &[PathBuf]) {
+    let picked = repositories::resolve_picked(folders);
+    let write = lock(home).add_repositories(picked);
+    write_then_refresh(home, settings_path, write);
+}
+
+/// Drops the entry listed at `path`, then leaves Home showing the file.
+fn remove_repository_on_model(home: &Mutex<HomeModel>, settings_path: &Path, path: &Path) {
+    let write = lock(home).remove_repository(path);
+    write_then_refresh(home, settings_path, write);
+}
+
+/// Writes what an action asked for and refreshes from the file it wrote.
+///
+/// The refresh runs whether or not the write worked, so what Home shows is
+/// always what the file actually holds. A write that failed is reported after
+/// it, since the refresh clears the last failure.
+fn write_then_refresh(home: &Mutex<HomeModel>, settings_path: &Path, write: Option<SettingsWrite>) {
+    let written = write.map(|write| repositories::write(settings_path, write.repositories));
+    refresh_home_on_model(home, settings_path);
+    if let Some(Err(failure)) = written {
+        lock(home).failed(failure);
+    }
+}
+
+/// Runs `action` against the settings file, then projects what Home now shows.
+///
+/// A machine with no home directory has nowhere to keep the file, which is a
+/// whole-Home failure rather than something an action can work around.
+fn on_settings_file(home: &Mutex<HomeModel>, action: impl FnOnce(&Path)) -> dto::HomeSnapshotDto {
+    match repositories::settings_path() {
+        Ok(path) => action(&path),
+        Err(failure) => lock(home).refreshed(Err(failure)),
+    }
+    dto::project_home(&lock(home))
 }
 
 /// Loads `request` into `model`, reporting each stage's label to `report`.
@@ -236,13 +288,14 @@ fn reanchor_draft_on_model(
 #[specta::specta]
 #[allow(clippy::needless_pass_by_value)]
 pub async fn open_session(
-    state: tauri::State<'_, ManagedSession>,
+    state: tauri::State<'_, AppRoot>,
     on_stage: Channel<String>,
 ) -> Result<dto::SessionSnapshotDto, dto::SessionFailureDto> {
-    let model = std::sync::Arc::clone(&state.model);
-    let load_started = std::sync::Arc::clone(&state.load_started);
-    let request = state.request.clone();
-    let storage = state.storage.clone();
+    let session = session(&state)?;
+    let model = std::sync::Arc::clone(&session.model);
+    let load_started = std::sync::Arc::clone(&session.load_started);
+    let request = session.request.clone();
+    let storage = session.storage.clone();
     tauri::async_runtime::spawn_blocking(move || {
         load_if_pending(&model, &load_started, &request, &storage, &|stage| {
             let _ = on_stage.send(stage.to_owned());
@@ -251,7 +304,7 @@ pub async fn open_session(
     .await
     .expect("the load task should not panic");
 
-    let guard = lock(&state.model);
+    let guard = lock(&session.model);
     match guard.phase() {
         SessionPhase::Ready(review) => Ok(dto::project_snapshot(review.session())),
         SessionPhase::Failed(failure) => Err(failure.into()),
@@ -261,17 +314,98 @@ pub async fn open_session(
     }
 }
 
-/// The request's own description, shown by the loading screen before anything
-/// about the target session is known.
+/// Re-reads the settings file and resolves every clone it lists.
+///
+/// Runs when Home opens, after an Add or a Remove, and on `r`. A settings file
+/// that cannot be read comes back as the snapshot's failure rather than as a
+/// command error, because the header and footer stay on screen either way.
+#[tauri::command(async)]
+#[specta::specta]
+#[allow(clippy::needless_pass_by_value)]
+pub fn refresh_home(state: tauri::State<'_, AppRoot>) -> dto::HomeSnapshotDto {
+    on_settings_file(&state.home, |path| {
+        refresh_home_on_model(&state.home, path);
+    })
+}
+
+/// Adds the folders the reviewer picked, writing the file once and refreshing.
+///
+/// A folder that is not a clone of a GitHub repository is refused with its
+/// reason while the rest proceed, and one already listed is ignored.
+#[tauri::command(async)]
+#[specta::specta]
+#[allow(clippy::needless_pass_by_value)]
+pub fn add_repositories(
+    state: tauri::State<'_, AppRoot>,
+    folders: Vec<String>,
+) -> dto::HomeSnapshotDto {
+    let folders = folders.into_iter().map(PathBuf::from).collect::<Vec<_>>();
+    on_settings_file(&state.home, |path| {
+        add_repositories_on_model(&state.home, path, &folders);
+    })
+}
+
+/// Drops one configured clone, writing the file and refreshing.
+#[tauri::command(async)]
+#[specta::specta]
+#[allow(clippy::needless_pass_by_value)]
+pub fn remove_repository(state: tauri::State<'_, AppRoot>, path: String) -> dto::HomeSnapshotDto {
+    let path = PathBuf::from(path);
+    on_settings_file(&state.home, |settings_path| {
+        remove_repository_on_model(&state.home, settings_path, &path);
+    })
+}
+
+/// Opens or closes the Repositories footer.
 #[tauri::command]
 #[specta::specta]
 #[allow(clippy::needless_pass_by_value)]
-pub fn describe_session(state: tauri::State<'_, ManagedSession>) -> String {
-    describe_session_on_request(&state.request)
+pub fn toggle_repositories_footer(state: tauri::State<'_, AppRoot>) -> dto::HomeSnapshotDto {
+    lock(&state.home).toggle_footer();
+    dto::project_home(&lock(&state.home))
 }
 
-fn describe_session_on_request(request: &SessionRequest) -> String {
-    request.description()
+/// Clears the refusals the last Add reported.
+#[tauri::command]
+#[specta::specta]
+#[allow(clippy::needless_pass_by_value)]
+pub fn dismiss_refusals(state: tauri::State<'_, AppRoot>) -> dto::HomeSnapshotDto {
+    lock(&state.home).dismiss_refusals();
+    dto::project_home(&lock(&state.home))
+}
+
+/// Which screen the binary was launched into, asked once before anything is
+/// rendered.
+///
+/// A Session carries its request's own description, which is all the loading
+/// screen can say before the load reaches the pull request itself.
+#[tauri::command]
+#[specta::specta]
+#[allow(clippy::needless_pass_by_value)]
+pub fn describe_launch(state: tauri::State<'_, AppRoot>) -> dto::LaunchDto {
+    describe_launch_on_root(&state)
+}
+
+fn describe_launch_on_root(root: &AppRoot) -> dto::LaunchDto {
+    match &root.session {
+        Some(session) => dto::LaunchDto::Session {
+            description: session.request.description(),
+        },
+        None => dto::LaunchDto::Home,
+    }
+}
+
+/// The Session behind the commands that need one.
+///
+/// Absent on a Home launch, where the frontend never calls them, so a call that
+/// arrives anyway is answered rather than assumed away.
+fn session<'a>(
+    state: &'a tauri::State<'_, AppRoot>,
+) -> Result<&'a ManagedSession, dto::SessionFailureDto> {
+    state
+        .session
+        .as_ref()
+        .ok_or_else(|| dto::command_failure("no session is open"))
 }
 
 /// Switches the displayed file and returns its rows.
@@ -283,10 +417,10 @@ fn describe_session_on_request(request: &SessionRequest) -> String {
 #[specta::specta]
 #[allow(clippy::needless_pass_by_value)]
 pub async fn select_file(
-    state: tauri::State<'_, ManagedSession>,
+    state: tauri::State<'_, AppRoot>,
     index: u32,
 ) -> Result<dto::FileDetailDto, dto::SessionFailureDto> {
-    select_file_on_model(&state.model, index as usize)
+    select_file_on_model(&session(&state)?.model, index as usize)
 }
 
 /// Marks the selected file viewed, or unmarks it, and returns the fresh sidebar.
@@ -298,9 +432,9 @@ pub async fn select_file(
 #[specta::specta]
 #[allow(clippy::needless_pass_by_value)]
 pub fn toggle_viewed(
-    state: tauri::State<'_, ManagedSession>,
+    state: tauri::State<'_, AppRoot>,
 ) -> Result<dto::SidebarDto, dto::SessionFailureDto> {
-    toggle_viewed_on_model(&state.model)
+    toggle_viewed_on_model(&session(&state)?.model)
 }
 
 /// Edits the draft over rows `start..=end` of `file_index`. Persists the new
@@ -316,14 +450,14 @@ pub fn toggle_viewed(
 #[specta::specta]
 #[allow(clippy::needless_pass_by_value)]
 pub fn edit_draft(
-    state: tauri::State<'_, ManagedSession>,
+    state: tauri::State<'_, AppRoot>,
     file_index: u32,
     start: u32,
     end: u32,
     body: String,
 ) -> Result<dto::DraftEditOutcomeDto, dto::SessionFailureDto> {
     edit_draft_on_model(
-        &state.model,
+        &session(&state)?.model,
         file_index as usize,
         start as usize,
         end as usize,
@@ -340,11 +474,11 @@ pub fn edit_draft(
 #[specta::specta]
 #[allow(clippy::needless_pass_by_value)]
 pub fn discard_draft(
-    state: tauri::State<'_, ManagedSession>,
+    state: tauri::State<'_, AppRoot>,
     file_index: u32,
     row: u32,
 ) -> Result<dto::DraftsDto, dto::SessionFailureDto> {
-    discard_draft_on_model(&state.model, file_index as usize, row as usize)
+    discard_draft_on_model(&session(&state)?.model, file_index as usize, row as usize)
 }
 
 /// Moves a stale draft, named by the position it was written against, onto
@@ -358,7 +492,7 @@ pub fn discard_draft(
 #[specta::specta]
 #[allow(clippy::needless_pass_by_value)]
 pub fn reanchor_draft(
-    state: tauri::State<'_, ManagedSession>,
+    state: tauri::State<'_, AppRoot>,
     file_index: u32,
     path: String,
     side: dto::DiffSideDto,
@@ -366,7 +500,7 @@ pub fn reanchor_draft(
     row: u32,
 ) -> Result<dto::DraftsDto, dto::SessionFailureDto> {
     reanchor_draft_on_model(
-        &state.model,
+        &session(&state)?.model,
         file_index as usize,
         &path,
         side.into(),
@@ -614,14 +748,173 @@ mod tests {
     }
 
     #[test]
-    fn describe_session_on_request_defers_to_the_requests_own_description() {
+    fn a_session_launch_is_described_by_its_own_request() {
         let request = SessionRequest::LocalComparison {
             repository: Path::new("/tmp/repository").to_path_buf(),
             base: "main".to_owned(),
             head: "feature".to_owned(),
         };
+        let root = AppRoot {
+            home: Arc::new(Mutex::new(HomeModel::new())),
+            session: Some(ManagedSession {
+                model: Arc::new(Mutex::new(app::SessionModel::loading(
+                    request.description(),
+                ))),
+                request: request.clone(),
+                storage: ReviewStorage::Disabled,
+                load_started: Arc::new(AtomicBool::new(false)),
+            }),
+        };
 
-        assert_eq!(describe_session_on_request(&request), request.description());
+        assert_eq!(
+            describe_launch_on_root(&root),
+            dto::LaunchDto::Session {
+                description: request.description(),
+            },
+        );
+    }
+
+    #[test]
+    fn a_launch_with_no_session_is_described_as_home() {
+        let root = AppRoot {
+            home: Arc::new(Mutex::new(HomeModel::new())),
+            session: None,
+        };
+
+        assert_eq!(describe_launch_on_root(&root), dto::LaunchDto::Home);
+    }
+
+    /// A clone whose `origin` points at GitHub, which is what Home configures.
+    fn clone_of(slug: &str) -> TempDir {
+        let directory = TempDir::new().unwrap();
+        git(directory.path(), ["init", "--quiet"]);
+        git(
+            directory.path(),
+            [
+                "remote",
+                "add",
+                "origin",
+                &format!("https://github.com/{slug}.git"),
+            ],
+        );
+        directory
+    }
+
+    fn home_model() -> Mutex<app::HomeModel> {
+        Mutex::new(app::HomeModel::new())
+    }
+
+    /// The repository paths the settings file now holds.
+    fn listed(settings_path: &Path) -> Vec<std::path::PathBuf> {
+        settings::load(settings_path).unwrap().repositories
+    }
+
+    #[test]
+    fn refreshing_home_reads_the_settings_file_every_time() {
+        let clone = clone_of("acme/widgets");
+        let directory = TempDir::new().unwrap();
+        let settings_path = directory.path().join("settings.toml");
+        let home = home_model();
+
+        refresh_home_on_model(&home, &settings_path);
+        assert!(lock(&home).repositories().is_empty());
+
+        std::fs::write(
+            &settings_path,
+            format!(
+                "repositories = [{:?}]\n",
+                clone.path().display().to_string()
+            ),
+        )
+        .unwrap();
+        refresh_home_on_model(&home, &settings_path);
+
+        let guard = lock(&home);
+        assert_eq!(guard.repositories().len(), 1, "a hand edit is picked up");
+        assert_eq!(guard.repositories()[0].slug(), Some("acme/widgets"));
+    }
+
+    #[test]
+    fn adding_a_clone_writes_the_file_and_lists_it() {
+        let clone = clone_of("acme/widgets");
+        let directory = TempDir::new().unwrap();
+        let settings_path = directory.path().join("settings.toml");
+        let home = home_model();
+
+        add_repositories_on_model(&home, &settings_path, &[clone.path().to_path_buf()]);
+
+        assert_eq!(listed(&settings_path).len(), 1);
+        assert_eq!(lock(&home).repositories()[0].slug(), Some("acme/widgets"));
+    }
+
+    #[test]
+    fn adding_a_folder_that_is_not_a_clone_refuses_it_and_writes_nothing() {
+        let not_a_clone = TempDir::new().unwrap();
+        let directory = TempDir::new().unwrap();
+        let settings_path = directory.path().join("settings.toml");
+        let home = home_model();
+
+        add_repositories_on_model(&home, &settings_path, &[not_a_clone.path().to_path_buf()]);
+
+        assert!(
+            !settings_path.exists(),
+            "nothing was accepted, so the file is never touched",
+        );
+        let guard = lock(&home);
+        assert_eq!(guard.refusals().len(), 1);
+        assert_eq!(guard.refusals()[0].reason, "not a Git repository");
+    }
+
+    #[test]
+    fn removing_a_repository_writes_the_file_without_it() {
+        let first = clone_of("acme/widgets");
+        let second = clone_of("acme/billing");
+        let directory = TempDir::new().unwrap();
+        let settings_path = directory.path().join("settings.toml");
+        let home = home_model();
+        add_repositories_on_model(
+            &home,
+            &settings_path,
+            &[first.path().to_path_buf(), second.path().to_path_buf()],
+        );
+        let listed_first = lock(&home).repositories()[0].path.clone();
+
+        remove_repository_on_model(&home, &settings_path, &listed_first);
+
+        assert_eq!(listed(&settings_path).len(), 1);
+        assert_eq!(lock(&home).repositories()[0].slug(), Some("acme/billing"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_settings_file_that_cannot_be_written_is_reported_with_the_list_still_standing() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let clone = clone_of("acme/widgets");
+        let directory = TempDir::new().unwrap();
+        let settings_path = directory.path().join("settings.toml");
+        let home = home_model();
+        add_repositories_on_model(&home, &settings_path, &[clone.path().to_path_buf()]);
+        // Readable, so the refresh that follows still finds the clone, but not
+        // writable, so the second Add cannot record anything.
+        std::fs::set_permissions(&settings_path, std::fs::Permissions::from_mode(0o444)).unwrap();
+
+        let second = clone_of("acme/billing");
+        add_repositories_on_model(&home, &settings_path, &[second.path().to_path_buf()]);
+
+        let guard = lock(&home);
+        assert_eq!(
+            guard
+                .failure()
+                .expect("the write failure should be shown")
+                .summary,
+            "Home could not save your settings",
+        );
+        assert_eq!(
+            guard.repositories().len(),
+            1,
+            "the clone that is configured is still listed",
+        );
     }
 
     #[test]

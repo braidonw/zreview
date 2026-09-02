@@ -54,6 +54,13 @@ impl From<DiffLineKind> for DiffLineKindDto {
     }
 }
 
+/// Which screen the binary was launched into.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, specta::Type)]
+pub enum LaunchDto {
+    Home,
+    Session { description: String },
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, specta::Type)]
 pub enum DiffSideDto {
     Left,
@@ -199,6 +206,85 @@ impl From<&SessionFailure> for SessionFailureDto {
             detail: failure.detail.clone(),
             remediation: failure.remediation.clone(),
         }
+    }
+}
+
+/// One of Home's three groups, always rendered whether or not it has rows.
+#[derive(Clone, Debug, Serialize, specta::Type)]
+pub struct HomeGroupDto {
+    pub title: String,
+    pub count: u32,
+    /// The one line an empty group shows in place of rows.
+    pub empty_copy: String,
+}
+
+/// One configured clone as the footer lists it.
+#[derive(Clone, Debug, Serialize, specta::Type)]
+pub struct HomeRepositoryDto {
+    pub path: String,
+    pub slug: Option<String>,
+    /// Why this clone cannot be listed, absent when it resolved.
+    pub failure: Option<String>,
+}
+
+/// A picked folder Home would not add, and why.
+#[derive(Clone, Debug, Serialize, specta::Type)]
+pub struct AddRefusalDto {
+    pub folder: String,
+    pub reason: String,
+}
+
+/// Everything Home renders, from its header to its footer.
+#[derive(Clone, Debug, Serialize, specta::Type)]
+pub struct HomeSnapshotDto {
+    /// The header's count line, absent until there is something to count.
+    pub count_line: Option<String>,
+    pub groups: Vec<HomeGroupDto>,
+    pub repositories: Vec<HomeRepositoryDto>,
+    pub footer_summary: String,
+    pub footer_expanded: bool,
+    pub refusals: Vec<AddRefusalDto>,
+    /// What replaces the list area when Home cannot read its repositories. The
+    /// header and footer stay either way, so Add still works.
+    pub failure: Option<SessionFailureDto>,
+}
+
+/// Everything Home shows, from the model that decided it.
+///
+/// No pull requests have been fetched yet, so every group is empty and no
+/// repository carries a count.
+#[must_use]
+pub fn project_home(home: &app::HomeModel) -> HomeSnapshotDto {
+    HomeSnapshotDto {
+        count_line: home.count_line(),
+        groups: app::HomeGroup::ALL
+            .into_iter()
+            .map(|group| HomeGroupDto {
+                title: group.title().to_owned(),
+                count: 0,
+                empty_copy: group.empty_copy().to_owned(),
+            })
+            .collect(),
+        repositories: home
+            .repositories()
+            .iter()
+            .map(|entry| HomeRepositoryDto {
+                path: entry.path.display().to_string(),
+                slug: entry.slug().map(ToOwned::to_owned),
+                failure: entry.reason().map(ToOwned::to_owned),
+            })
+            .collect(),
+        footer_summary: home.footer_summary(),
+        footer_expanded: home.is_footer_expanded(),
+        refusals: home
+            .refusals()
+            .iter()
+            .map(|refusal| AddRefusalDto {
+                folder: refusal.folder.display().to_string(),
+                reason: refusal.reason.clone(),
+            })
+            .collect(),
+        failure: home.failure().map(Into::into),
     }
 }
 
@@ -579,6 +665,80 @@ mod tests {
         let session = demo_session();
         let detail = project_file(&session, 0).expect("index zero is in range");
         assert!(detail.empty_reason.is_none());
+    }
+
+    /// Home with two clones configured, one of which did not resolve.
+    fn home_with_one_failed_repository() -> app::HomeModel {
+        let mut home = app::HomeModel::new();
+        home.refreshed(Ok(vec![
+            app::RepositoryEntry {
+                path: std::path::PathBuf::from("/Developer/zreview"),
+                outcome: app::RepositoryOutcome::Valid {
+                    root: std::path::PathBuf::from("/Developer/zreview"),
+                    slug: "braidonw/zreview".to_owned(),
+                },
+            },
+            app::RepositoryEntry {
+                path: std::path::PathBuf::from("/Developer/moved"),
+                outcome: app::RepositoryOutcome::Failed {
+                    reason: "the folder no longer exists".to_owned(),
+                },
+            },
+        ]));
+        home
+    }
+
+    #[test]
+    fn home_projects_the_three_groups_in_order_with_their_empty_copy() {
+        let snapshot = project_home(&app::HomeModel::new());
+
+        let titles = snapshot
+            .groups
+            .iter()
+            .map(|group| group.title.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(titles, ["To review", "To address", "Waiting on others"]);
+        assert!(snapshot.groups.iter().all(|group| group.count == 0));
+        assert_eq!(snapshot.groups[1].empty_copy, "Nothing to address.");
+    }
+
+    #[test]
+    fn home_projects_each_repository_with_its_slug_or_its_reason() {
+        let snapshot = project_home(&home_with_one_failed_repository());
+
+        assert_eq!(snapshot.repositories[0].path, "/Developer/zreview");
+        assert_eq!(
+            snapshot.repositories[0].slug.as_deref(),
+            Some("braidonw/zreview")
+        );
+        assert!(snapshot.repositories[0].failure.is_none());
+        assert!(snapshot.repositories[1].slug.is_none());
+        assert_eq!(
+            snapshot.repositories[1].failure.as_deref(),
+            Some("the folder no longer exists")
+        );
+        assert_eq!(snapshot.footer_summary, "2 repositories \u{b7} 1 failed");
+        assert_eq!(snapshot.count_line.as_deref(), Some("2 repositories"));
+    }
+
+    #[test]
+    fn home_projects_the_whole_home_failure_and_the_footer_that_stays_with_it() {
+        let mut home = app::HomeModel::new();
+        home.refreshed(Err(SessionFailure::new(
+            "Home could not read your settings",
+        )));
+
+        let snapshot = project_home(&home);
+
+        assert_eq!(
+            snapshot
+                .failure
+                .expect("the failure should be shown")
+                .summary,
+            "Home could not read your settings",
+        );
+        assert_eq!(snapshot.footer_summary, "No repositories");
+        assert!(snapshot.count_line.is_none());
     }
 
     #[test]
