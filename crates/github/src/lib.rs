@@ -39,6 +39,69 @@ impl RepositorySlug {
     }
 }
 
+/// A local clone resolved to its worktree root and the GitHub repository it
+/// points at.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ResolvedClone {
+    pub root: PathBuf,
+    pub slug: RepositorySlug,
+}
+
+/// Why a local clone is not something Home can list pull requests for.
+#[derive(Debug, Error)]
+pub enum CloneError {
+    #[error("the folder no longer exists")]
+    Missing,
+
+    #[error("not a Git repository")]
+    NotAGitRepository,
+
+    #[error("no GitHub remote")]
+    NoGithubRemote,
+
+    #[error("could not read the repository: {source}")]
+    Unreadable {
+        #[source]
+        source: git::GitError,
+    },
+}
+
+/// Resolves a local clone to its worktree root and the GitHub repository its
+/// remotes name.
+///
+/// The root, rather than the path handed in, is what identifies a clone, so two
+/// paths inside one checkout resolve to the same entry.
+///
+/// # Errors
+///
+/// Returns [`CloneError`] when the path is gone, is not a Git repository, has no
+/// remote that parses to a GitHub slug, or cannot be read.
+pub fn resolve_clone(path: &Path) -> Result<ResolvedClone, CloneError> {
+    if !path.exists() {
+        return Err(CloneError::Missing);
+    }
+    let root = git::repository_root(path).map_err(classify_git_failure)?;
+    let remotes = git::remotes(&root).map_err(classify_git_failure)?;
+    let slug = preferred_remote_repository(&remotes).ok_or(CloneError::NoGithubRemote)?;
+    Ok(ResolvedClone { root, slug })
+}
+
+/// Separates Git refusing the path from Git failing to run at all.
+///
+/// A non-zero exit from `rev-parse` or `remote` on a path that exists means the
+/// folder is not a checkout; anything else is a fault worth reporting verbatim.
+fn classify_git_failure(error: git::GitError) -> CloneError {
+    match error {
+        git::GitError::Command { .. } => CloneError::NotAGitRepository,
+        source @ (git::GitError::Execute { .. }
+        | git::GitError::NonUtf8 { .. }
+        | git::GitError::InvalidObjectId { .. }
+        | git::GitError::UnsupportedStatus(_)
+        | git::GitError::InvalidPath(_)
+        | git::GitError::InvalidPatch { .. }) => CloneError::Unreadable { source },
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PullRequestLocator {
     pub repository: RepositorySlug,
@@ -1318,6 +1381,74 @@ JSON
             captured = captured.display(),
         );
         write_executable(path, &body);
+    }
+
+    /// A clone with `origin` pointing at GitHub, which is what Home configures.
+    fn clone_with_remote(url: Option<&str>) -> TempDir {
+        let directory = TempDir::new().unwrap();
+        git(directory.path(), ["init", "--quiet"]);
+        if let Some(url) = url {
+            git(directory.path(), ["remote", "add", "origin", url]);
+        }
+        directory
+    }
+
+    #[test]
+    fn a_clone_resolves_to_its_worktree_root_and_github_slug() {
+        let directory = clone_with_remote(Some("git@github.com:acme/widgets.git"));
+        let nested = directory.path().join("crates/review");
+        fs::create_dir_all(&nested).unwrap();
+
+        let resolved = resolve_clone(&nested).unwrap();
+
+        assert_eq!(resolved.slug, RepositorySlug::new("acme", "widgets"));
+        assert_eq!(
+            resolved.root,
+            directory.path().canonicalize().unwrap(),
+            "a path inside the clone should resolve to the clone's root",
+        );
+    }
+
+    #[test]
+    fn a_clone_with_no_github_remote_is_refused() {
+        let directory = clone_with_remote(Some("https://example.com/acme/widgets.git"));
+
+        let error = resolve_clone(directory.path()).unwrap_err();
+
+        assert!(matches!(error, CloneError::NoGithubRemote), "got {error}");
+        assert_eq!(error.to_string(), "no GitHub remote");
+    }
+
+    #[test]
+    fn a_clone_with_no_remotes_at_all_is_refused() {
+        let directory = clone_with_remote(None);
+
+        let error = resolve_clone(directory.path()).unwrap_err();
+
+        assert!(matches!(error, CloneError::NoGithubRemote), "got {error}");
+    }
+
+    #[test]
+    fn a_folder_that_is_not_a_git_repository_is_refused() {
+        let directory = TempDir::new().unwrap();
+
+        let error = resolve_clone(directory.path()).unwrap_err();
+
+        assert!(
+            matches!(error, CloneError::NotAGitRepository),
+            "got {error}",
+        );
+        assert_eq!(error.to_string(), "not a Git repository");
+    }
+
+    #[test]
+    fn a_folder_that_no_longer_exists_is_refused_as_missing() {
+        let directory = TempDir::new().unwrap();
+
+        let error = resolve_clone(&directory.path().join("moved-away")).unwrap_err();
+
+        assert!(matches!(error, CloneError::Missing), "got {error}");
+        assert_eq!(error.to_string(), "the folder no longer exists");
     }
 
     #[test]
