@@ -11,9 +11,13 @@
 //! knows about a database, a forge, or a UI framework.
 
 mod handoff;
+mod home;
 mod review;
 mod session;
 
 pub use handoff::Handoff;
+pub use home::{
+    AddRefusal, HomeGroup, HomeModel, RepositoryEntry, RepositoryOutcome, SettingsWrite,
+};
 pub use review::{FindingDisposition, ReviewModel, ReviewRunState};
 pub use session::{PendingSend, SessionModel, SessionPhase, SubmissionState, lock};
