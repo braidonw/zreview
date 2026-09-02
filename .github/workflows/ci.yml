@@ -32,6 +32,11 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
+      # tauri-build reads bundle.frontendDist from tauri.conf.json even for
+      # `cargo check`/`test`, and the frontend job builds it separately.
+      - name: Frontend dist placeholder
+        run: mkdir -p apps/desktop/dist
+
       - name: Formatting
         run: cargo fmt --all --check
 
@@ -43,6 +48,38 @@ jobs:
       # resolving to different versions than were reviewed.
       - name: Tests
         run: cargo test --workspace --locked
+
+  frontend:
+    # The desktop app's frontend has no macOS dependency, so it runs on the
+    # cheaper host rather than sharing the platform-locked check job.
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: apps/desktop
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11.25.0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: apps/desktop/pnpm-lock.yaml
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Typecheck
+        run: pnpm typecheck
+
+      - name: Tests
+        run: pnpm test
+
+      - name: Build
+        run: pnpm build
 
   deny:
     # Reads Cargo.lock and crate metadata only, so it does not need the macOS
