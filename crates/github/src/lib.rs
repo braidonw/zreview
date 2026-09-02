@@ -3,12 +3,20 @@ use std::{
     path::{Path, PathBuf},
     process::{Command, Output, Stdio},
     sync::Arc,
+    time::Duration,
 };
 
 use domain::{DiffSide, LoadStage, ReviewComment, ReviewSubmission};
 use git::{ComparisonDiff, ComparisonMode, GitRemote};
 use serde::Deserialize;
 use thiserror::Error;
+
+mod home;
+
+pub use home::{
+    DEFAULT_GRAPHQL_TIMEOUT, HomeFetch, HomePullRequest, HomeRepository, HomeSearch,
+    OpinionatedReview, RateLimit, ReviewDecision, ReviewState, ReviewThread, StatusCheckState,
+};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RepositorySlug {
@@ -84,6 +92,14 @@ pub enum GithubError {
         source: std::io::Error,
     },
 
+    /// As [`GithubError::Execute`], for the calls that name repositories by slug
+    /// and so run in no repository of their own.
+    #[error("failed to run gh: {source}")]
+    Spawn {
+        #[source]
+        source: std::io::Error,
+    },
+
     #[error("GitHub rejected the request as unauthenticated: {detail}")]
     Unauthenticated { detail: String },
 
@@ -108,8 +124,19 @@ pub enum GithubError {
     #[error("gh api failed with status {status}: {stderr}")]
     Command { status: i32, stderr: String },
 
+    #[error("gh did not respond within {timeout_ms}ms")]
+    Timeout { timeout_ms: u64 },
+
+    #[error("GitHub returned more than {pages} pages of {subject}")]
+    PagingLimit { pages: usize, subject: &'static str },
+
     #[error("GitHub returned invalid pull request JSON: {0}")]
     InvalidResponse(#[from] serde_json::Error),
+
+    /// A GraphQL response that parsed but cannot be trusted, such as a page that
+    /// claims a successor it gives no cursor for.
+    #[error("GitHub returned an unusable response: {detail}")]
+    InvalidGraphResponse { detail: String },
 
     #[error("GitHub review comment {id} is unusable: {message}")]
     InvalidComment { id: u64, message: String },
@@ -117,7 +144,7 @@ pub enum GithubError {
     #[error("GitHub returned PR #{actual} when #{expected} was requested")]
     UnexpectedPullRequest { expected: u64, actual: u64 },
 
-    #[error("GitHub returned base repository {actual}, expected {expected}")]
+    #[error("GitHub returned repository {actual}, expected {expected}")]
     UnexpectedRepository { expected: String, actual: String },
 
     #[error(
@@ -152,7 +179,7 @@ impl GithubError {
             Self::RateLimited { .. } => {
                 Some("Wait for the GitHub rate limit to reset, then retry.")
             }
-            Self::Network { .. } => {
+            Self::Network { .. } | Self::Timeout { .. } => {
                 Some("Check your network connection and https://githubstatus.com, then retry.")
             }
             Self::ServerError { .. } => Some("Check https://githubstatus.com, then retry."),
@@ -167,6 +194,9 @@ impl GithubError {
             ),
             Self::Command { .. }
             | Self::Execute { .. }
+            | Self::InvalidGraphResponse { .. }
+            | Self::PagingLimit { .. }
+            | Self::Spawn { .. }
             | Self::Validation { .. }
             | Self::InvalidResponse(_)
             | Self::InvalidComment { .. }
@@ -180,6 +210,7 @@ impl GithubError {
 #[derive(Clone, Debug)]
 pub struct GithubClient {
     gh_executable: PathBuf,
+    graphql_timeout: Duration,
 }
 
 impl Default for GithubClient {
@@ -193,7 +224,15 @@ impl GithubClient {
     pub fn new(executable: impl Into<PathBuf>) -> Self {
         Self {
             gh_executable: executable.into(),
+            graphql_timeout: DEFAULT_GRAPHQL_TIMEOUT,
         }
+    }
+
+    /// Sets how long one GraphQL call may run before `gh` is killed.
+    #[must_use]
+    pub const fn with_graphql_timeout(mut self, timeout: Duration) -> Self {
+        self.graphql_timeout = timeout;
+        self
     }
 
     /// Loads metadata and an exact local Git snapshot for one GitHub pull request.
@@ -771,15 +810,17 @@ fn parse_full_name(value: &str) -> Option<RepositorySlug> {
 }
 
 fn validate_slug_component(component: &str, selector: &str) -> Result<(), GithubError> {
-    let valid = !component.is_empty()
-        && component
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'));
+    let valid = !component.is_empty() && component.bytes().all(is_slug_byte);
     if valid {
         Ok(())
     } else {
         Err(GithubError::InvalidSelector(selector.to_owned()))
     }
+}
+
+/// The bytes GitHub allows in an owner or a repository name.
+const fn is_slug_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.')
 }
 
 fn validate_sha(value: &str) -> Result<(), String> {
