@@ -20,6 +20,7 @@
     "@tanstack/react-virtual": "^3.14.10",
     "@tauri-apps/api": "^2.11.1",
     "@tauri-apps/plugin-clipboard-manager": "^2.3.3",
+    "@tauri-apps/plugin-dialog": "^2.7.3",
     "react": "^19.2.8",
     "react-dom": "^19.2.8"
   },

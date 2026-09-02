@@ -3,6 +3,8 @@ import type {
   DraftsDto,
   FileDetailDto,
   FileSummaryDto,
+  HomeRepositoryDto,
+  HomeSnapshotDto,
   RowDto,
   SessionSnapshotDto,
   SidebarDto,
@@ -93,6 +95,32 @@ export function makeSnapshot(overrides: Partial<SessionSnapshotDto> = {}): Sessi
     subtitle: "Diff virtualization demo",
     sidebar: makeSidebar(),
     warnings: [],
+    ...overrides,
+  };
+}
+
+export function makeHomeRepository(overrides: Partial<HomeRepositoryDto> = {}): HomeRepositoryDto {
+  return {
+    path: "/Developer/zreview",
+    slug: "braidonw/zreview",
+    failure: null,
+    ...overrides,
+  };
+}
+
+export function makeHomeSnapshot(overrides: Partial<HomeSnapshotDto> = {}): HomeSnapshotDto {
+  return {
+    count_line: null,
+    groups: [
+      { title: "To review", count: 0, empty_copy: "Nothing waiting for your review." },
+      { title: "To address", count: 0, empty_copy: "Nothing to address." },
+      { title: "Waiting on others", count: 0, empty_copy: "Nothing waiting on others." },
+    ],
+    repositories: [],
+    footer_summary: "No repositories",
+    footer_expanded: false,
+    refusals: [],
+    failure: null,
     ...overrides,
   };
 }

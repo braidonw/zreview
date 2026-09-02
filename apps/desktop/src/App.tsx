@@ -1,37 +1,23 @@
-import { FailureScreen } from "./components/FailureScreen";
-import { LoadingScreen } from "./components/LoadingScreen";
-import { SessionShell } from "./components/SessionShell";
-import { useSession } from "./hooks/useSession";
+import { useEffect, useState } from "react";
+import type { LaunchDto } from "./bindings";
+import { commands } from "./bindings";
+import { HomeScreen } from "./components/HomeScreen";
+import { SessionApp } from "./SessionApp";
 
 export default function App() {
-  const {
-    state,
-    selectFile,
-    clickRow,
-    openComposer,
-    closeComposer,
-    composerChange,
-    composerDiscard,
-    reanchorDraft,
-  } = useSession();
+  const [launch, setLaunch] = useState<LaunchDto | null>(null);
 
-  switch (state.status) {
-    case "loading":
-      return <LoadingScreen description={state.description} stage={state.stage} />;
-    case "failed":
-      return <FailureScreen failure={state.failure} />;
-    case "ready":
-      return (
-        <SessionShell
-          state={state}
-          onSelectFile={selectFile}
-          onRowClick={clickRow}
-          onOpenComposer={openComposer}
-          onComposerChange={composerChange}
-          onComposerClose={closeComposer}
-          onComposerDiscard={composerDiscard}
-          onReanchorDraft={reanchorDraft}
-        />
-      );
+  useEffect(() => {
+    void commands.describeLaunch().then(setLaunch);
+  }, []);
+
+  // Nothing is rendered until the answer arrives, so neither screen flashes
+  // before the other.
+  if (launch === null) {
+    return null;
   }
+  if (launch === "Home") {
+    return <HomeScreen />;
+  }
+  return <SessionApp description={launch.Session.description} />;
 }

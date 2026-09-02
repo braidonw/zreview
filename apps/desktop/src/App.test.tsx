@@ -5,7 +5,7 @@ import type { Channel } from "@tauri-apps/api/core";
 import App from "./App";
 import { makeFile, makeFileSummary, makeRow, makeSidebar, makeSnapshot } from "./test/fixtures";
 
-const describeSession = vi.fn();
+const describeLaunch = vi.fn();
 const openSession = vi.fn();
 const selectFile = vi.fn();
 const toggleViewed = vi.fn();
@@ -15,7 +15,7 @@ const reanchorDraft = vi.fn();
 
 vi.mock("./bindings", () => ({
   commands: {
-    describeSession: () => describeSession(),
+    describeLaunch: () => describeLaunch(),
     openSession: (channel: unknown) => openSession(channel),
     selectFile: (index: unknown) => selectFile(index),
     toggleViewed: () => toggleViewed(),
@@ -31,8 +31,8 @@ vi.mock("@tauri-apps/plugin-clipboard-manager", () => ({
 }));
 
 beforeEach(() => {
-  describeSession.mockReset();
-  describeSession.mockResolvedValue("the generated fixture");
+  describeLaunch.mockReset();
+  describeLaunch.mockResolvedValue({ Session: { description: "the generated fixture" } });
   openSession.mockReset();
   selectFile.mockReset();
   toggleViewed.mockReset();
@@ -100,9 +100,8 @@ describe("App", () => {
     await waitFor(() => expect(screen.getByText("network unreachable")).toBeTruthy());
   });
 
-  it("shows the failure screen when describeSession itself rejects", async () => {
-    describeSession.mockReset();
-    describeSession.mockRejectedValue(new Error("IPC is unavailable"));
+  it("shows the failure screen when openSession itself rejects", async () => {
+    openSession.mockRejectedValue(new Error("IPC is unavailable"));
 
     render(<App />);
 
