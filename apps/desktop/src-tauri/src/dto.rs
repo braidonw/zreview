@@ -405,10 +405,10 @@ mod tests {
         .unwrap()
     }
 
-    /// A pull request session, built directly rather than through `session::load`
-    /// since that would need a live `gh`.
+    /// Built directly rather than through `session::load`, which needs a live `gh`.
     fn pull_request_session() -> ReviewSession {
-        let sha: Arc<str> = "a".repeat(40).into();
+        let base_sha: Arc<str> = "a".repeat(40).into();
+        let head_sha: Arc<str> = "b".repeat(40).into();
         ReviewSession::new(
             SessionSource::GitHubPullRequest {
                 repository_root: std::path::PathBuf::from("/tmp/repository"),
@@ -419,10 +419,10 @@ mod tests {
                 url: "https://github.com/acme/widgets/pull/42".into(),
                 base_ref: "main".into(),
                 head_ref: "feature".into(),
-                base_sha: Arc::clone(&sha),
-                recorded_base_sha: Arc::clone(&sha),
-                diff_base_sha: Arc::clone(&sha),
-                head_sha: sha,
+                base_sha: Arc::clone(&base_sha),
+                recorded_base_sha: base_sha.clone(),
+                diff_base_sha: base_sha,
+                head_sha,
             },
             vec![DiffFile::demo(1)].into(),
         )

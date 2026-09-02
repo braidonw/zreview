@@ -9,8 +9,7 @@ const USAGE: &str = "usage:
   desktop pr [<repository>] <number-or-url>";
 
 fn main() -> ExitCode {
-    // Only argument parsing happens before the window opens. Everything that can
-    // be slow or fail, such as Git, is reported inside the app.
+    // Only argument parsing happens before the window opens. Everything that can be slow or fail, such as Git, gh, or the network, is reported inside the app.
     let (request, storage) = match parse_arguments(&env::args().skip(1).collect::<Vec<_>>()) {
         Ok(parsed) => parsed,
         Err(message) => {
@@ -156,8 +155,6 @@ mod tests {
                 ReviewStorage::Default,
             ),
         );
-        // Without a repository the current directory is used, so this only
-        // asserts that the selector and storage survived.
         let (request, storage) = parse_arguments(&arguments(&["pr", "42"])).unwrap();
         assert!(matches!(
             request,
@@ -167,5 +164,26 @@ mod tests {
             },
         ));
         assert_eq!(storage, ReviewStorage::Default);
+    }
+
+    #[test]
+    fn a_pull_request_repository_accepts_a_url_selector() {
+        assert_eq!(
+            parse_arguments(&arguments(&[
+                "pr",
+                "/tmp/repository",
+                "https://github.com/acme/widgets/pull/42",
+            ]))
+            .unwrap(),
+            (
+                SessionRequest::PullRequest {
+                    repository: Path::new("/tmp/repository").to_path_buf(),
+                    selector: PullRequestSelector::Url(
+                        "https://github.com/acme/widgets/pull/42".to_owned()
+                    ),
+                },
+                ReviewStorage::Default,
+            ),
+        );
     }
 }

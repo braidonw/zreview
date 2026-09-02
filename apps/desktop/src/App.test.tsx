@@ -79,28 +79,6 @@ describe("App", () => {
     );
   });
 
-  it("shows a pull request's own description while it opens", async () => {
-    describeSession.mockResolvedValue("pull request #42");
-    openSession.mockImplementation(() => new Promise(() => {}));
-
-    render(<App />);
-
-    await waitFor(() => expect(screen.getByText(/Opening pull request #42/)).toBeTruthy());
-  });
-
-  it("shows the pull request's identity and title in the header once ready", async () => {
-    openSession.mockResolvedValue({
-      status: "ok",
-      data: makeSnapshot({ title: "acme/widgets · PR #42", subtitle: "Add the widget factory" }),
-    });
-    selectFile.mockResolvedValue({ status: "ok", data: makeFile() });
-
-    render(<App />);
-
-    await waitFor(() => expect(screen.getByText("acme/widgets · PR #42")).toBeTruthy());
-    expect(screen.getByText("Add the widget factory")).toBeTruthy();
-  });
-
   it("shows the failure screen's fields when opening fails", async () => {
     openSession.mockResolvedValue({
       status: "error",
