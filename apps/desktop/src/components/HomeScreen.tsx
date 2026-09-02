@@ -5,10 +5,13 @@ import "./HomeScreen.css";
 
 /** The screen ZReview opens on when no pull request has been named. */
 export function HomeScreen() {
-  const { snapshot, toggleFooter, dismissRefusals, addRepositories, removeRepository } = useHome();
+  const { snapshot, failure, toggleFooter, addRepositories, removeRepository } = useHome();
 
-  // Nothing is drawn until the first read answers, so no empty state flashes
-  // in front of a list that is about to arrive.
+  // A command that never answered leaves nothing worth trusting on screen.
+  if (failure !== null) {
+    return <FailureScreen failure={failure} />;
+  }
+  // Nothing is drawn until the first read answers, so no empty state flashes in front of a list.
   if (snapshot === null) {
     return null;
   }
@@ -34,18 +37,11 @@ export function HomeScreen() {
             Add...
           </button>
         </div>
-        {snapshot.refusals.length > 0 && (
-          <div className="home__refusals">
-            {snapshot.refusals.map((refusal) => (
-              <div className="home__refusal" key={refusal.folder}>
-                {refusal.folder}: {refusal.reason}
-              </div>
-            ))}
-            <button className="home__dismiss" type="button" onClick={dismissRefusals}>
-              Dismiss
-            </button>
+        {snapshot.refusals.map((refusal) => (
+          <div className="home__refusal" key={refusal.path}>
+            {refusal.path}: {refusal.reason}
           </div>
-        )}
+        ))}
         {snapshot.footer_expanded &&
           snapshot.repositories.map((repository) => (
             <div className="home__repository" key={repository.path}>
@@ -90,6 +86,16 @@ function HomeBody({ snapshot, onAdd }: { snapshot: HomeSnapshotDto; onAdd: () =>
   }
   return (
     <div className="home__body home__body--list">
+      {snapshot.write_failure !== null && (
+        <div className="home__write-failure">
+          <span>{snapshot.write_failure.summary}</span>
+          {snapshot.write_failure.remediation !== null && (
+            <span className="home__write-remediation">
+              {snapshot.write_failure.remediation}
+            </span>
+          )}
+        </div>
+      )}
       {snapshot.groups.map((group) => (
         <section className="home__group" key={group.title}>
           <div className="home__group-label">

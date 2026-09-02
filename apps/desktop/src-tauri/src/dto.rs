@@ -227,10 +227,10 @@ pub struct HomeRepositoryDto {
     pub failure: Option<String>,
 }
 
-/// A picked folder Home would not add, and why.
+/// Something Home would not do, and why.
 #[derive(Clone, Debug, Serialize, specta::Type)]
-pub struct AddRefusalDto {
-    pub folder: String,
+pub struct RefusalDto {
+    pub path: String,
     pub reason: String,
 }
 
@@ -243,10 +243,13 @@ pub struct HomeSnapshotDto {
     pub repositories: Vec<HomeRepositoryDto>,
     pub footer_summary: String,
     pub footer_expanded: bool,
-    pub refusals: Vec<AddRefusalDto>,
+    pub refusals: Vec<RefusalDto>,
     /// What replaces the list area when Home cannot read its repositories. The
     /// header and footer stay either way, so Add still works.
     pub failure: Option<SessionFailureDto>,
+    /// Why the last write did not reach the file, shown as a line above the
+    /// list, which stays because reading it still worked.
+    pub write_failure: Option<SessionFailureDto>,
 }
 
 /// Everything Home shows, from the model that decided it.
@@ -279,12 +282,13 @@ pub fn project_home(home: &app::HomeModel) -> HomeSnapshotDto {
         refusals: home
             .refusals()
             .iter()
-            .map(|refusal| AddRefusalDto {
-                folder: refusal.folder.display().to_string(),
+            .map(|refusal| RefusalDto {
+                path: refusal.path.display().to_string(),
                 reason: refusal.reason.clone(),
             })
             .collect(),
         failure: home.failure().map(Into::into),
+        write_failure: home.write_failure().map(Into::into),
     }
 }
 
@@ -718,7 +722,10 @@ mod tests {
             Some("the folder no longer exists")
         );
         assert_eq!(snapshot.footer_summary, "2 repositories \u{b7} 1 failed");
-        assert_eq!(snapshot.count_line.as_deref(), Some("2 repositories"));
+        assert_eq!(
+            snapshot.count_line.as_deref(),
+            Some("0 pull requests across 2 repositories"),
+        );
     }
 
     #[test]

@@ -19,13 +19,13 @@ mod review;
 mod session;
 
 pub use handoff::Handoff;
-pub use home::{
-    AddRefusal, HomeGroup, HomeModel, RepositoryEntry, RepositoryOutcome, SettingsWrite,
-};
+pub use home::{HomeGroup, HomeModel, Refusal, RepositoryEntry, RepositoryOutcome, SettingsWrite};
 pub use review::{FindingDisposition, ReviewModel, ReviewRunState};
 pub use session::{PendingSend, SessionModel, SessionPhase, SubmissionState};
 
-/// Takes a model's lock, recovering from poisoning: the guarded state stays consistent, and refusing to use it would be worse than the panic that poisoned it.
+/// Takes a model's lock, recovering from poisoning. The guarded state stays
+/// consistent, and refusing to use it would be worse than the panic that
+/// poisoned it.
 pub fn lock<T>(model: &Mutex<T>) -> MutexGuard<'_, T> {
     model.lock().unwrap_or_else(PoisonError::into_inner)
 }

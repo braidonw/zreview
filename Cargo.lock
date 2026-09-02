@@ -1726,7 +1726,6 @@ version = "0.1.0"
 dependencies = [
  "app",
  "domain",
- "git",
  "github",
  "serde",
  "serde_json",

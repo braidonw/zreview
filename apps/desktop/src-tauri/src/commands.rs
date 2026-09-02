@@ -8,13 +8,13 @@ use std::{
     },
 };
 
-use app::{HomeModel, SessionPhase, SettingsWrite, lock};
+use app::{SessionPhase, SettingsWrite, lock};
 use domain::DiffSide;
 use session::{ReviewStorage, SessionRequest};
 use tauri::ipc::Channel;
 use tauri_specta::collect_commands;
 
-use crate::{AppRoot, ManagedSession, dto, repositories};
+use crate::{AppRoot, ManagedHome, ManagedSession, dto, repositories};
 
 /// The specta builder, shared between the invoke handler and the bindings export.
 #[must_use]
@@ -25,7 +25,6 @@ pub fn specta_builder() -> tauri_specta::Builder<tauri::Wry> {
         add_repositories,
         remove_repository,
         toggle_repositories_footer,
-        dismiss_refusals,
         open_session,
         select_file,
         toggle_viewed,
@@ -36,47 +35,72 @@ pub fn specta_builder() -> tauri_specta::Builder<tauri::Wry> {
 }
 
 /// Re-reads the settings file and resolves every clone it lists.
-fn refresh_home_on_model(home: &Mutex<HomeModel>, settings_path: &Path) {
-    let read = repositories::read(settings_path);
-    lock(home).refreshed(read);
+fn refresh_home_on_model(home: &ManagedHome, settings_path: &Path) {
+    let _ordered = lock(&home.settings_action);
+    read_into_model(home, settings_path);
 }
 
 /// Adds the folders a reviewer picked, then leaves Home showing the file.
-fn add_repositories_on_model(home: &Mutex<HomeModel>, settings_path: &Path, folders: &[PathBuf]) {
+fn add_repositories_on_model(home: &ManagedHome, settings_path: &Path, folders: &[PathBuf]) {
+    let _ordered = lock(&home.settings_action);
     let picked = repositories::resolve_picked(folders);
-    let write = lock(home).add_repositories(picked);
-    write_then_refresh(home, settings_path, write);
+    let write = lock(&home.model).add_repositories(settings_path, picked);
+    write_then_read(home, settings_path, write);
 }
 
 /// Drops the entry listed at `path`, then leaves Home showing the file.
-fn remove_repository_on_model(home: &Mutex<HomeModel>, settings_path: &Path, path: &Path) {
-    let write = lock(home).remove_repository(path);
-    write_then_refresh(home, settings_path, write);
+fn remove_repository_on_model(home: &ManagedHome, settings_path: &Path, path: &Path) {
+    let _ordered = lock(&home.settings_action);
+    let write = lock(&home.model).remove_repository(settings_path, path);
+    write_then_read(home, settings_path, write);
 }
 
-/// Writes what an action asked for and refreshes from the file it wrote.
+/// Reads the settings file into the model. The caller holds the action guard.
+fn read_into_model(home: &ManagedHome, settings_path: &Path) {
+    let read = repositories::read(settings_path);
+    lock(&home.model).refreshed(read);
+}
+
+/// Writes what an action asked for and reads back the file it wrote.
 ///
-/// The refresh runs whether or not the write worked, so what Home shows is
-/// always what the file actually holds. A write that failed is reported after
-/// it, since the refresh clears the last failure.
-fn write_then_refresh(home: &Mutex<HomeModel>, settings_path: &Path, write: Option<SettingsWrite>) {
-    let written = write.map(|write| repositories::write(settings_path, write.repositories));
-    refresh_home_on_model(home, settings_path);
-    if let Some(Err(failure)) = written {
-        lock(home).failed(failure);
+/// The read runs whether or not the write worked, so what Home shows is always
+/// what the file actually holds. A write that failed is its own line above the
+/// list rather than a screen in front of it.
+fn write_then_read(home: &ManagedHome, settings_path: &Path, write: Option<SettingsWrite>) {
+    if let Some(write) = write {
+        let written = repositories::write(settings_path, write.repositories);
+        lock(&home.model).write_finished(written);
     }
+    read_into_model(home, settings_path);
 }
 
 /// Runs `action` against the settings file, then projects what Home now shows.
 ///
 /// A machine with no home directory has nowhere to keep the file, which is a
 /// whole-Home failure rather than something an action can work around.
-fn on_settings_file(home: &Mutex<HomeModel>, action: impl FnOnce(&Path)) -> dto::HomeSnapshotDto {
+fn on_settings_file(
+    home: &ManagedHome,
+    action: impl FnOnce(&ManagedHome, &Path),
+) -> dto::HomeSnapshotDto {
     match repositories::settings_path() {
-        Ok(path) => action(&path),
-        Err(failure) => lock(home).refreshed(Err(failure)),
+        Ok(path) => action(home, &path),
+        Err(failure) => lock(&home.model).refreshed(Err(failure)),
     }
-    dto::project_home(&lock(home))
+    dto::project_home(&lock(&home.model))
+}
+
+/// Runs Home's file and Git work away from the UI thread.
+///
+/// The only failure is the task not finishing at all, which the frontend shows
+/// rather than waiting on a promise that will never settle.
+async fn off_the_ui_thread(
+    work: impl FnOnce() -> dto::HomeSnapshotDto + Send + 'static,
+) -> Result<dto::HomeSnapshotDto, dto::SessionFailureDto> {
+    tauri::async_runtime::spawn_blocking(work)
+        .await
+        .map_err(|error| {
+            dto::command_failure(format!("Home could not finish that action: {error}"))
+        })
 }
 
 /// Loads `request` into `model`, reporting each stage's label to `report`.
@@ -317,43 +341,67 @@ pub async fn open_session(
 /// Re-reads the settings file and resolves every clone it lists.
 ///
 /// Runs when Home opens, after an Add or a Remove, and on `r`. A settings file
-/// that cannot be read comes back as the snapshot's failure rather than as a
-/// command error, because the header and footer stay on screen either way.
-#[tauri::command(async)]
+/// that cannot be read comes back inside the snapshot rather than as a command
+/// error, because the header and footer stay on screen either way.
+///
+/// # Errors
+///
+/// Returns a failure when the task doing the reading does not finish.
+#[tauri::command]
 #[specta::specta]
 #[allow(clippy::needless_pass_by_value)]
-pub fn refresh_home(state: tauri::State<'_, AppRoot>) -> dto::HomeSnapshotDto {
-    on_settings_file(&state.home, |path| {
-        refresh_home_on_model(&state.home, path);
-    })
+pub async fn refresh_home(
+    state: tauri::State<'_, AppRoot>,
+) -> Result<dto::HomeSnapshotDto, dto::SessionFailureDto> {
+    let home = state.home.clone();
+    off_the_ui_thread(move || on_settings_file(&home, refresh_home_on_model)).await
 }
 
 /// Adds the folders the reviewer picked, writing the file once and refreshing.
 ///
 /// A folder that is not a clone of a GitHub repository is refused with its
 /// reason while the rest proceed, and one already listed is ignored.
-#[tauri::command(async)]
+///
+/// # Errors
+///
+/// Returns a failure when the task doing the work does not finish.
+#[tauri::command]
 #[specta::specta]
 #[allow(clippy::needless_pass_by_value)]
-pub fn add_repositories(
+pub async fn add_repositories(
     state: tauri::State<'_, AppRoot>,
     folders: Vec<String>,
-) -> dto::HomeSnapshotDto {
+) -> Result<dto::HomeSnapshotDto, dto::SessionFailureDto> {
+    let home = state.home.clone();
     let folders = folders.into_iter().map(PathBuf::from).collect::<Vec<_>>();
-    on_settings_file(&state.home, |path| {
-        add_repositories_on_model(&state.home, path, &folders);
+    off_the_ui_thread(move || {
+        on_settings_file(&home, |home, path| {
+            add_repositories_on_model(home, path, &folders);
+        })
     })
+    .await
 }
 
 /// Drops one configured clone, writing the file and refreshing.
-#[tauri::command(async)]
+///
+/// # Errors
+///
+/// Returns a failure when the task doing the work does not finish.
+#[tauri::command]
 #[specta::specta]
 #[allow(clippy::needless_pass_by_value)]
-pub fn remove_repository(state: tauri::State<'_, AppRoot>, path: String) -> dto::HomeSnapshotDto {
+pub async fn remove_repository(
+    state: tauri::State<'_, AppRoot>,
+    path: String,
+) -> Result<dto::HomeSnapshotDto, dto::SessionFailureDto> {
+    let home = state.home.clone();
     let path = PathBuf::from(path);
-    on_settings_file(&state.home, |settings_path| {
-        remove_repository_on_model(&state.home, settings_path, &path);
+    off_the_ui_thread(move || {
+        on_settings_file(&home, |home, settings_path| {
+            remove_repository_on_model(home, settings_path, &path);
+        })
     })
+    .await
 }
 
 /// Opens or closes the Repositories footer.
@@ -361,17 +409,8 @@ pub fn remove_repository(state: tauri::State<'_, AppRoot>, path: String) -> dto:
 #[specta::specta]
 #[allow(clippy::needless_pass_by_value)]
 pub fn toggle_repositories_footer(state: tauri::State<'_, AppRoot>) -> dto::HomeSnapshotDto {
-    lock(&state.home).toggle_footer();
-    dto::project_home(&lock(&state.home))
-}
-
-/// Clears the refusals the last Add reported.
-#[tauri::command]
-#[specta::specta]
-#[allow(clippy::needless_pass_by_value)]
-pub fn dismiss_refusals(state: tauri::State<'_, AppRoot>) -> dto::HomeSnapshotDto {
-    lock(&state.home).dismiss_refusals();
-    dto::project_home(&lock(&state.home))
+    lock(&state.home.model).toggle_footer();
+    dto::project_home(&lock(&state.home.model))
 }
 
 /// Which screen the binary was launched into, asked once before anything is
@@ -755,7 +794,7 @@ mod tests {
             head: "feature".to_owned(),
         };
         let root = AppRoot {
-            home: Arc::new(Mutex::new(HomeModel::new())),
+            home: ManagedHome::new(),
             session: Some(ManagedSession {
                 model: Arc::new(Mutex::new(app::SessionModel::loading(
                     request.description(),
@@ -777,7 +816,7 @@ mod tests {
     #[test]
     fn a_launch_with_no_session_is_described_as_home() {
         let root = AppRoot {
-            home: Arc::new(Mutex::new(HomeModel::new())),
+            home: ManagedHome::new(),
             session: None,
         };
 
@@ -800,8 +839,13 @@ mod tests {
         directory
     }
 
-    fn home_model() -> Mutex<app::HomeModel> {
-        Mutex::new(app::HomeModel::new())
+    fn home_model() -> ManagedHome {
+        ManagedHome::new()
+    }
+
+    /// What Home shows once an action has finished.
+    fn snapshot(home: &ManagedHome) -> dto::HomeSnapshotDto {
+        dto::project_home(&lock(&home.model))
     }
 
     /// The repository paths the settings file now holds.
@@ -817,7 +861,7 @@ mod tests {
         let home = home_model();
 
         refresh_home_on_model(&home, &settings_path);
-        assert!(lock(&home).repositories().is_empty());
+        assert!(lock(&home.model).repositories().is_empty());
 
         std::fs::write(
             &settings_path,
@@ -829,7 +873,7 @@ mod tests {
         .unwrap();
         refresh_home_on_model(&home, &settings_path);
 
-        let guard = lock(&home);
+        let guard = lock(&home.model);
         assert_eq!(guard.repositories().len(), 1, "a hand edit is picked up");
         assert_eq!(guard.repositories()[0].slug(), Some("acme/widgets"));
     }
@@ -844,7 +888,10 @@ mod tests {
         add_repositories_on_model(&home, &settings_path, &[clone.path().to_path_buf()]);
 
         assert_eq!(listed(&settings_path).len(), 1);
-        assert_eq!(lock(&home).repositories()[0].slug(), Some("acme/widgets"));
+        assert_eq!(
+            lock(&home.model).repositories()[0].slug(),
+            Some("acme/widgets")
+        );
     }
 
     #[test]
@@ -860,7 +907,7 @@ mod tests {
             !settings_path.exists(),
             "nothing was accepted, so the file is never touched",
         );
-        let guard = lock(&home);
+        let guard = lock(&home.model);
         assert_eq!(guard.refusals().len(), 1);
         assert_eq!(guard.refusals()[0].reason, "not a Git repository");
     }
@@ -877,17 +924,20 @@ mod tests {
             &settings_path,
             &[first.path().to_path_buf(), second.path().to_path_buf()],
         );
-        let listed_first = lock(&home).repositories()[0].path.clone();
+        let listed_first = lock(&home.model).repositories()[0].path.clone();
 
         remove_repository_on_model(&home, &settings_path, &listed_first);
 
         assert_eq!(listed(&settings_path).len(), 1);
-        assert_eq!(lock(&home).repositories()[0].slug(), Some("acme/billing"));
+        assert_eq!(
+            lock(&home.model).repositories()[0].slug(),
+            Some("acme/billing")
+        );
     }
 
     #[cfg(unix)]
     #[test]
-    fn a_settings_file_that_cannot_be_written_is_reported_with_the_list_still_standing() {
+    fn a_settings_file_that_cannot_be_written_is_a_line_above_a_list_that_stays() {
         use std::os::unix::fs::PermissionsExt;
 
         let clone = clone_of("acme/widgets");
@@ -902,18 +952,99 @@ mod tests {
         let second = clone_of("acme/billing");
         add_repositories_on_model(&home, &settings_path, &[second.path().to_path_buf()]);
 
-        let guard = lock(&home);
+        let shown = snapshot(&home);
         assert_eq!(
-            guard
-                .failure()
+            shown
+                .write_failure
                 .expect("the write failure should be shown")
                 .summary,
             "Home could not save your settings",
         );
+        assert!(
+            shown.failure.is_none(),
+            "a write failure never replaces the list",
+        );
         assert_eq!(
-            guard.repositories().len(),
+            shown.repositories.len(),
             1,
             "the clone that is configured is still listed",
+        );
+    }
+
+    /// A write replaces the whole file, so writing over one Home could not parse
+    /// would drop every repository it never managed to read.
+    #[test]
+    fn adding_over_a_malformed_settings_file_leaves_the_file_exactly_as_it_was() {
+        let clone = clone_of("acme/widgets");
+        let directory = TempDir::new().unwrap();
+        let settings_path = directory.path().join("settings.toml");
+        let malformed = "repositories = [this is not valid toml";
+        std::fs::write(&settings_path, malformed).unwrap();
+        let home = home_model();
+        refresh_home_on_model(&home, &settings_path);
+
+        add_repositories_on_model(&home, &settings_path, &[clone.path().to_path_buf()]);
+
+        assert_eq!(
+            std::fs::read_to_string(&settings_path).unwrap(),
+            malformed,
+            "the file a reviewer has to fix must survive the attempt",
+        );
+        let shown = snapshot(&home);
+        assert_eq!(shown.refusals.len(), 1);
+        assert_eq!(shown.refusals[0].path, settings_path.display().to_string());
+        assert_eq!(
+            shown.refusals[0].reason,
+            "fix this file before changing your repositories",
+        );
+    }
+
+    #[test]
+    fn removing_over_a_malformed_settings_file_leaves_the_file_exactly_as_it_was() {
+        let directory = TempDir::new().unwrap();
+        let settings_path = directory.path().join("settings.toml");
+        let malformed = "repositories = [this is not valid toml";
+        std::fs::write(&settings_path, malformed).unwrap();
+        let home = home_model();
+        refresh_home_on_model(&home, &settings_path);
+
+        remove_repository_on_model(&home, &settings_path, Path::new("/Developer/zreview"));
+
+        assert_eq!(std::fs::read_to_string(&settings_path).unwrap(), malformed,);
+    }
+
+    /// Two clicks landing together must not read the same list twice and write
+    /// back one that still holds the entry the other removed.
+    #[test]
+    fn two_concurrent_removes_leave_neither_entry_in_the_file() {
+        let first = clone_of("acme/widgets");
+        let second = clone_of("acme/billing");
+        let directory = TempDir::new().unwrap();
+        let settings_path = directory.path().join("settings.toml");
+        let home = home_model();
+        add_repositories_on_model(
+            &home,
+            &settings_path,
+            &[first.path().to_path_buf(), second.path().to_path_buf()],
+        );
+        let paths = lock(&home.model)
+            .repositories()
+            .iter()
+            .map(|entry| entry.path.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(paths.len(), 2);
+
+        thread::scope(|scope| {
+            for path in &paths {
+                let home = &home;
+                let settings_path = &settings_path;
+                scope.spawn(move || remove_repository_on_model(home, settings_path, path));
+            }
+        });
+
+        assert!(
+            listed(&settings_path).is_empty(),
+            "one remove read a list the other had already changed",
         );
     }
 

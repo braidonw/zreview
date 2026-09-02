@@ -16,23 +16,35 @@ export const commands = {
 	 *  Re-reads the settings file and resolves every clone it lists.
 	 * 
 	 *  Runs when Home opens, after an Add or a Remove, and on `r`. A settings file
-	 *  that cannot be read comes back as the snapshot's failure rather than as a
-	 *  command error, because the header and footer stay on screen either way.
+	 *  that cannot be read comes back inside the snapshot rather than as a command
+	 *  error, because the header and footer stay on screen either way.
+	 * 
+	 *  # Errors
+	 * 
+	 *  Returns a failure when the task doing the reading does not finish.
 	 */
-	refreshHome: () => __TAURI_INVOKE<HomeSnapshotDto>("refresh_home"),
+	refreshHome: () => typedError<HomeSnapshotDto, SessionFailureDto>(__TAURI_INVOKE("refresh_home")),
 	/**
 	 *  Adds the folders the reviewer picked, writing the file once and refreshing.
 	 * 
 	 *  A folder that is not a clone of a GitHub repository is refused with its
 	 *  reason while the rest proceed, and one already listed is ignored.
+	 * 
+	 *  # Errors
+	 * 
+	 *  Returns a failure when the task doing the work does not finish.
 	 */
-	addRepositories: (folders: string[]) => __TAURI_INVOKE<HomeSnapshotDto>("add_repositories", { folders }),
-	/**  Drops one configured clone, writing the file and refreshing. */
-	removeRepository: (path: string) => __TAURI_INVOKE<HomeSnapshotDto>("remove_repository", { path }),
+	addRepositories: (folders: string[]) => typedError<HomeSnapshotDto, SessionFailureDto>(__TAURI_INVOKE("add_repositories", { folders })),
+	/**
+	 *  Drops one configured clone, writing the file and refreshing.
+	 * 
+	 *  # Errors
+	 * 
+	 *  Returns a failure when the task doing the work does not finish.
+	 */
+	removeRepository: (path: string) => typedError<HomeSnapshotDto, SessionFailureDto>(__TAURI_INVOKE("remove_repository", { path })),
 	/**  Opens or closes the Repositories footer. */
 	toggleRepositoriesFooter: () => __TAURI_INVOKE<HomeSnapshotDto>("toggle_repositories_footer"),
-	/**  Clears the refusals the last Add reported. */
-	dismissRefusals: () => __TAURI_INVOKE<HomeSnapshotDto>("dismiss_refusals"),
 	/**
 	 *  Loads the review session the window was opened with, reporting each stage on
 	 *  `on_stage` as it goes.
@@ -91,12 +103,6 @@ export const commands = {
 };
 
 /* Types */
-/**  A picked folder Home would not add, and why. */
-export type AddRefusalDto = {
-	folder: string,
-	reason: string,
-};
-
 /**  A draft resolved to the row it is drawn on. */
 export type AnchoredDraftDto = {
 	row: number,
@@ -180,18 +186,29 @@ export type HomeSnapshotDto = {
 	repositories: HomeRepositoryDto[],
 	footer_summary: string,
 	footer_expanded: boolean,
-	refusals: AddRefusalDto[],
+	refusals: RefusalDto[],
 	/**
 	 *  What replaces the list area when Home cannot read its repositories. The
 	 *  header and footer stay either way, so Add still works.
 	 */
 	failure: SessionFailureDto | null,
+	/**
+	 *  Why the last write did not reach the file, shown as a line above the
+	 *  list, which stays because reading it still worked.
+	 */
+	write_failure: SessionFailureDto | null,
 };
 
 /**  Which screen the binary was launched into. */
 export type LaunchDto = "Home" | { Session: {
 	description: string,
 } };
+
+/**  Something Home would not do, and why. */
+export type RefusalDto = {
+	path: string,
+	reason: string,
+};
 
 export type RowDto = {
 	kind: DiffLineKindDto,

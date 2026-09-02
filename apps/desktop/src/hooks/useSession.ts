@@ -1,24 +1,12 @@
 import { useCallback, useEffect, useReducer, useRef } from "react";
 import { Channel } from "@tauri-apps/api/core";
 import { writeText } from "@tauri-apps/plugin-clipboard-manager";
-import type { DiffSideDto, SessionFailureDto } from "../bindings";
+import type { DiffSideDto } from "../bindings";
 import { commands } from "../bindings";
 import { clamp } from "../lib/clamp";
+import { toFailure } from "../lib/failure";
 import { initialState, selectionRange, sessionReducer } from "./sessionReducer";
 import { useDraftQueue } from "./useDraftQueue";
-
-/** Narrows a command rejection into a SessionFailureDto. */
-function toFailure(error: unknown): SessionFailureDto {
-  if (
-    typeof error === "object" &&
-    error !== null &&
-    "summary" in error &&
-    typeof (error as { summary: unknown }).summary === "string"
-  ) {
-    return error as SessionFailureDto;
-  }
-  return { summary: String(error), detail: null, remediation: null };
-}
 
 /** Loads the session the window was launched into and exposes every action the UI can take on it. */
 export function useSession(description: string) {

@@ -79,7 +79,7 @@ describe("App", () => {
     );
   });
 
-  it("shows the failure screen's fields when opening fails", async () => {
+  it("shows the failure screen's fields, remediation before detail", async () => {
     openSession.mockResolvedValue({
       status: "error",
       error: { summary: "Could not load", detail: "boom", remediation: "try again" },
@@ -88,8 +88,9 @@ describe("App", () => {
     render(<App />);
 
     await waitFor(() => expect(screen.getByText("Could not load")).toBeTruthy());
-    expect(screen.getByText("boom")).toBeTruthy();
-    expect(screen.getByText("try again")).toBeTruthy();
+    expect(document.querySelector(".failure-screen")?.textContent).toBe(
+      "Could not loadtry againboom",
+    );
   });
 
   it("renders the failure screen for a plain-string command rejection", async () => {
@@ -106,6 +107,17 @@ describe("App", () => {
     render(<App />);
 
     await waitFor(() => expect(screen.getByText("Error: IPC is unavailable")).toBeTruthy());
+  });
+
+  it("shows the failure screen when the launch call rejects", async () => {
+    describeLaunch.mockReset();
+    describeLaunch.mockRejectedValue(new Error("the launch could not be described"));
+
+    render(<App />);
+
+    await waitFor(() =>
+      expect(screen.getByText("Error: the launch could not be described")).toBeTruthy(),
+    );
   });
 
   describe("once ready", () => {

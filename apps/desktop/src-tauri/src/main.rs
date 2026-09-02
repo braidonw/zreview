@@ -29,32 +29,32 @@ fn main() -> ExitCode {
 fn parse_arguments(arguments: &[String]) -> Result<Launch, String> {
     match arguments {
         [] => Ok(Launch::Home),
-        [only] if only == "demo" => Ok(session(SessionRequest::Demo, ReviewStorage::Disabled)),
-        [first, rest @ ..] if first == "pr" => {
-            Ok(session(parse_pull_request(rest)?, ReviewStorage::Default))
-        }
-        [repository, base] => Ok(session(
-            SessionRequest::LocalComparison {
+        [only] if only == "demo" => Ok(Launch::Session {
+            request: SessionRequest::Demo,
+            storage: ReviewStorage::Disabled,
+        }),
+        [first, rest @ ..] if first == "pr" => Ok(Launch::Session {
+            request: parse_pull_request(rest)?,
+            storage: ReviewStorage::Default,
+        }),
+        [repository, base] => Ok(Launch::Session {
+            request: SessionRequest::LocalComparison {
                 repository: Path::new(repository).to_path_buf(),
                 base: base.clone(),
                 head: "HEAD".to_owned(),
             },
-            ReviewStorage::Default,
-        )),
-        [repository, base, head] => Ok(session(
-            SessionRequest::LocalComparison {
+            storage: ReviewStorage::Default,
+        }),
+        [repository, base, head] => Ok(Launch::Session {
+            request: SessionRequest::LocalComparison {
                 repository: Path::new(repository).to_path_buf(),
                 base: base.clone(),
                 head: head.clone(),
             },
-            ReviewStorage::Default,
-        )),
+            storage: ReviewStorage::Default,
+        }),
         _ => Err("expected a repository, base revision, and optional head revision".to_owned()),
     }
-}
-
-fn session(request: SessionRequest, storage: ReviewStorage) -> Launch {
-    Launch::Session { request, storage }
 }
 
 fn parse_pull_request(arguments: &[String]) -> Result<SessionRequest, String> {

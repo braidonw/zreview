@@ -71,6 +71,21 @@
   color: var(--text-secondary);
 }
 
+.home__write-failure {
+  min-height: var(--file-row-height);
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  font-family: var(--font-sans);
+  font-size: var(--size-body);
+  color: var(--severity-error-text);
+}
+
+.home__write-remediation {
+  font-size: var(--size-meta);
+  color: var(--text-secondary);
+}
+
 .home__group {
   padding-top: 20px;
   display: flex;
@@ -100,7 +115,7 @@
 }
 
 .home__group-empty {
-  height: 36px;
+  height: var(--file-row-height);
   display: flex;
   align-items: center;
   font-family: var(--font-sans);
@@ -169,12 +184,6 @@
   background: var(--accent-hover);
 }
 
-.home__refusals {
-  display: flex;
-  flex-direction: column;
-  gap: 2px;
-}
-
 .home__refusal {
   height: 24px;
   display: flex;
@@ -182,17 +191,6 @@
   font-family: var(--font-mono);
   font-size: var(--size-meta);
   color: var(--severity-warning-text);
-}
-
-.home__dismiss {
-  align-self: flex-start;
-  padding: 0;
-  border: 0;
-  background: none;
-  font-family: var(--font-sans);
-  font-size: var(--size-label);
-  color: var(--text-tertiary);
-  cursor: pointer;
 }
 
 .home__repository {

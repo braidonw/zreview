@@ -62,13 +62,15 @@ impl RepositoryEntry {
     }
 }
 
-/// A picked folder Home would not add, and why.
+/// Something Home would not do, and why.
 ///
-/// Shown until the next Add answers it or the reviewer dismisses it, so a
-/// selection that was partly refused says which part and what was wrong with it.
+/// Replaced by the next Add, so a selection that was partly refused says which
+/// part and what was wrong with it until the reviewer picks again.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct AddRefusal {
-    pub folder: PathBuf,
+pub struct Refusal {
+    /// The folder that was picked, or the settings file when the action itself
+    /// was refused.
+    pub path: PathBuf,
     pub reason: String,
 }
 
@@ -122,8 +124,9 @@ impl HomeGroup {
 pub struct HomeModel {
     repositories: Vec<RepositoryEntry>,
     failure: Option<SessionFailure>,
+    write_failure: Option<SessionFailure>,
     footer_expanded: bool,
-    refusals: Vec<AddRefusal>,
+    refusals: Vec<Refusal>,
 }
 
 impl HomeModel {
@@ -150,10 +153,13 @@ impl HomeModel {
         }
     }
 
-    /// Records a failure that leaves the repository list standing, such as a
-    /// settings file that could be read but not written.
-    pub fn failed(&mut self, failure: SessionFailure) {
-        self.failure = Some(failure);
+    /// Takes what came of writing the settings file.
+    ///
+    /// Kept apart from [`Self::failure`] because a file that could be read but
+    /// not written leaves a list worth showing. The failure is a line above it,
+    /// not a screen in front of it, and both can be true at once.
+    pub fn write_finished(&mut self, result: Result<(), SessionFailure>) {
+        self.write_failure = result.err();
     }
 
     #[must_use]
@@ -162,9 +168,18 @@ impl HomeModel {
     }
 
     /// What stops Home listing anything at all, if anything does.
+    ///
+    /// Only a settings file that could not be read, or no home directory to look
+    /// for one in. A write that failed is [`Self::write_failure`].
     #[must_use]
     pub const fn failure(&self) -> Option<&SessionFailure> {
         self.failure.as_ref()
+    }
+
+    /// Why the last write did not reach the file, if it did not.
+    #[must_use]
+    pub const fn write_failure(&self) -> Option<&SessionFailure> {
+        self.write_failure.as_ref()
     }
 
     /// How many configured clones could not be resolved.
@@ -178,10 +193,15 @@ impl HomeModel {
 
     /// The header's count line, absent while there is nothing to count.
     ///
-    /// The pull requests it will also count are not fetched yet.
+    /// No pull requests have been fetched yet, so the count of them is zero.
     #[must_use]
     pub fn count_line(&self) -> Option<String> {
-        (!self.repositories.is_empty()).then(|| repository_count(self.repositories.len()))
+        (!self.repositories.is_empty()).then(|| {
+            format!(
+                "0 pull requests across {}",
+                repository_count(self.repositories.len())
+            )
+        })
     }
 
     /// Takes the folders a reviewer picked, saying what the file should now hold.
@@ -192,7 +212,15 @@ impl HomeModel {
     /// says nothing a reviewer needs to act on. Nothing is written when nothing
     /// was accepted.
     #[must_use]
-    pub fn add_repositories(&mut self, picked: Vec<RepositoryEntry>) -> Option<SettingsWrite> {
+    pub fn add_repositories(
+        &mut self,
+        settings_path: &Path,
+        picked: Vec<RepositoryEntry>,
+    ) -> Option<SettingsWrite> {
+        if let Some(refusal) = self.unreadable_settings_refusal(settings_path) {
+            self.refusals = vec![refusal];
+            return None;
+        }
         // This selection's refusals replace the last one's, which the reviewer
         // has now answered by picking again.
         self.refusals.clear();
@@ -210,8 +238,8 @@ impl HomeModel {
                         accepted += 1;
                     }
                 }
-                RepositoryOutcome::Failed { reason } => self.refusals.push(AddRefusal {
-                    folder: entry.path,
+                RepositoryOutcome::Failed { reason } => self.refusals.push(Refusal {
+                    path: entry.path,
                     reason,
                 }),
             }
@@ -225,7 +253,15 @@ impl HomeModel {
     /// refreshed underneath it removes the repository it was pointing at or
     /// none at all. Nothing is written when the path is no longer listed.
     #[must_use]
-    pub fn remove_repository(&mut self, path: &Path) -> Option<SettingsWrite> {
+    pub fn remove_repository(
+        &mut self,
+        settings_path: &Path,
+        path: &Path,
+    ) -> Option<SettingsWrite> {
+        if let Some(refusal) = self.unreadable_settings_refusal(settings_path) {
+            self.refusals = vec![refusal];
+            return None;
+        }
         let repositories = self
             .repositories
             .iter()
@@ -235,14 +271,21 @@ impl HomeModel {
         (repositories.len() < self.repositories.len()).then_some(SettingsWrite { repositories })
     }
 
-    /// The folders the last Add would not take, with the reason for each.
+    /// What the last action would not do, with the reason for each.
     #[must_use]
-    pub fn refusals(&self) -> &[AddRefusal] {
+    pub fn refusals(&self) -> &[Refusal] {
         &self.refusals
     }
 
-    pub fn dismiss_refusals(&mut self) {
-        self.refusals.clear();
+    /// Refuses to write over a settings file Home could not read.
+    ///
+    /// A write replaces the whole file, and what an unreadable one holds is
+    /// unknown, so writing would silently drop repositories Home never saw.
+    fn unreadable_settings_refusal(&self, settings_path: &Path) -> Option<Refusal> {
+        self.failure.is_some().then(|| Refusal {
+            path: settings_path.to_path_buf(),
+            reason: "fix this file before changing your repositories".to_owned(),
+        })
     }
 
     /// Whether `root` is a clone Home already lists.
@@ -385,13 +428,19 @@ mod tests {
         assert_eq!(home.count_line(), None, "nothing to count before a refresh");
 
         home.refreshed(Ok(vec![valid("/Developer/zreview", "braidonw/zreview")]));
-        assert_eq!(home.count_line().as_deref(), Some("1 repository"));
+        assert_eq!(
+            home.count_line().as_deref(),
+            Some("0 pull requests across 1 repository"),
+        );
 
         home.refreshed(Ok(vec![
             valid("/Developer/zreview", "braidonw/zreview"),
             valid("/Developer/widgets", "acme/widgets"),
         ]));
-        assert_eq!(home.count_line().as_deref(), Some("2 repositories"));
+        assert_eq!(
+            home.count_line().as_deref(),
+            Some("0 pull requests across 2 repositories"),
+        );
     }
 
     #[test]
@@ -469,6 +518,11 @@ mod tests {
         }
     }
 
+    /// The settings file every Add and Remove in these tests would write.
+    fn settings_path() -> PathBuf {
+        PathBuf::from("/Users/braidon/.config/zreview/settings.toml")
+    }
+
     /// Home with two clones already configured.
     fn configured() -> HomeModel {
         let mut home = HomeModel::new();
@@ -484,11 +538,14 @@ mod tests {
         let mut home = configured();
 
         let write = home
-            .add_repositories(vec![picked(
-                "/Developer/billing/crates",
-                "/Developer/billing",
-                "acme/billing",
-            )])
+            .add_repositories(
+                &settings_path(),
+                vec![picked(
+                    "/Developer/billing/crates",
+                    "/Developer/billing",
+                    "acme/billing",
+                )],
+            )
             .expect("an accepted folder should be written");
 
         assert_eq!(
@@ -508,10 +565,13 @@ mod tests {
         let mut home = configured();
 
         let write = home
-            .add_repositories(vec![
-                failed("/Developer/notes", "not a Git repository"),
-                picked("/Developer/billing", "/Developer/billing", "acme/billing"),
-            ])
+            .add_repositories(
+                &settings_path(),
+                vec![
+                    failed("/Developer/notes", "not a Git repository"),
+                    picked("/Developer/billing", "/Developer/billing", "acme/billing"),
+                ],
+            )
             .expect("the folder that did resolve should still be written");
 
         assert!(
@@ -521,7 +581,7 @@ mod tests {
         );
         let refusals = home.refusals();
         assert_eq!(refusals.len(), 1);
-        assert_eq!(refusals[0].folder, Path::new("/Developer/notes"));
+        assert_eq!(refusals[0].path, Path::new("/Developer/notes"));
         assert_eq!(refusals[0].reason, "not a Git repository");
     }
 
@@ -529,7 +589,10 @@ mod tests {
     fn an_add_that_accepts_nothing_writes_nothing_and_still_reports_the_refusal() {
         let mut home = configured();
 
-        let write = home.add_repositories(vec![failed("/Developer/notes", "no GitHub remote")]);
+        let write = home.add_repositories(
+            &settings_path(),
+            vec![failed("/Developer/notes", "no GitHub remote")],
+        );
 
         assert!(
             write.is_none(),
@@ -542,11 +605,14 @@ mod tests {
     fn a_folder_inside_a_clone_that_is_already_listed_is_ignored() {
         let mut home = configured();
 
-        let write = home.add_repositories(vec![picked(
-            "/Developer/zreview/crates/app",
-            "/Developer/zreview",
-            "braidonw/zreview",
-        )]);
+        let write = home.add_repositories(
+            &settings_path(),
+            vec![picked(
+                "/Developer/zreview/crates/app",
+                "/Developer/zreview",
+                "braidonw/zreview",
+            )],
+        );
 
         assert!(write.is_none(), "re-adding a listed clone changes nothing");
         assert!(
@@ -563,11 +629,14 @@ mod tests {
             "the folder no longer exists",
         )]));
 
-        let write = home.add_repositories(vec![picked(
-            "/Developer/zreview",
-            "/Developer/zreview",
-            "braidonw/zreview",
-        )]);
+        let write = home.add_repositories(
+            &settings_path(),
+            vec![picked(
+                "/Developer/zreview",
+                "/Developer/zreview",
+                "braidonw/zreview",
+            )],
+        );
 
         assert!(write.is_none());
     }
@@ -578,35 +647,84 @@ mod tests {
         home.refreshed(Ok(Vec::new()));
 
         let write = home
-            .add_repositories(vec![
-                picked(
-                    "/Developer/billing/api",
-                    "/Developer/billing",
-                    "acme/billing",
-                ),
-                picked(
-                    "/Developer/billing/web",
-                    "/Developer/billing",
-                    "acme/billing",
-                ),
-            ])
+            .add_repositories(
+                &settings_path(),
+                vec![
+                    picked(
+                        "/Developer/billing/api",
+                        "/Developer/billing",
+                        "acme/billing",
+                    ),
+                    picked(
+                        "/Developer/billing/web",
+                        "/Developer/billing",
+                        "acme/billing",
+                    ),
+                ],
+            )
             .expect("one of the two should be written");
 
         assert_eq!(write.repositories, [PathBuf::from("/Developer/billing")]);
     }
 
     #[test]
-    fn each_add_replaces_the_refusals_and_a_dismissal_clears_them() {
+    fn each_add_replaces_the_refusals_the_last_one_reported() {
         let mut home = configured();
-        let _ = home.add_repositories(vec![failed("/Developer/notes", "no GitHub remote")]);
+        let _ = home.add_repositories(
+            &settings_path(),
+            vec![failed("/Developer/notes", "no GitHub remote")],
+        );
 
-        let _ = home.add_repositories(vec![failed("/Developer/scratch", "not a Git repository")]);
+        let _ = home.add_repositories(
+            &settings_path(),
+            vec![failed("/Developer/scratch", "not a Git repository")],
+        );
+
         let refusals = home.refusals();
         assert_eq!(refusals.len(), 1, "the earlier refusal has been answered");
-        assert_eq!(refusals[0].folder, Path::new("/Developer/scratch"));
+        assert_eq!(refusals[0].path, Path::new("/Developer/scratch"));
+    }
 
-        home.dismiss_refusals();
-        assert!(home.refusals().is_empty());
+    /// Home cannot know what a file it could not read holds, so writing over it
+    /// would replace repositories it never saw.
+    #[test]
+    fn adding_over_a_settings_file_that_could_not_be_read_is_refused() {
+        let mut home = HomeModel::new();
+        home.refreshed(Err(SessionFailure::new(
+            "Home could not read your settings",
+        )));
+
+        let write = home.add_repositories(
+            &settings_path(),
+            vec![picked(
+                "/Developer/billing",
+                "/Developer/billing",
+                "acme/billing",
+            )],
+        );
+
+        assert!(write.is_none(), "nothing may be written over that file");
+        let refusals = home.refusals();
+        assert_eq!(refusals.len(), 1);
+        assert_eq!(refusals[0].path, settings_path());
+        assert_eq!(
+            refusals[0].reason,
+            "fix this file before changing your repositories",
+        );
+    }
+
+    #[test]
+    fn removing_over_a_settings_file_that_could_not_be_read_is_refused() {
+        let mut home = HomeModel::new();
+        home.refreshed(Ok(vec![valid("/Developer/zreview", "braidonw/zreview")]));
+        home.refreshed(Err(SessionFailure::new(
+            "Home could not read your settings",
+        )));
+
+        let write = home.remove_repository(&settings_path(), Path::new("/Developer/zreview"));
+
+        assert!(write.is_none());
+        assert_eq!(home.refusals()[0].path, settings_path());
     }
 
     #[test]
@@ -614,7 +732,7 @@ mod tests {
         let mut home = configured();
 
         let write = home
-            .remove_repository(Path::new("/Developer/zreview"))
+            .remove_repository(&settings_path(), Path::new("/Developer/zreview"))
             .expect("a listed entry should be removable");
 
         assert_eq!(write.repositories, [PathBuf::from("/Developer/widgets")]);
@@ -624,22 +742,65 @@ mod tests {
     fn removing_an_entry_that_is_no_longer_listed_writes_nothing() {
         let mut home = configured();
 
-        let write = home.remove_repository(Path::new("/Developer/billing"));
+        let write = home.remove_repository(&settings_path(), Path::new("/Developer/billing"));
 
         assert!(write.is_none());
     }
 
     #[test]
-    fn a_failure_that_is_not_a_read_leaves_the_list_standing() {
+    fn a_write_failure_is_its_own_line_and_leaves_the_list_standing() {
         let mut home = HomeModel::new();
         home.refreshed(Ok(vec![valid("/Developer/zreview", "braidonw/zreview")]));
 
-        home.failed(SessionFailure::new("Could not write your settings"));
+        home.write_finished(Err(SessionFailure::new(
+            "Home could not save your settings",
+        )));
 
         assert_eq!(
-            home.failure().unwrap().summary,
-            "Could not write your settings"
+            home.write_failure()
+                .expect("the write failure shows")
+                .summary,
+            "Home could not save your settings",
+        );
+        assert!(
+            home.failure().is_none(),
+            "a write failure never replaces the list",
         );
         assert_eq!(home.repositories().len(), 1);
+    }
+
+    #[test]
+    fn a_read_failure_and_a_write_failure_are_both_visible() {
+        let mut home = HomeModel::new();
+        home.write_finished(Err(SessionFailure::new(
+            "Home could not save your settings",
+        )));
+
+        home.refreshed(Err(SessionFailure::new(
+            "Home could not read your settings",
+        )));
+
+        assert_eq!(
+            home.failure().expect("the read failure shows").summary,
+            "Home could not read your settings",
+        );
+        assert_eq!(
+            home.write_failure()
+                .expect("the write failure shows")
+                .summary,
+            "Home could not save your settings",
+        );
+    }
+
+    #[test]
+    fn a_successful_write_clears_the_write_failure() {
+        let mut home = HomeModel::new();
+        home.write_finished(Err(SessionFailure::new(
+            "Home could not save your settings",
+        )));
+
+        home.write_finished(Ok(()));
+
+        assert!(home.write_failure().is_none());
     }
 }

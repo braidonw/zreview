@@ -35,12 +35,36 @@ pub(crate) struct ManagedSession {
     pub(crate) load_started: Arc<AtomicBool>,
 }
 
+/// Home's state and the guard that orders the actions on its settings file.
+///
+/// Cloned into whatever thread an action runs on, so both halves travel
+/// together and no caller can take one without the other.
+#[derive(Clone)]
+pub(crate) struct ManagedHome {
+    pub(crate) model: Arc<Mutex<HomeModel>>,
+    /// Held for the whole of a refresh, an Add, or a Remove.
+    ///
+    /// Each of those reads the file, decides against what it read, writes, and
+    /// reads back. Two of them interleaving would let one write a list the
+    /// other had already changed, resurrecting a repository just removed.
+    pub(crate) settings_action: Arc<Mutex<()>>,
+}
+
+impl ManagedHome {
+    pub(crate) fn new() -> Self {
+        Self {
+            model: Arc::new(Mutex::new(HomeModel::new())),
+            settings_action: Arc::new(Mutex::new(())),
+        }
+    }
+}
+
 /// Everything the window holds, shared with every command.
 ///
 /// Home and at most one Session. For now a Session is here only when the binary
 /// was launched straight into one; Home does not open Sessions yet.
 pub(crate) struct AppRoot {
-    pub(crate) home: Arc<Mutex<HomeModel>>,
+    pub(crate) home: ManagedHome,
     pub(crate) session: Option<ManagedSession>,
 }
 
@@ -61,7 +85,7 @@ pub fn run(launch: Launch) {
         }),
     };
     let root = AppRoot {
-        home: Arc::new(Mutex::new(HomeModel::new())),
+        home: ManagedHome::new(),
         session,
     };
     let specta_builder = commands::specta_builder();

@@ -121,6 +121,7 @@ export function makeHomeSnapshot(overrides: Partial<HomeSnapshotDto> = {}): Home
     footer_expanded: false,
     refusals: [],
     failure: null,
+    write_failure: null,
     ...overrides,
   };
 }

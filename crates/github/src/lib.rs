@@ -59,11 +59,8 @@ pub enum CloneError {
     #[error("no GitHub remote")]
     NoGithubRemote,
 
-    #[error("could not read the repository: {source}")]
-    Unreadable {
-        #[source]
-        source: git::GitError,
-    },
+    #[error("could not read the repository: {detail}")]
+    Unreadable { detail: String },
 }
 
 /// Resolves a local clone to its worktree root and the GitHub repository its
@@ -77,29 +74,47 @@ pub enum CloneError {
 /// Returns [`CloneError`] when the path is gone, is not a Git repository, has no
 /// remote that parses to a GitHub slug, or cannot be read.
 pub fn resolve_clone(path: &Path) -> Result<ResolvedClone, CloneError> {
-    if !path.exists() {
-        return Err(CloneError::Missing);
+    // The error kind separates a clone that has been moved away from one this
+    // process is not allowed to look at, which are different problems.
+    if let Err(error) = std::fs::metadata(path) {
+        return Err(match error.kind() {
+            std::io::ErrorKind::NotFound => CloneError::Missing,
+            _ => CloneError::Unreadable {
+                detail: error.to_string(),
+            },
+        });
     }
-    let root = git::repository_root(path).map_err(classify_git_failure)?;
-    let remotes = git::remotes(&root).map_err(classify_git_failure)?;
+    let root = git::repository_root(path).map_err(|error| classify_git_failure(&error))?;
+    let remotes = git::remotes(&root).map_err(|error| classify_git_failure(&error))?;
     let slug = preferred_remote_repository(&remotes).ok_or(CloneError::NoGithubRemote)?;
     Ok(ResolvedClone { root, slug })
 }
 
-/// Separates Git refusing the path from Git failing to run at all.
+/// Separates Git saying the folder is not a checkout from Git failing for any
+/// other reason.
 ///
-/// A non-zero exit from `rev-parse` or `remote` on a path that exists means the
-/// folder is not a checkout; anything else is a fault worth reporting verbatim.
-fn classify_git_failure(error: git::GitError) -> CloneError {
+/// Only Git's own wording earns the verdict. A folder Git could not enter, or a
+/// Git that could not run at all, is a fault reported with the text it gave.
+fn classify_git_failure(error: &git::GitError) -> CloneError {
     match error {
-        git::GitError::Command { .. } => CloneError::NotAGitRepository,
-        source @ (git::GitError::Execute { .. }
+        git::GitError::Command { stderr, .. } if is_not_a_repository(stderr) => {
+            CloneError::NotAGitRepository
+        }
+        git::GitError::Command { .. }
+        | git::GitError::Execute { .. }
         | git::GitError::NonUtf8 { .. }
         | git::GitError::InvalidObjectId { .. }
         | git::GitError::UnsupportedStatus(_)
         | git::GitError::InvalidPath(_)
-        | git::GitError::InvalidPatch { .. }) => CloneError::Unreadable { source },
+        | git::GitError::InvalidPatch { .. } => CloneError::Unreadable {
+            detail: error.to_string(),
+        },
     }
+}
+
+/// Git's own wording for a path that is not inside a checkout.
+fn is_not_a_repository(stderr: &str) -> bool {
+    stderr.to_lowercase().contains("not a git repository")
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1449,6 +1464,48 @@ JSON
 
         assert!(matches!(error, CloneError::Missing), "got {error}");
         assert_eq!(error.to_string(), "the folder no longer exists");
+    }
+
+    /// A folder the process may not look inside, so `git` cannot enter it and
+    /// the failure is a fault rather than a verdict on the folder.
+    #[cfg(unix)]
+    #[test]
+    fn a_folder_git_cannot_enter_is_refused_as_unreadable() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = TempDir::new().unwrap();
+        let locked = directory.path().join("locked");
+        fs::create_dir(&locked).unwrap();
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
+
+        let error = resolve_clone(&locked).unwrap_err();
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
+
+        assert!(
+            matches!(&error, CloneError::Unreadable { detail } if detail.contains("Permission denied")),
+            "got {error}",
+        );
+    }
+
+    /// A folder whose parent cannot be read at all, which is not the same as one
+    /// that has been moved away.
+    #[cfg(unix)]
+    #[test]
+    fn a_folder_whose_metadata_cannot_be_read_is_refused_as_unreadable() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = TempDir::new().unwrap();
+        let locked = directory.path().join("locked");
+        fs::create_dir(&locked).unwrap();
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
+
+        let error = resolve_clone(&locked.join("clone")).unwrap_err();
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
+
+        assert!(
+            matches!(error, CloneError::Unreadable { .. }),
+            "a folder that cannot be looked at is not a folder that is gone: {error}",
+        );
     }
 
     #[test]

@@ -1,6 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
+import type { HomeSnapshotDto } from "./bindings";
 import App from "./App";
 import { makeHomeRepository, makeHomeSnapshot } from "./test/fixtures";
 
@@ -9,7 +10,6 @@ const refreshHome = vi.fn();
 const addRepositories = vi.fn();
 const removeRepository = vi.fn();
 const toggleRepositoriesFooter = vi.fn();
-const dismissRefusals = vi.fn();
 
 vi.mock("./bindings", () => ({
   commands: {
@@ -18,7 +18,6 @@ vi.mock("./bindings", () => ({
     addRepositories: (folders: unknown) => addRepositories(folders),
     removeRepository: (path: unknown) => removeRepository(path),
     toggleRepositoriesFooter: () => toggleRepositoriesFooter(),
-    dismissRefusals: () => dismissRefusals(),
   },
 }));
 
@@ -27,10 +26,15 @@ vi.mock("@tauri-apps/plugin-dialog", () => ({
   open: (options: unknown) => open(options),
 }));
 
-/// Home with two clones configured, one of which did not resolve.
+// The commands that touch the settings file answer with a result, as the bindings do.
+function ok(snapshot: HomeSnapshotDto) {
+  return { status: "ok", data: snapshot };
+}
+
+// Home with two clones configured, one of which did not resolve.
 function configured() {
   return makeHomeSnapshot({
-    count_line: "2 repositories",
+    count_line: "0 pull requests across 2 repositories",
     repositories: [
       makeHomeRepository({ path: "/Developer/zreview", slug: "braidonw/zreview" }),
       makeHomeRepository({
@@ -47,22 +51,21 @@ beforeEach(() => {
   describeLaunch.mockReset();
   describeLaunch.mockResolvedValue("Home");
   refreshHome.mockReset();
-  refreshHome.mockResolvedValue(makeHomeSnapshot());
+  refreshHome.mockResolvedValue(ok(makeHomeSnapshot()));
   addRepositories.mockReset();
   removeRepository.mockReset();
   toggleRepositoriesFooter.mockReset();
-  dismissRefusals.mockReset();
   open.mockReset();
 });
 
 describe("Home", () => {
   it("renders the heading, the count line, and the three groups with their empty copy", async () => {
-    refreshHome.mockResolvedValue(configured());
+    refreshHome.mockResolvedValue(ok(configured()));
 
     render(<App />);
 
     await waitFor(() => expect(screen.getByText("Home")).toBeTruthy());
-    expect(screen.getByText("2 repositories")).toBeTruthy();
+    expect(screen.getByText("0 pull requests across 2 repositories")).toBeTruthy();
     expect(screen.getByText("To review")).toBeTruthy();
     expect(screen.getByText("To address")).toBeTruthy();
     expect(screen.getByText("Waiting on others")).toBeTruthy();
@@ -72,7 +75,7 @@ describe("Home", () => {
   });
 
   it("shows the footer collapsed to its summary line with Add beside it", async () => {
-    refreshHome.mockResolvedValue(configured());
+    refreshHome.mockResolvedValue(ok(configured()));
 
     render(<App />);
 
@@ -84,7 +87,7 @@ describe("Home", () => {
 
   it("lists each repository's slug, path, state, and Remove once the footer expands", async () => {
     const user = userEvent.setup();
-    refreshHome.mockResolvedValue(configured());
+    refreshHome.mockResolvedValue(ok(configured()));
     toggleRepositoriesFooter.mockResolvedValue({ ...configured(), footer_expanded: true });
 
     render(<App />);
@@ -109,13 +112,15 @@ describe("Home", () => {
 
   it("replaces the list with the failure block while leaving Add in the footer", async () => {
     refreshHome.mockResolvedValue(
-      makeHomeSnapshot({
-        failure: {
-          summary: "Home could not read your settings",
-          detail: "could not parse the settings file",
-          remediation: "Fix ~/.config/zreview/settings.toml, then press r to refresh.",
-        },
-      }),
+      ok(
+        makeHomeSnapshot({
+          failure: {
+            summary: "Home could not read your settings",
+            detail: "could not parse the settings file",
+            remediation: "Fix ~/.config/zreview/settings.toml, then press r to refresh.",
+          },
+        }),
+      ),
     );
 
     render(<App />);
@@ -131,16 +136,41 @@ describe("Home", () => {
     expect(screen.getByRole("button", { name: "Add..." })).toBeTruthy();
   });
 
+  it("shows a write failure as a line above a list that stays", async () => {
+    refreshHome.mockResolvedValue(
+      ok({
+        ...configured(),
+        write_failure: {
+          summary: "Home could not save your settings",
+          detail: null,
+          remediation: "Check that ~/.config/zreview/settings.toml is writable.",
+        },
+      }),
+    );
+
+    render(<App />);
+
+    await waitFor(() =>
+      expect(screen.getByText("Home could not save your settings")).toBeTruthy(),
+    );
+    expect(
+      screen.getByText("Check that ~/.config/zreview/settings.toml is writable."),
+    ).toBeTruthy();
+    expect(screen.getByText("To review")).toBeTruthy();
+  });
+
   it("passes the picked folders to the add command and shows what it refused", async () => {
     const user = userEvent.setup();
     open.mockResolvedValue(["/Developer/notes", "/Developer/billing"]);
     addRepositories.mockResolvedValue(
-      makeHomeSnapshot({
-        count_line: "1 repository",
-        repositories: [makeHomeRepository({ path: "/Developer/billing", slug: "acme/billing" })],
-        footer_summary: "1 repository",
-        refusals: [{ folder: "/Developer/notes", reason: "not a Git repository" }],
-      }),
+      ok(
+        makeHomeSnapshot({
+          count_line: "0 pull requests across 1 repository",
+          repositories: [makeHomeRepository({ path: "/Developer/billing", slug: "acme/billing" })],
+          footer_summary: "1 repository",
+          refusals: [{ path: "/Developer/notes", reason: "not a Git repository" }],
+        }),
+      ),
     );
 
     render(<App />);
@@ -157,6 +187,7 @@ describe("Home", () => {
     await waitFor(() =>
       expect(screen.getByText("/Developer/notes: not a Git repository")).toBeTruthy(),
     );
+    expect(screen.getByText("1 repository")).toBeTruthy();
   });
 
   it("adds nothing when the picker is dismissed", async () => {
@@ -174,30 +205,56 @@ describe("Home", () => {
 
   it("removes the repository the Remove beside it names", async () => {
     const user = userEvent.setup();
-    refreshHome.mockResolvedValue({ ...configured(), footer_expanded: true });
-    removeRepository.mockResolvedValue(makeHomeSnapshot({ footer_expanded: true }));
+    refreshHome.mockResolvedValue(ok({ ...configured(), footer_expanded: true }));
+    removeRepository.mockImplementation((path: string) =>
+      Promise.resolve(
+        ok({
+          ...configured(),
+          footer_expanded: true,
+          repositories: configured().repositories.filter(
+            (repository) => repository.path !== path,
+          ),
+        }),
+      ),
+    );
 
     render(<App />);
     await waitFor(() => expect(screen.getByText("braidonw/zreview")).toBeTruthy());
 
     await user.click(screen.getAllByRole("button", { name: "Remove" })[0]);
 
-    expect(removeRepository).toHaveBeenCalledWith("/Developer/zreview");
+    await waitFor(() => expect(screen.queryByText("/Developer/zreview")).toBeNull());
+    expect(screen.getByText("/Developer/moved")).toBeTruthy();
   });
 
-  it("refreshes on r", async () => {
+  it("refreshes on r, showing what the settings file now holds", async () => {
     const user = userEvent.setup();
+
     render(<App />);
-    await waitFor(() => expect(refreshHome).toHaveBeenCalledTimes(1));
+    await waitFor(() => expect(screen.getByText("No repositories yet")).toBeTruthy());
+    refreshHome.mockResolvedValue(ok(configured()));
 
     await user.keyboard("r");
 
-    await waitFor(() => expect(refreshHome).toHaveBeenCalledTimes(2));
+    await waitFor(() => expect(screen.getByText("To review")).toBeTruthy());
+    expect(screen.getByText("2 repositories · 1 failed")).toBeTruthy();
+  });
+
+  it("leaves the settings file alone when r is pressed with shift held", async () => {
+    const user = userEvent.setup();
+
+    render(<App />);
+    await waitFor(() => expect(screen.getByText("No repositories yet")).toBeTruthy());
+    refreshHome.mockClear();
+
+    await user.keyboard("{Shift>}r{/Shift}");
+
+    expect(refreshHome).not.toHaveBeenCalled();
   });
 
   it("expands the footer on e", async () => {
     const user = userEvent.setup();
-    refreshHome.mockResolvedValue(configured());
+    refreshHome.mockResolvedValue(ok(configured()));
     toggleRepositoriesFooter.mockResolvedValue({ ...configured(), footer_expanded: true });
 
     render(<App />);
@@ -206,5 +263,41 @@ describe("Home", () => {
     await user.keyboard("e");
 
     await waitFor(() => expect(screen.getByText("braidonw/zreview")).toBeTruthy());
+  });
+
+  it("shows the failure screen when a Home command rejects", async () => {
+    refreshHome.mockReset();
+    refreshHome.mockRejectedValue(new Error("IPC is unavailable"));
+
+    render(<App />);
+
+    await waitFor(() => expect(screen.getByText("Error: IPC is unavailable")).toBeTruthy());
+  });
+
+  it("shows the failure screen when a Home command answers with an error", async () => {
+    refreshHome.mockResolvedValue({
+      status: "error",
+      error: { summary: "Home could not finish that action", detail: null, remediation: null },
+    });
+
+    render(<App />);
+
+    await waitFor(() =>
+      expect(screen.getByText("Home could not finish that action")).toBeTruthy(),
+    );
+  });
+
+  it("shows the failure screen when the picker rejects", async () => {
+    const user = userEvent.setup();
+    open.mockRejectedValue(new Error("the picker could not open"));
+
+    render(<App />);
+    await waitFor(() => expect(screen.getByText("No repositories yet")).toBeTruthy());
+
+    await user.click(screen.getByRole("button", { name: "Add repository..." }));
+
+    await waitFor(() =>
+      expect(screen.getByText("Error: the picker could not open")).toBeTruthy(),
+    );
   });
 });
