@@ -1,5 +1,6 @@
 [workspace]
 members = [
+    "apps/desktop/src-tauri",
     "apps/zreview",
     "crates/app",
     "crates/domain",

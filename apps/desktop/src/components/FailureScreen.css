@@ -1,0 +1,26 @@
+.failure-screen {
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  padding: 0 48px;
+  text-align: center;
+  background: var(--surface-base);
+}
+
+.failure-screen__summary {
+  color: var(--severity-error-text);
+  font-size: var(--size-heading);
+}
+
+.failure-screen__detail {
+  color: var(--text-secondary);
+  font-size: var(--size-body);
+}
+
+.failure-screen__remediation {
+  color: var(--text-tertiary);
+  font-size: var(--size-meta);
+}

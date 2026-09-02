@@ -1,0 +1,11 @@
+.hunk-header {
+  height: var(--row-height);
+  width: 100%;
+  padding: 0 12px;
+  display: flex;
+  align-items: center;
+  background: var(--diff-hunk-bg);
+  color: var(--diff-hunk-fg);
+  font-family: var(--font-mono);
+  font-size: var(--size-code);
+}
