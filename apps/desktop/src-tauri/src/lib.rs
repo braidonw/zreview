@@ -2,11 +2,25 @@
 
 use std::sync::{Arc, Mutex, atomic::AtomicBool};
 
-use app::SessionModel;
+use app::{HomeModel, SessionModel};
 use session::{ReviewStorage, SessionRequest};
 
 mod commands;
 mod dto;
+mod repositories;
+
+/// What the binary was asked to open.
+///
+/// Home is the screen with no pull request named. Everything else opens one
+/// review sitting straight away, from the command line, and never sees Home.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum Launch {
+    Home,
+    Session {
+        request: SessionRequest,
+        storage: ReviewStorage,
+    },
+}
 
 /// The one review sitting this window shows, shared with every command.
 pub(crate) struct ManagedSession {
@@ -21,25 +35,65 @@ pub(crate) struct ManagedSession {
     pub(crate) load_started: Arc<AtomicBool>,
 }
 
+/// Home's state and the guard that orders the actions on its settings file.
+///
+/// Cloned into whatever thread an action runs on, so both halves travel
+/// together and no caller can take one without the other.
+#[derive(Clone)]
+pub(crate) struct ManagedHome {
+    pub(crate) model: Arc<Mutex<HomeModel>>,
+    /// Held for the whole of a refresh, an Add, or a Remove.
+    ///
+    /// Each of those reads the file, decides against what it read, writes, and
+    /// reads back. Two of them interleaving would let one write a list the
+    /// other had already changed, resurrecting a repository just removed.
+    pub(crate) settings_action: Arc<Mutex<()>>,
+}
+
+impl ManagedHome {
+    pub(crate) fn new() -> Self {
+        Self {
+            model: Arc::new(Mutex::new(HomeModel::new())),
+            settings_action: Arc::new(Mutex::new(())),
+        }
+    }
+}
+
+/// Everything the window holds, shared with every command.
+///
+/// Home and at most one Session. For now a Session is here only when the binary
+/// was launched straight into one; Home does not open Sessions yet.
+pub(crate) struct AppRoot {
+    pub(crate) home: ManagedHome,
+    pub(crate) session: Option<ManagedSession>,
+}
+
 /// Builds the window and runs the application until it closes.
 ///
 /// # Panics
 ///
 /// Panics if the Tauri application fails to start, or if bindings export fails
 /// in a debug build.
-pub fn run(request: SessionRequest, storage: ReviewStorage) {
-    let model = Arc::new(Mutex::new(SessionModel::loading(request.description())));
-    let managed = ManagedSession {
-        model,
-        request,
-        storage,
-        load_started: Arc::new(AtomicBool::new(false)),
+pub fn run(launch: Launch) {
+    let session = match launch {
+        Launch::Home => None,
+        Launch::Session { request, storage } => Some(ManagedSession {
+            model: Arc::new(Mutex::new(SessionModel::loading(request.description()))),
+            request,
+            storage,
+            load_started: Arc::new(AtomicBool::new(false)),
+        }),
+    };
+    let root = AppRoot {
+        home: ManagedHome::new(),
+        session,
     };
     let specta_builder = commands::specta_builder();
 
     tauri::Builder::default()
         .plugin(tauri_plugin_clipboard_manager::init())
-        .manage(managed)
+        .plugin(tauri_plugin_dialog::init())
+        .manage(root)
         .invoke_handler(specta_builder.invoke_handler())
         .setup(move |_app| {
             #[cfg(debug_assertions)]

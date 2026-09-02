@@ -1,27 +1,15 @@
 import { useCallback, useEffect, useReducer, useRef } from "react";
 import { Channel } from "@tauri-apps/api/core";
 import { writeText } from "@tauri-apps/plugin-clipboard-manager";
-import type { DiffSideDto, SessionFailureDto } from "../bindings";
+import type { DiffSideDto } from "../bindings";
 import { commands } from "../bindings";
 import { clamp } from "../lib/clamp";
+import { toFailure } from "../lib/failure";
 import { initialState, selectionRange, sessionReducer } from "./sessionReducer";
 import { useDraftQueue } from "./useDraftQueue";
 
-/** Narrows a command rejection into a SessionFailureDto. */
-function toFailure(error: unknown): SessionFailureDto {
-  if (
-    typeof error === "object" &&
-    error !== null &&
-    "summary" in error &&
-    typeof (error as { summary: unknown }).summary === "string"
-  ) {
-    return error as SessionFailureDto;
-  }
-  return { summary: String(error), detail: null, remediation: null };
-}
-
-/** Loads the demo session and exposes every action the UI can take on it. */
-export function useSession() {
+/** Loads the session the window was launched into and exposes every action the UI can take on it. */
+export function useSession(description: string) {
   const [state, dispatch] = useReducer(sessionReducer, initialState);
   const stateRef = useRef(state);
   stateRef.current = state;
@@ -33,34 +21,31 @@ export function useSession() {
       return;
     }
     hasOpened.current = true;
+    dispatch({ type: "describe", description });
+
+    const channel = new Channel<string>();
+    channel.onmessage = (stage) => dispatch({ type: "stage", stage });
 
     commands
-      .describeSession()
-      .then((description) => {
-        dispatch({ type: "describe", description });
-
-        const channel = new Channel<string>();
-        channel.onmessage = (stage) => dispatch({ type: "stage", stage });
-
-        commands.openSession(channel).then((opened) => {
-          if (opened.status === "error") {
-            dispatch({ type: "failed", failure: toFailure(opened.error) });
+      .openSession(channel)
+      .then((opened) => {
+        if (opened.status === "error") {
+          dispatch({ type: "failed", failure: toFailure(opened.error) });
+          return;
+        }
+        const snapshot = opened.data;
+        commands.selectFile(0).then((selected) => {
+          if (selected.status === "error") {
+            dispatch({ type: "failed", failure: toFailure(selected.error) });
             return;
           }
-          const snapshot = opened.data;
-          commands.selectFile(0).then((selected) => {
-            if (selected.status === "error") {
-              dispatch({ type: "failed", failure: toFailure(selected.error) });
-              return;
-            }
-            dispatch({ type: "ready", snapshot, file: selected.data });
-          });
+          dispatch({ type: "ready", snapshot, file: selected.data });
         });
       })
       .catch((error: unknown) => {
         dispatch({ type: "failed", failure: toFailure(error) });
       });
-  }, []);
+  }, [description]);
 
   const selectFile = useCallback((index: number) => {
     commands.selectFile(index).then((selected) => {

@@ -1,17 +1,19 @@
 use std::{env, path::Path, process::ExitCode};
 
+use desktop_lib::Launch;
 use github::PullRequestSelector;
 use session::{ReviewStorage, SessionRequest};
 
 const USAGE: &str = "usage:
   desktop
+  desktop demo
   desktop <repository> <base> [<head>]
   desktop pr [<repository>] <number-or-url>";
 
 fn main() -> ExitCode {
     // Only argument parsing happens before the window opens. Everything that can be slow or fail, such as Git, gh, or the network, is reported inside the app.
-    let (request, storage) = match parse_arguments(&env::args().skip(1).collect::<Vec<_>>()) {
-        Ok(parsed) => parsed,
+    let launch = match parse_arguments(&env::args().skip(1).collect::<Vec<_>>()) {
+        Ok(launch) => launch,
         Err(message) => {
             eprintln!("desktop: {message}");
             eprintln!("{USAGE}");
@@ -19,33 +21,38 @@ fn main() -> ExitCode {
         }
     };
 
-    desktop_lib::run(request, storage);
+    desktop_lib::run(launch);
 
     ExitCode::SUCCESS
 }
 
-fn parse_arguments(arguments: &[String]) -> Result<(SessionRequest, ReviewStorage), String> {
+fn parse_arguments(arguments: &[String]) -> Result<Launch, String> {
     match arguments {
-        [] => Ok((SessionRequest::Demo, ReviewStorage::Disabled)),
-        [first, rest @ ..] if first == "pr" => {
-            Ok((parse_pull_request(rest)?, ReviewStorage::Default))
-        }
-        [repository, base] => Ok((
-            SessionRequest::LocalComparison {
+        [] => Ok(Launch::Home),
+        [only] if only == "demo" => Ok(Launch::Session {
+            request: SessionRequest::Demo,
+            storage: ReviewStorage::Disabled,
+        }),
+        [first, rest @ ..] if first == "pr" => Ok(Launch::Session {
+            request: parse_pull_request(rest)?,
+            storage: ReviewStorage::Default,
+        }),
+        [repository, base] => Ok(Launch::Session {
+            request: SessionRequest::LocalComparison {
                 repository: Path::new(repository).to_path_buf(),
                 base: base.clone(),
                 head: "HEAD".to_owned(),
             },
-            ReviewStorage::Default,
-        )),
-        [repository, base, head] => Ok((
-            SessionRequest::LocalComparison {
+            storage: ReviewStorage::Default,
+        }),
+        [repository, base, head] => Ok(Launch::Session {
+            request: SessionRequest::LocalComparison {
                 repository: Path::new(repository).to_path_buf(),
                 base: base.clone(),
                 head: head.clone(),
             },
-            ReviewStorage::Default,
-        )),
+            storage: ReviewStorage::Default,
+        }),
         _ => Err("expected a repository, base revision, and optional head revision".to_owned()),
     }
 }
@@ -87,10 +94,23 @@ mod tests {
         values.iter().map(|value| (*value).to_owned()).collect()
     }
 
+    /// The Session a launch opens, for the arguments that open one directly.
+    fn opened_session(launch: Launch) -> (SessionRequest, ReviewStorage) {
+        match launch {
+            Launch::Session { request, storage } => (request, storage),
+            Launch::Home => panic!("expected a session launch, got Home"),
+        }
+    }
+
     #[test]
-    fn no_arguments_opens_the_generated_fixture_with_storage_disabled() {
+    fn no_arguments_opens_home() {
+        assert_eq!(parse_arguments(&[]).unwrap(), Launch::Home);
+    }
+
+    #[test]
+    fn demo_opens_the_generated_fixture_with_storage_disabled() {
         assert_eq!(
-            parse_arguments(&[]).unwrap(),
+            opened_session(parse_arguments(&arguments(&["demo"])).unwrap()),
             (SessionRequest::Demo, ReviewStorage::Disabled),
         );
     }
@@ -98,7 +118,7 @@ mod tests {
     #[test]
     fn a_local_comparison_defaults_its_head_to_head_and_uses_default_storage() {
         assert_eq!(
-            parse_arguments(&arguments(&["/tmp/repository", "main"])).unwrap(),
+            opened_session(parse_arguments(&arguments(&["/tmp/repository", "main"])).unwrap()),
             (
                 SessionRequest::LocalComparison {
                     repository: Path::new("/tmp/repository").to_path_buf(),
@@ -109,7 +129,9 @@ mod tests {
             ),
         );
         assert_eq!(
-            parse_arguments(&arguments(&["/tmp/repository", "main", "feature"])).unwrap(),
+            opened_session(
+                parse_arguments(&arguments(&["/tmp/repository", "main", "feature"])).unwrap()
+            ),
             (
                 SessionRequest::LocalComparison {
                     repository: Path::new("/tmp/repository").to_path_buf(),
@@ -146,7 +168,7 @@ mod tests {
     #[test]
     fn a_pull_request_takes_an_optional_repository_and_uses_default_storage() {
         assert_eq!(
-            parse_arguments(&arguments(&["pr", "/tmp/repository", "42"])).unwrap(),
+            opened_session(parse_arguments(&arguments(&["pr", "/tmp/repository", "42"])).unwrap()),
             (
                 SessionRequest::PullRequest {
                     repository: Path::new("/tmp/repository").to_path_buf(),
@@ -155,7 +177,8 @@ mod tests {
                 ReviewStorage::Default,
             ),
         );
-        let (request, storage) = parse_arguments(&arguments(&["pr", "42"])).unwrap();
+        let (request, storage) =
+            opened_session(parse_arguments(&arguments(&["pr", "42"])).unwrap());
         assert!(matches!(
             request,
             SessionRequest::PullRequest {
@@ -169,12 +192,14 @@ mod tests {
     #[test]
     fn a_pull_request_repository_accepts_a_url_selector() {
         assert_eq!(
-            parse_arguments(&arguments(&[
-                "pr",
-                "/tmp/repository",
-                "https://github.com/acme/widgets/pull/42",
-            ]))
-            .unwrap(),
+            opened_session(
+                parse_arguments(&arguments(&[
+                    "pr",
+                    "/tmp/repository",
+                    "https://github.com/acme/widgets/pull/42",
+                ]))
+                .unwrap()
+            ),
             (
                 SessionRequest::PullRequest {
                     repository: Path::new("/tmp/repository").to_path_buf(),
