@@ -405,6 +405,39 @@ mod tests {
         .unwrap()
     }
 
+    /// A pull request session, built directly rather than through `session::load`
+    /// since that would need a live `gh`.
+    fn pull_request_session() -> ReviewSession {
+        let sha: Arc<str> = "a".repeat(40).into();
+        ReviewSession::new(
+            SessionSource::GitHubPullRequest {
+                repository_root: std::path::PathBuf::from("/tmp/repository"),
+                owner: "acme".into(),
+                repository: "widgets".into(),
+                number: 42,
+                title: "Add the widget factory".into(),
+                url: "https://github.com/acme/widgets/pull/42".into(),
+                base_ref: "main".into(),
+                head_ref: "feature".into(),
+                base_sha: Arc::clone(&sha),
+                recorded_base_sha: Arc::clone(&sha),
+                diff_base_sha: Arc::clone(&sha),
+                head_sha: sha,
+            },
+            vec![DiffFile::demo(1)].into(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn snapshot_shows_the_pull_requests_identity_and_title() {
+        let session = pull_request_session();
+        let snapshot = project_snapshot(&session);
+
+        assert_eq!(snapshot.title, "acme/widgets \u{00B7} PR #42");
+        assert_eq!(snapshot.subtitle, "Add the widget factory");
+    }
+
     #[test]
     fn snapshot_projects_the_demo_sidebar() {
         let session = demo_session();
