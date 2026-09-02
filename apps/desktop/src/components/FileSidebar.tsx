@@ -1,4 +1,5 @@
-import type { FileStatusDto, FileSummaryDto, SidebarDto } from "../bindings";
+import type { DiffSideDto, FileStatusDto, FileSummaryDto, SessionFailureDto, SidebarDto, StaleDraftDto } from "../bindings";
+import { DraftsPanel } from "./DraftsPanel";
 import "./FileSidebar.css";
 
 const STATUS_GLYPH: Record<FileStatusDto, { label: string; className: string }> = {
@@ -15,13 +16,30 @@ export function FileSidebar({
   title,
   subtitle,
   sidebar,
+  warnings,
+  writeFailure,
+  fileDraftCount,
+  staleDrafts,
+  cursor,
   onSelect,
+  onReanchorDraft,
 }: {
   title: string;
   subtitle: string;
   sidebar: SidebarDto;
+  warnings: SessionFailureDto[];
+  writeFailure: string | null;
+  fileDraftCount: number;
+  staleDrafts: StaleDraftDto[];
+  cursor: number;
   onSelect: (index: number) => void;
+  onReanchorDraft: (path: string, side: DiffSideDto, line: number, row: number) => void;
 }) {
+  const warningMessages = warnings.map((warning) => warning.summary);
+  if (writeFailure !== null) {
+    warningMessages.push(writeFailure);
+  }
+
   return (
     <div className="file-sidebar">
       <div className="file-sidebar__header">
@@ -32,6 +50,15 @@ export function FileSidebar({
           {sidebar.thread_count} conversations
         </div>
       </div>
+      {warningMessages.length > 0 && (
+        <div className="file-sidebar__warnings">
+          {warningMessages.map((message) => (
+            <div key={message} className="file-sidebar__warning">
+              {message}
+            </div>
+          ))}
+        </div>
+      )}
       <div className="file-sidebar__list">
         {sidebar.files.map((file) => (
           <FileRow
@@ -42,6 +69,12 @@ export function FileSidebar({
           />
         ))}
       </div>
+      <DraftsPanel
+        fileDraftCount={fileDraftCount}
+        stale={staleDrafts}
+        cursor={cursor}
+        onReanchor={onReanchorDraft}
+      />
     </div>
   );
 }

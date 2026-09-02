@@ -1,8 +1,18 @@
-import type { FileDetailDto, SessionFailureDto, SessionSnapshotDto, SidebarDto } from "../bindings";
+import type {
+  AnchoredDraftDto,
+  DraftsDto,
+  FileDetailDto,
+  SessionFailureDto,
+  SessionSnapshotDto,
+  SidebarDto,
+} from "../bindings";
 import { clamp } from "../lib/clamp";
 
-/** What the loading screen shows before any session request has begun. */
-const DEMO_DESCRIPTION = "the generated fixture";
+/** Shown under the composer when a span was refused rather than saved. */
+const REJECTED_NOTICE = "This selection cannot hold a comment";
+
+/** The composer's frozen span and any notice it is showing, or absent when closed. */
+export type ComposerState = { rows: [number, number]; notice: string | null } | null;
 
 export type SessionState =
   | { status: "loading"; description: string; stage: string }
@@ -13,24 +23,32 @@ export type SessionState =
       file: FileDetailDto;
       cursor: number;
       anchor: number;
+      drafts: DraftsDto;
+      composer: ComposerState;
     };
 
 export type ReadyState = Extract<SessionState, { status: "ready" }>;
 
 export const initialState: SessionState = {
   status: "loading",
-  description: DEMO_DESCRIPTION,
+  description: "",
   stage: "Starting",
 };
 
 export type SessionAction =
+  | { type: "describe"; description: string }
   | { type: "stage"; stage: string }
   | { type: "failed"; failure: SessionFailureDto }
   | { type: "ready"; snapshot: SessionSnapshotDto; file: FileDetailDto }
   | { type: "file"; file: FileDetailDto }
   | { type: "sidebar"; sidebar: SidebarDto }
   | { type: "move"; delta: 1 | -1; extend: boolean }
-  | { type: "click"; index: number };
+  | { type: "click"; index: number }
+  | { type: "toggleComposer" }
+  | { type: "openComposer"; index: number }
+  | { type: "closeComposer" }
+  | { type: "drafts"; drafts: DraftsDto }
+  | { type: "editRejected" };
 
 /** Clamps a cursor into a row range, or to zero when the file has no rows. */
 function clampCursor(value: number, rowCount: number): number {
@@ -39,6 +57,12 @@ function clampCursor(value: number, rowCount: number): number {
 
 export function sessionReducer(state: SessionState, action: SessionAction): SessionState {
   switch (action.type) {
+    case "describe":
+      if (state.status !== "loading") {
+        return state;
+      }
+      return { ...state, description: action.description };
+
     case "stage":
       if (state.status !== "loading") {
         return state;
@@ -55,13 +79,22 @@ export function sessionReducer(state: SessionState, action: SessionAction): Sess
         file: action.file,
         cursor: 0,
         anchor: 0,
+        drafts: action.file.drafts,
+        composer: null,
       };
 
     case "file":
       if (state.status !== "ready") {
         return state;
       }
-      return { ...state, file: action.file, cursor: 0, anchor: 0 };
+      return {
+        ...state,
+        file: action.file,
+        cursor: 0,
+        anchor: 0,
+        drafts: action.file.drafts,
+        composer: null,
+      };
 
     case "sidebar":
       if (state.status !== "ready") {
@@ -85,10 +118,64 @@ export function sessionReducer(state: SessionState, action: SessionAction): Sess
       const cursor = clampCursor(action.index, state.file.rows.length);
       return { ...state, cursor, anchor: cursor };
     }
+
+    case "toggleComposer": {
+      if (state.status !== "ready") {
+        return state;
+      }
+      const [start, end] = selectionRange(state);
+      if (state.composer && state.composer.rows[0] === start && state.composer.rows[1] === end) {
+        return { ...state, composer: null };
+      }
+      return { ...state, composer: { rows: [start, end], notice: null } };
+    }
+
+    case "openComposer": {
+      if (state.status !== "ready") {
+        return state;
+      }
+      const cursor = clampCursor(action.index, state.file.rows.length);
+      return { ...state, cursor, anchor: cursor, composer: { rows: [cursor, cursor], notice: null } };
+    }
+
+    case "closeComposer":
+      if (state.status !== "ready") {
+        return state;
+      }
+      return { ...state, composer: null };
+
+    case "drafts":
+      if (state.status !== "ready" || action.drafts.file_index !== state.drafts.file_index) {
+        return state;
+      }
+      return {
+        ...state,
+        drafts: action.drafts,
+        composer: state.composer ? { ...state.composer, notice: null } : null,
+      };
+
+    case "editRejected":
+      if (state.status !== "ready" || !state.composer) {
+        return state;
+      }
+      return { ...state, composer: { ...state.composer, notice: REJECTED_NOTICE } };
   }
 }
 
 /** The inclusive row range the reviewer has selected, low index first. */
 export function selectionRange(state: ReadyState): [number, number] {
   return [Math.min(state.anchor, state.cursor), Math.max(state.anchor, state.cursor)];
+}
+
+/** The draft anchored to a row, if the projection has one there. */
+export function draftAtRow(drafts: DraftsDto, row: number): AnchoredDraftDto | undefined {
+  return drafts.anchored.find((draft) => draft.row === row);
+}
+
+/** The text a freshly opened composer should show, silently, before any typing. */
+export function composerPrefill(state: ReadyState): string {
+  if (!state.composer) {
+    return "";
+  }
+  return draftAtRow(state.drafts, state.composer.rows[1])?.body ?? "";
 }

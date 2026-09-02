@@ -5,15 +5,23 @@ import type { Channel } from "@tauri-apps/api/core";
 import App from "./App";
 import { makeFile, makeFileSummary, makeRow, makeSidebar, makeSnapshot } from "./test/fixtures";
 
+const describeSession = vi.fn();
 const openSession = vi.fn();
 const selectFile = vi.fn();
 const toggleViewed = vi.fn();
+const editDraft = vi.fn();
+const discardDraft = vi.fn();
+const reanchorDraft = vi.fn();
 
 vi.mock("./bindings", () => ({
   commands: {
+    describeSession: () => describeSession(),
     openSession: (channel: unknown) => openSession(channel),
     selectFile: (index: unknown) => selectFile(index),
     toggleViewed: () => toggleViewed(),
+    editDraft: (...args: unknown[]) => editDraft(...args),
+    discardDraft: (...args: unknown[]) => discardDraft(...args),
+    reanchorDraft: (...args: unknown[]) => reanchorDraft(...args),
   },
 }));
 
@@ -23,9 +31,14 @@ vi.mock("@tauri-apps/plugin-clipboard-manager", () => ({
 }));
 
 beforeEach(() => {
+  describeSession.mockReset();
+  describeSession.mockResolvedValue("the generated fixture");
   openSession.mockReset();
   selectFile.mockReset();
   toggleViewed.mockReset();
+  editDraft.mockReset();
+  discardDraft.mockReset();
+  reanchorDraft.mockReset();
   writeText.mockReset();
 });
 
@@ -38,7 +51,8 @@ describe("App", () => {
     });
 
     render(<App />);
-    expect(screen.getByText(/Opening the generated fixture/)).toBeTruthy();
+
+    await waitFor(() => expect(screen.getByText(/Opening the generated fixture/)).toBeTruthy());
 
     channel?.onmessage("Fetching Git objects");
 
@@ -84,6 +98,15 @@ describe("App", () => {
     render(<App />);
 
     await waitFor(() => expect(screen.getByText("network unreachable")).toBeTruthy());
+  });
+
+  it("shows the failure screen when describeSession itself rejects", async () => {
+    describeSession.mockReset();
+    describeSession.mockRejectedValue(new Error("IPC is unavailable"));
+
+    render(<App />);
+
+    await waitFor(() => expect(screen.getByText("Error: IPC is unavailable")).toBeTruthy());
   });
 
   describe("once ready", () => {
@@ -183,6 +206,49 @@ describe("App", () => {
       await user.keyboard("{Meta>}c{/Meta}");
 
       expect(writeText).toHaveBeenCalledWith("first\nsecond");
+    });
+
+    it("yields the row cursor to a keydown targeting the open composer", async () => {
+      const user = userEvent.setup();
+      render(<App />);
+      await waitFor(() => expect(screen.getByText("first")).toBeTruthy());
+
+      await user.keyboard("c");
+      const editorContent = await waitFor(() => {
+        const element = document.querySelector("[data-composer] .cm-content");
+        if (!element) {
+          throw new Error("composer editor not mounted yet");
+        }
+        return element;
+      });
+
+      editorContent.dispatchEvent(new KeyboardEvent("keydown", { key: "j", bubbles: true }));
+
+      expect(screen.getByText("first").closest(".diff-row")?.className).toContain(
+        "diff-row--selected",
+      );
+      expect(screen.getByText("second").closest(".diff-row")?.className).not.toContain(
+        "diff-row--selected",
+      );
+    });
+
+    it("does not let the global c toggle swallow a keydown inside the composer", async () => {
+      const user = userEvent.setup();
+      render(<App />);
+      await waitFor(() => expect(screen.getByText("first")).toBeTruthy());
+
+      await user.keyboard("c");
+      const editorContent = await waitFor(() => {
+        const element = document.querySelector("[data-composer] .cm-content");
+        if (!element) {
+          throw new Error("composer editor not mounted yet");
+        }
+        return element;
+      });
+
+      editorContent.dispatchEvent(new KeyboardEvent("keydown", { key: "c", bubbles: true }));
+
+      expect(document.querySelector("[data-composer]")).not.toBeNull();
     });
   });
 });

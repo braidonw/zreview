@@ -4,7 +4,16 @@ import { SessionShell } from "./components/SessionShell";
 import { useSession } from "./hooks/useSession";
 
 export default function App() {
-  const { state, selectFile, clickRow } = useSession();
+  const {
+    state,
+    selectFile,
+    clickRow,
+    openComposer,
+    closeComposer,
+    composerChange,
+    composerDiscard,
+    reanchorDraft,
+  } = useSession();
 
   switch (state.status) {
     case "loading":
@@ -12,6 +21,17 @@ export default function App() {
     case "failed":
       return <FailureScreen failure={state.failure} />;
     case "ready":
-      return <SessionShell state={state} onSelectFile={selectFile} onRowClick={clickRow} />;
+      return (
+        <SessionShell
+          state={state}
+          onSelectFile={selectFile}
+          onRowClick={clickRow}
+          onOpenComposer={openComposer}
+          onComposerChange={composerChange}
+          onComposerClose={closeComposer}
+          onComposerDiscard={composerDiscard}
+          onReanchorDraft={reanchorDraft}
+        />
+      );
   }
 }

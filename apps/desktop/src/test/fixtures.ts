@@ -1,4 +1,13 @@
-import type { FileDetailDto, FileSummaryDto, RowDto, SessionSnapshotDto, SidebarDto } from "../bindings";
+import type {
+  AnchoredDraftDto,
+  DraftsDto,
+  FileDetailDto,
+  FileSummaryDto,
+  RowDto,
+  SessionSnapshotDto,
+  SidebarDto,
+  StaleDraftDto,
+} from "../bindings";
 
 export function makeRow(overrides: Partial<RowDto> = {}): RowDto {
   return {
@@ -8,8 +17,37 @@ export function makeRow(overrides: Partial<RowDto> = {}): RowDto {
     text: "line",
     hunk_header: null,
     thread_count: 0,
-    has_draft: false,
-    draft_is_proposed: false,
+    ...overrides,
+  };
+}
+
+export function makeAnchoredDraft(overrides: Partial<AnchoredDraftDto> = {}): AnchoredDraftDto {
+  return {
+    row: 0,
+    body: "a draft",
+    is_proposed: false,
+    ...overrides,
+  };
+}
+
+export function makeStaleDraft(overrides: Partial<StaleDraftDto> = {}): StaleDraftDto {
+  return {
+    path: "src/review_fixture_00.rs",
+    side: "Right",
+    line: 9999,
+    body: "written last week",
+    location: "was RIGHT line 9999",
+    ...overrides,
+  };
+}
+
+export function makeDrafts(overrides: Partial<DraftsDto> = {}): DraftsDto {
+  return {
+    file_index: 0,
+    anchored: [],
+    stale: [],
+    file_draft_count: 0,
+    write_failure: null,
     ...overrides,
   };
 }
@@ -19,6 +57,8 @@ export function makeFile(overrides: Partial<FileDetailDto> = {}): FileDetailDto 
     index: 0,
     path: "src/review_fixture_00.rs",
     rows: [makeRow()],
+    drafts: makeDrafts(),
+    empty_reason: null,
     ...overrides,
   };
 }
@@ -52,6 +92,7 @@ export function makeSnapshot(overrides: Partial<SessionSnapshotDto> = {}): Sessi
     title: "Generated fixture",
     subtitle: "Diff virtualization demo",
     sidebar: makeSidebar(),
+    warnings: [],
     ...overrides,
   };
 }

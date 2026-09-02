@@ -122,3 +122,17 @@
 .file-row__check {
   color: var(--severity-success);
 }
+
+.file-sidebar__warnings {
+  padding: 8px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  border-bottom: 1px solid var(--border-default);
+  background: var(--severity-warning-dim);
+}
+
+.file-sidebar__warning {
+  color: var(--severity-warning-text);
+  font-size: var(--size-label);
+}

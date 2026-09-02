@@ -1,0 +1,35 @@
+.draft-card {
+  margin-left: calc(var(--gutter-width) * 2 + 20px);
+  margin-right: 12px;
+  margin-top: 4px;
+  margin-bottom: 4px;
+  padding: 8px;
+  border-radius: 6px;
+  border-left: 2px solid var(--severity-warning);
+  background: var(--surface-overlay);
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  font-family: var(--font-sans);
+}
+
+.draft-card__header {
+  display: flex;
+  gap: 8px;
+  font-size: var(--size-label);
+}
+
+.draft-card__label {
+  color: var(--severity-warning-text);
+  font-weight: 600;
+}
+
+.draft-card__stale {
+  color: var(--severity-error-text);
+}
+
+.draft-card__body {
+  font-size: var(--size-meta);
+  color: var(--text-primary);
+  white-space: pre-wrap;
+}
