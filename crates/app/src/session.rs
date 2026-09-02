@@ -152,7 +152,9 @@ impl SessionModel {
     ///
     /// Storage is asked to save on every keystroke, which is what makes the text
     /// survive a crash; a sink is required not to block, so this stays cheap.
-    /// Reports whether the span can carry a comment at all.
+    /// Reports whether the span was actually stored, not merely constructible.
+    /// A span whose ends fall in different hunks builds an anchor but is refused
+    /// by `set_draft_over`, and that refusal must reach the caller too.
     pub fn draft_edited(&mut self, rows: RangeInclusive<usize>, body: String) -> bool {
         let Self {
             phase, review_sink, ..
@@ -167,9 +169,11 @@ impl SessionModel {
         let Some(anchor) = review.session.anchor_for_span(file, rows.clone()) else {
             return false;
         };
-        review.session.set_draft_over(file, rows, body);
-        Self::record_draft(review_sink.as_deref(), &review.session, &anchor);
-        true
+        let stored = review.session.set_draft_over(file, rows, body);
+        if stored {
+            Self::record_draft(review_sink.as_deref(), &review.session, &anchor);
+        }
+        stored
     }
 
     /// Removes the draft on a row and tells storage it is gone.
@@ -561,7 +565,8 @@ mod tests {
     use std::sync::{Mutex, atomic::Ordering};
 
     use domain::{
-        DiffFile, DiffSide, FindingProvenance, GuidanceSelection, SessionSource, SubmissionOutcome,
+        ChangeCounts, DiffFile, DiffHunk, DiffLine, DiffLineKind, DiffSide, FileStatus,
+        FindingProvenance, GuidanceSelection, SessionSource, SubmissionOutcome,
     };
 
     use super::*;
@@ -680,6 +685,71 @@ mod tests {
                 head_sha,
             },
             files.into(),
+        )
+        .unwrap()
+    }
+
+    /// A session with one file split across two hunks, so a span crossing them
+    /// can be tested.
+    fn two_hunk_session() -> ReviewSession {
+        let head_sha: Arc<str> = "a".repeat(40).into();
+        let lines = vec![
+            DiffLine {
+                kind: DiffLineKind::Context,
+                old_line: Some(10),
+                new_line: Some(10),
+                text: "a".into(),
+            },
+            DiffLine {
+                kind: DiffLineKind::Addition,
+                old_line: None,
+                new_line: Some(11),
+                text: "b".into(),
+            },
+            DiffLine {
+                kind: DiffLineKind::Context,
+                old_line: Some(80),
+                new_line: Some(80),
+                text: "c".into(),
+            },
+            DiffLine {
+                kind: DiffLineKind::Addition,
+                old_line: None,
+                new_line: Some(81),
+                text: "d".into(),
+            },
+        ];
+        let file = DiffFile {
+            path: "src/review.rs".into(),
+            old_path: None,
+            status: FileStatus::Modified,
+            is_binary: false,
+            hunks: vec![
+                DiffHunk {
+                    header: "@@ -10,1 +10,2 @@".into(),
+                    old_start: 10,
+                    new_start: 10,
+                    line_range: 0..2,
+                },
+                DiffHunk {
+                    header: "@@ -80,1 +80,2 @@".into(),
+                    old_start: 80,
+                    new_start: 80,
+                    line_range: 2..4,
+                },
+            ]
+            .into(),
+            counts: ChangeCounts::of(&lines),
+            lines: lines.into(),
+        };
+        ReviewSession::new(
+            SessionSource::LocalComparison {
+                repository_root: std::path::PathBuf::from("/tmp/repository"),
+                base_sha: Arc::clone(&head_sha),
+                diff_base_sha: Arc::clone(&head_sha),
+                head_sha,
+            },
+            vec![file].into(),
         )
         .unwrap()
     }
@@ -1160,6 +1230,20 @@ mod tests {
         assert_eq!(draft.anchor.start_line, Some(1));
         assert_eq!(draft.anchor.line, 3);
         assert_eq!(session.drafts().len(), 1);
+    }
+
+    /// A span whose ends fall in different hunks builds an anchor but is refused
+    /// by `set_draft_over`; that refusal must reach the caller, not `true`.
+    #[test]
+    fn a_span_crossing_hunks_is_refused_and_stores_nothing() {
+        let sink = RecordingSink::default();
+        let mut model = loaded_model(two_hunk_session(), Some(Box::new(sink.clone())), None);
+
+        // Row 0 is in the first hunk, row 3 in the second.
+        assert!(!model.draft_edited(0..=3, "spans two hunks".to_owned()));
+
+        assert!(review(&model).session().drafts().is_empty());
+        assert!(sink.calls().is_empty(), "nothing should have been written");
     }
 
     /// The point of the whole path: what is written becomes a draft anchored to the
