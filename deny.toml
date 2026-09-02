@@ -31,10 +31,12 @@ allow = [
     "Unicode-3.0",
     "BSL-1.0",
     "NCSA",
-    # Weak, file-level copyleft. Reached only through gpui's font discovery
-    # (option-ext, via dirs -> zed-font-kit) and it does not extend to code that
-    # merely links it. Recorded here as a deliberate decision, and one of the
-    # items PLAN wants confirmed by legal review before distribution.
+    # Weak, file-level copyleft. Reached through gpui's font discovery
+    # (option-ext, via dirs -> zed-font-kit) and, since the Tauri desktop shell,
+    # also through tauri-utils' CSS parsing (cssparser, selectors, via dom_query)
+    # and its own `dirs` dependency (option-ext again). None of it extends to
+    # code that merely links it. Recorded here as a deliberate decision, and one
+    # of the items PLAN wants confirmed by legal review before distribution.
     "MPL-2.0",
 ]
 # Fail on a dependency whose licence cannot be determined at all.
