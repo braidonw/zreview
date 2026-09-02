@@ -1,0 +1,124 @@
+.file-sidebar {
+  width: var(--sidebar-width);
+  flex-shrink: 0;
+  height: 100%;
+  overflow-y: auto;
+  background: var(--surface-base);
+  border-right: 1px solid var(--border-default);
+}
+
+.file-sidebar__header {
+  padding: 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  border-bottom: 1px solid var(--border-default);
+}
+
+.file-sidebar__label {
+  color: var(--severity-info);
+  font-size: var(--size-meta);
+  overflow: hidden;
+  white-space: nowrap;
+}
+
+.file-sidebar__title {
+  color: var(--text-primary);
+  font-weight: 600;
+  overflow: hidden;
+  white-space: nowrap;
+}
+
+.file-sidebar__meta {
+  color: var(--text-tertiary);
+  font-size: var(--size-meta);
+}
+
+.file-row {
+  height: var(--file-row-height);
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 0 12px;
+  cursor: pointer;
+  background: var(--surface-base);
+}
+
+.file-row--selected {
+  background: var(--surface-selected);
+}
+
+.file-row--viewed {
+  opacity: var(--viewed-opacity);
+}
+
+.file-row__status {
+  width: 16px;
+  font-weight: 600;
+}
+
+.file-row__status--success {
+  color: var(--severity-success);
+}
+
+.file-row__status--error {
+  color: var(--severity-error-text);
+}
+
+.file-row__status--error-strong {
+  color: var(--severity-error);
+}
+
+.file-row__status--warning {
+  color: var(--severity-warning);
+}
+
+.file-row__status--info {
+  color: var(--severity-info);
+}
+
+.file-row__status--proposed {
+  color: var(--proposed-base);
+}
+
+.file-row__path {
+  flex: 1;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  color: var(--text-secondary);
+  font-family: var(--font-mono);
+  font-size: var(--size-code);
+}
+
+.file-row__threads {
+  padding: 0 4px;
+  border-radius: 4px;
+  background: var(--accent-dim);
+  color: var(--accent-text);
+  font-size: var(--size-label);
+}
+
+.file-row__binary {
+  color: var(--text-tertiary);
+  font-size: var(--size-label);
+}
+
+.file-row__counts {
+  display: flex;
+  gap: 4px;
+  font-size: var(--size-label);
+  font-family: var(--font-mono);
+}
+
+.file-row__additions {
+  color: var(--severity-success);
+}
+
+.file-row__deletions {
+  color: var(--severity-error-text);
+}
+
+.file-row__check {
+  color: var(--severity-success);
+}

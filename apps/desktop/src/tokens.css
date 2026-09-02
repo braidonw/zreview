@@ -1,0 +1,82 @@
+/* Transcribed from crates/ui/src/theme.rs. Keep the two files in step. A token
+   renamed or added there should be renamed or added here the same day. */
+
+:root {
+  /* Background levels, deepest first. */
+  --surface-inset: #0c1116;
+  --surface-base: #0f141a;
+  --surface-raised: #161c23;
+  --surface-overlay: #1c232c;
+  --surface-hover: #202832;
+  --surface-selected: #1a2534;
+
+  /* Four levels, in descending prominence. */
+  --text-primary: #e6ebf1;
+  --text-secondary: #a4afbc;
+  --text-tertiary: #6f7b89;
+  --text-faint: #4e5966;
+  --text-on-accent: #08101c;
+
+  /* Three weights of border. */
+  --border-subtle: #1a212a;
+  --border-default: #263039;
+  --border-strong: #36424e;
+  --border-focus: #4c8dff;
+
+  /* Interaction only: focus, selection, primary action, links. */
+  --accent-base: #4c8dff;
+  --accent-hover: #6ba1ff;
+  --accent-dim: #22355a;
+  --accent-text: #a9c8ff;
+
+  /* Low-chroma diff fills. */
+  --diff-add-bg: #0f2a1c;
+  --diff-add-bg-strong: #1b4a30;
+  --diff-add-fg: #cde7d6;
+  --diff-add-mark: #5fa97c;
+  --diff-del-bg: #2c171c;
+  --diff-del-bg-strong: #58252f;
+  --diff-del-fg: #edd2d7;
+  --diff-del-mark: #c4737f;
+  --diff-hunk-bg: #131a26;
+  --diff-hunk-fg: #7d8da6;
+
+  /* High-chroma signal, each with a dim fill and a text value. */
+  --severity-error: #ff6a4d;
+  --severity-error-dim: #3a1710;
+  --severity-error-text: #ffb3a0;
+  --severity-warning: #e2a33c;
+  --severity-warning-dim: #322412;
+  --severity-warning-text: #f3ce86;
+  --severity-info: #7fa8d9;
+  --severity-info-dim: #16232f;
+  --severity-info-text: #b6cfe8;
+  --severity-success: #46c08a;
+  --severity-success-dim: #0f2a20;
+  --severity-success-text: #93ddbb;
+
+  /* One hue, reserved entirely for "a model proposed this". */
+  --proposed-base: #b48ce0;
+  --proposed-dim: #241a32;
+  --proposed-text: #d6bdf0;
+
+  /* Layout. */
+  --row-height: 20px;
+  --gutter-width: 46px;
+  --rail-width: 2px;
+  --sidebar-width: 290px;
+  --file-row-height: 36px;
+  --marker-width: 20px;
+  --viewed-opacity: 0.55;
+
+  /* Type. */
+  --size-code: 12.5px;
+  --size-body: 13px;
+  --size-meta: 12px;
+  --size-label: 11px;
+  --size-heading: 17px;
+  --size-display: 24px;
+  --body-line-height: 20px;
+  --font-mono: ui-monospace, "SF Mono", Menlo, monospace;
+  --font-sans: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+}
