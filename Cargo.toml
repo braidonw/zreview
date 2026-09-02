@@ -8,6 +8,7 @@ members = [
     "crates/github",
     "crates/review",
     "crates/session",
+    "crates/settings",
     "crates/store",
     "crates/ui",
 ]
@@ -29,8 +30,10 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 review = { path = "crates/review" }
 session = { path = "crates/session" }
+settings = { path = "crates/settings" }
 store = { path = "crates/store" }
 thiserror = "2.0"
+toml = "1.0"
 ui = { path = "crates/ui" }
 
 [workspace.lints.rust]
