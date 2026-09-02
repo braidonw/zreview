@@ -1,7 +1,11 @@
 import { useEffect, useRef } from "react";
 import { useVirtualizer } from "@tanstack/react-virtual";
-import type { RowDto } from "../bindings";
+import type { DraftsDto, RowDto } from "../bindings";
+import type { ComposerState } from "../hooks/sessionReducer";
+import { draftAtRow } from "../hooks/sessionReducer";
+import { CommentComposer } from "./CommentComposer";
 import { DiffRow } from "./DiffRow";
+import { DraftCard } from "./DraftCard";
 import { HunkHeader } from "./HunkHeader";
 import "./DiffList.css";
 
@@ -11,14 +15,28 @@ export function DiffList({
   cursor,
   selectionStart,
   selectionEnd,
+  drafts,
+  composer,
+  composerPrefill,
   onRowClick,
+  onOpenComposer,
+  onComposerChange,
+  onComposerClose,
+  onComposerDiscard,
 }: {
   rows: RowDto[];
   fileIndex: number;
   cursor: number;
   selectionStart: number;
   selectionEnd: number;
+  drafts: DraftsDto;
+  composer: ComposerState;
+  composerPrefill: string;
   onRowClick: (index: number) => void;
+  onOpenComposer: (index: number) => void;
+  onComposerChange: (body: string) => void;
+  onComposerClose: () => void;
+  onComposerDiscard: () => void;
 }) {
   const scrollRef = useRef<HTMLDivElement>(null);
 
@@ -54,19 +72,37 @@ export function DiffList({
           if (!row) {
             return null;
           }
+          const draft = draftAtRow(drafts, item.index);
+          const composerOpenHere = composer !== null && composer.rows[1] === item.index;
           return (
             <div
               key={item.key}
+              data-index={item.index}
+              ref={virtualizer.measureElement}
               className="diff-list__item"
-              style={{ height: item.size, transform: `translateY(${item.start}px)` }}
+              style={{ transform: `translateY(${item.start}px)` }}
             >
               {row.hunk_header !== null && <HunkHeader header={row.hunk_header} />}
               <DiffRow
                 row={row}
                 selected={item.index === cursor}
                 inSelection={item.index >= selectionStart && item.index <= selectionEnd}
+                draft={draft}
+                showPill={item.index === cursor && !composerOpenHere}
                 onClick={() => onRowClick(item.index)}
+                onOpenComposer={() => onOpenComposer(item.index)}
               />
+              {draft && !composerOpenHere && <DraftCard body={draft.body} />}
+              {composerOpenHere && composer && (
+                <CommentComposer
+                  rows={composer.rows}
+                  prefill={composerPrefill}
+                  notice={composer.notice}
+                  onChange={onComposerChange}
+                  onClose={onComposerClose}
+                  onDiscard={onComposerDiscard}
+                />
+              )}
             </div>
           );
         })}

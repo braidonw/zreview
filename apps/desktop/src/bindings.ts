@@ -5,7 +5,8 @@ import { invoke as __TAURI_INVOKE, Channel } from "@tauri-apps/api/core";
 /** Commands */
 export const commands = {
 	/**
-	 *  Loads the demo review session, reporting each stage on `on_stage` as it goes.
+	 *  Loads the review session the window was opened with, reporting each stage on
+	 *  `on_stage` as it goes.
 	 * 
 	 *  # Errors
 	 * 
@@ -28,15 +29,87 @@ export const commands = {
 	 *  Returns a failure when the session is not ready.
 	 */
 	toggleViewed: () => typedError<SidebarDto, SessionFailureDto>(__TAURI_INVOKE("toggle_viewed")),
+	/**
+	 *  The request's own description, shown by the loading screen before anything
+	 *  about the target session is known.
+	 */
+	describeSession: () => __TAURI_INVOKE<string>("describe_session"),
+	/**
+	 *  Edits the draft over rows `start..=end` of `file_index`. Persists the new
+	 *  text on every call. That is what makes a keystroke survive a crash.
+	 * 
+	 *  # Errors
+	 * 
+	 *  Returns a failure when the session is not ready. An unanchorable span is not
+	 *  an error. It comes back as `accepted: false` on the outcome, and neither is a
+	 *  `file_index` that has since been navigated away from; the outcome reflects
+	 *  the file that is actually selected.
+	 */
+	editDraft: (fileIndex: number, start: number, end: number, body: string) => typedError<DraftEditOutcomeDto, SessionFailureDto>(__TAURI_INVOKE("edit_draft", { fileIndex, start, end, body })),
+	/**
+	 *  Discards the draft on `row` of `file_index`.
+	 * 
+	 *  # Errors
+	 * 
+	 *  Returns a failure when the session is not ready.
+	 */
+	discardDraft: (fileIndex: number, row: number) => typedError<DraftsDto, SessionFailureDto>(__TAURI_INVOKE("discard_draft", { fileIndex, row })),
+	/**
+	 *  Moves a stale draft, named by the position it was written against, onto
+	 *  `row` of `file_index`.
+	 * 
+	 *  # Errors
+	 * 
+	 *  Returns a failure when the session is not ready, no stale draft matches
+	 *  `(path, side, line)`, or `row` cannot carry a comment.
+	 */
+	reanchorDraft: (fileIndex: number, path: string, side: DiffSideDto, line: number, row: number) => typedError<DraftsDto, SessionFailureDto>(__TAURI_INVOKE("reanchor_draft", { fileIndex, path, side, line, row })),
 };
 
 /* Types */
+/**  A draft resolved to the row it is drawn on. */
+export type AnchoredDraftDto = {
+	row: number,
+	body: string,
+	is_proposed: boolean,
+};
+
 export type DiffLineKindDto = "Context" | "Addition" | "Deletion" | "NoNewlineMarker";
+
+export type DiffSideDto = "Left" | "Right";
+
+/**  The outcome of an edit, discard, or reanchor on the composer. */
+export type DraftEditOutcomeDto = {
+	accepted: boolean,
+	drafts: DraftsDto,
+};
+
+/**
+ *  Every draft that belongs to one file, projected for a per-keystroke response.
+ * 
+ *  Deliberately narrow. Refetching a whole [`FileDetailDto`] on every keystroke
+ *  would re-send up to 100,000 rows for a single character typed.
+ */
+export type DraftsDto = {
+	file_index: number,
+	anchored: AnchoredDraftDto[],
+	stale: StaleDraftDto[],
+	file_draft_count: number,
+	write_failure: string | null,
+};
+
+/**  Why a file shows no diff rows. */
+export type EmptyReasonDto = {
+	label: string,
+	detail: string,
+};
 
 export type FileDetailDto = {
 	index: number,
 	path: string,
 	rows: RowDto[],
+	drafts: DraftsDto,
+	empty_reason: EmptyReasonDto | null,
 };
 
 export type FileStatusDto = "Added" | "Deleted" | "Modified" | "Renamed" | "Copied" | "TypeChanged" | "Unmerged";
@@ -66,8 +139,6 @@ export type RowDto = {
 	 */
 	hunk_header: string | null,
 	thread_count: number,
-	has_draft: boolean,
-	draft_is_proposed: boolean,
 };
 
 export type SessionFailureDto = {
@@ -80,6 +151,7 @@ export type SessionSnapshotDto = {
 	title: string,
 	subtitle: string,
 	sidebar: SidebarDto,
+	warnings: SessionFailureDto[],
 };
 
 export type SidebarDto = {
@@ -87,6 +159,16 @@ export type SidebarDto = {
 	selected_file: number,
 	viewed_count: number,
 	thread_count: number,
+};
+
+/**  A draft whose anchor no longer resolves against the current diff. */
+export type StaleDraftDto = {
+	path: string,
+	side: DiffSideDto,
+	line: number,
+	body: string,
+	/**  Where the draft used to sit, formatted for display, e.g. "was RIGHT line 42". */
+	location: string,
 };
 
 /* Tauri Specta runtime */

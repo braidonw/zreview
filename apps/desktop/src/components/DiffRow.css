@@ -99,3 +99,28 @@
   overflow: hidden;
   white-space: nowrap;
 }
+
+.diff-row__draft-chip {
+  flex-shrink: 0;
+  margin-right: 8px;
+  padding: 0 6px;
+  border-radius: 3px;
+  background: var(--accent-dim);
+  color: var(--accent-text);
+  font-family: var(--font-sans);
+  font-size: var(--size-label);
+  text-transform: uppercase;
+}
+
+.diff-row__pill {
+  flex-shrink: 0;
+  margin-right: 8px;
+  padding: 4px 10px;
+  border: none;
+  border-radius: 4px;
+  background: var(--accent-base);
+  color: var(--text-on-accent);
+  font-family: var(--font-sans);
+  font-size: var(--size-label);
+  cursor: pointer;
+}

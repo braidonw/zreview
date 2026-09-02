@@ -4,8 +4,11 @@
 //! `&SessionFailure`) and returns a value, which is what keeps them testable
 //! without a running app.
 
-use domain::{DiffFile, DiffLineKind, FileStatus, ReviewSession, SessionFailure, SessionSource};
-use serde::Serialize;
+use domain::{
+    DiffFile, DiffLineKind, DiffSide, EmptyDiffReason, FileStatus, ReviewSession, SessionFailure,
+    SessionSource,
+};
+use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, Serialize, specta::Type)]
 pub enum FileStatusDto {
@@ -51,6 +54,30 @@ impl From<DiffLineKind> for DiffLineKindDto {
     }
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, specta::Type)]
+pub enum DiffSideDto {
+    Left,
+    Right,
+}
+
+impl From<DiffSide> for DiffSideDto {
+    fn from(side: DiffSide) -> Self {
+        match side {
+            DiffSide::Left => Self::Left,
+            DiffSide::Right => Self::Right,
+        }
+    }
+}
+
+impl From<DiffSideDto> for DiffSide {
+    fn from(side: DiffSideDto) -> Self {
+        match side {
+            DiffSideDto::Left => Self::Left,
+            DiffSideDto::Right => Self::Right,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize, specta::Type)]
 pub struct FileSummaryDto {
     pub index: u32,
@@ -77,6 +104,7 @@ pub struct SessionSnapshotDto {
     pub title: String,
     pub subtitle: String,
     pub sidebar: SidebarDto,
+    pub warnings: Vec<SessionFailureDto>,
 }
 
 #[derive(Clone, Debug, Serialize, specta::Type)]
@@ -91,8 +119,61 @@ pub struct RowDto {
     /// always equals its line index.
     pub hunk_header: Option<String>,
     pub thread_count: u32,
-    pub has_draft: bool,
-    pub draft_is_proposed: bool,
+}
+
+/// A draft resolved to the row it is drawn on.
+#[derive(Clone, Debug, Serialize, specta::Type)]
+pub struct AnchoredDraftDto {
+    pub row: u32,
+    pub body: String,
+    pub is_proposed: bool,
+}
+
+/// A draft whose anchor no longer resolves against the current diff.
+#[derive(Clone, Debug, Serialize, specta::Type)]
+pub struct StaleDraftDto {
+    pub path: String,
+    pub side: DiffSideDto,
+    pub line: u32,
+    pub body: String,
+    /// Where the draft used to sit, formatted for display, e.g. "was RIGHT line 42".
+    pub location: String,
+}
+
+/// Every draft that belongs to one file, projected for a per-keystroke response.
+///
+/// Deliberately narrow. Refetching a whole [`FileDetailDto`] on every keystroke
+/// would re-send up to 100,000 rows for a single character typed.
+#[derive(Clone, Debug, Serialize, specta::Type)]
+pub struct DraftsDto {
+    pub file_index: u32,
+    pub anchored: Vec<AnchoredDraftDto>,
+    pub stale: Vec<StaleDraftDto>,
+    pub file_draft_count: u32,
+    pub write_failure: Option<String>,
+}
+
+/// The outcome of an edit, discard, or reanchor on the composer.
+#[derive(Clone, Debug, Serialize, specta::Type)]
+pub struct DraftEditOutcomeDto {
+    pub accepted: bool,
+    pub drafts: DraftsDto,
+}
+
+/// Why a file shows no diff rows.
+#[derive(Clone, Debug, Serialize, specta::Type)]
+pub struct EmptyReasonDto {
+    pub label: String,
+    pub detail: String,
+}
+
+impl From<EmptyDiffReason> for EmptyReasonDto {
+    fn from(reason: EmptyDiffReason) -> Self {
+        Self {
+            label: reason.label().to_owned(),
+            detail: reason.detail().to_owned(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize, specta::Type)]
@@ -100,6 +181,8 @@ pub struct FileDetailDto {
     pub index: u32,
     pub path: String,
     pub rows: Vec<RowDto>,
+    pub drafts: DraftsDto,
+    pub empty_reason: Option<EmptyReasonDto>,
 }
 
 #[derive(Clone, Debug, Serialize, specta::Type)]
@@ -181,6 +264,7 @@ pub fn project_snapshot(session: &ReviewSession) -> SessionSnapshotDto {
         title,
         subtitle,
         sidebar: project_sidebar(session),
+        warnings: session.warnings().iter().map(Into::into).collect(),
     }
 }
 
@@ -225,12 +309,13 @@ pub fn project_file(session: &ReviewSession, index: usize) -> Option<FileDetailD
         index: as_u32(index),
         path: file.path.to_string(),
         rows,
+        drafts: project_drafts(session, index),
+        empty_reason: file.empty_reason().map(Into::into),
     })
 }
 
 fn project_row(session: &ReviewSession, file_index: usize, file: &DiffFile, row: usize) -> RowDto {
     let line = &file.lines[row];
-    let draft = session.draft_at(file_index, row);
     RowDto {
         kind: line.kind.into(),
         old_line: line.old_line,
@@ -238,13 +323,59 @@ fn project_row(session: &ReviewSession, file_index: usize, file: &DiffFile, row:
         text: line.text.to_string(),
         hunk_header: file.hunk_header_at(row).map(ToString::to_string),
         thread_count: as_u32(session.comments().threads_at(file_index, row).len()),
-        has_draft: draft.is_some(),
-        draft_is_proposed: draft.is_some_and(domain::DraftComment::is_proposed),
+    }
+}
+
+/// Every draft on one file, resolved to its row where it still anchors, cheap
+/// regardless of file size since it walks this file's drafts, never its rows.
+///
+/// # Panics
+///
+/// Panics if `file_index` is out of range. Every caller already holds a session
+/// whose selected or requested file is known to exist.
+#[must_use]
+pub fn project_drafts(session: &ReviewSession, file_index: usize) -> DraftsDto {
+    let file = session
+        .files()
+        .get(file_index)
+        .expect("file_index is bounds-checked by the caller");
+    let anchors = session.anchors();
+    let mut anchored = Vec::new();
+    let mut stale = Vec::new();
+    for draft in session.drafts().for_path(&file.path) {
+        if draft.is_stale {
+            stale.push(StaleDraftDto {
+                path: draft.anchor.path.to_string(),
+                side: draft.anchor.side.into(),
+                line: draft.anchor.line,
+                body: draft.body.clone(),
+                location: format!("was {} line {}", draft.anchor.side, draft.anchor.line),
+            });
+        } else if let Some(location) = anchors.and_then(|index| index.resolve(&draft.anchor).ok()) {
+            anchored.push(AnchoredDraftDto {
+                row: as_u32(location.row),
+                body: draft.body.clone(),
+                is_proposed: draft.is_proposed(),
+            });
+        }
+    }
+    anchored.sort_by_key(|draft| draft.row);
+    let file_draft_count = as_u32(anchored.len() + stale.len());
+    DraftsDto {
+        file_index: as_u32(file_index),
+        anchored,
+        stale,
+        file_draft_count,
+        write_failure: None,
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
+    use domain::DiffFile;
+
     use super::*;
 
     fn demo_session() -> ReviewSession {
@@ -255,6 +386,23 @@ mod tests {
         )
         .expect("the generated fixture always loads")
         .session
+    }
+
+    /// A session anchored against a head commit, so it can hold drafts.
+    fn anchored_session() -> ReviewSession {
+        let head_sha: Arc<str> = "a".repeat(40).into();
+        let mut file = DiffFile::demo(40);
+        file.path = "src/review.rs".into();
+        ReviewSession::new(
+            SessionSource::LocalComparison {
+                repository_root: std::path::PathBuf::from("/tmp/repository"),
+                base_sha: Arc::clone(&head_sha),
+                diff_base_sha: Arc::clone(&head_sha),
+                head_sha,
+            },
+            vec![file].into(),
+        )
+        .unwrap()
     }
 
     #[test]
@@ -336,5 +484,78 @@ mod tests {
     #[test]
     fn short_sha_does_not_panic_on_a_short_string() {
         assert_eq!(short_sha("abc"), "abc");
+    }
+
+    #[test]
+    fn project_drafts_lists_anchored_and_stale_drafts_on_the_files_path() {
+        let mut session = anchored_session();
+        session.set_draft(0, 6, "needs a test");
+        let stale = domain::DiffAnchor {
+            path: "src/review.rs".into(),
+            side: domain::DiffSide::Right,
+            line: 9_999,
+            start_line: None,
+            head_sha: "a".repeat(40).into(),
+        };
+        session.restore_drafts([(stale, "written last week".to_owned())]);
+
+        let drafts = project_drafts(&session, 0);
+
+        assert_eq!(drafts.file_index, 0);
+        assert_eq!(drafts.file_draft_count, 2);
+        assert_eq!(drafts.anchored.len(), 1);
+        assert_eq!(drafts.anchored[0].row, 6);
+        assert_eq!(drafts.anchored[0].body, "needs a test");
+        assert!(!drafts.anchored[0].is_proposed);
+        assert_eq!(drafts.stale.len(), 1);
+        assert_eq!(drafts.stale[0].path, "src/review.rs");
+        assert!(matches!(drafts.stale[0].side, DiffSideDto::Right));
+        assert_eq!(drafts.stale[0].line, 9_999);
+        assert_eq!(drafts.stale[0].body, "written last week");
+        assert_eq!(drafts.stale[0].location, "was RIGHT line 9999");
+        assert!(drafts.write_failure.is_none());
+    }
+
+    #[test]
+    fn project_file_carries_the_empty_reason_for_a_binary_file() {
+        let session = ReviewSession::new(
+            SessionSource::Demo,
+            vec![DiffFile {
+                path: "image.bin".into(),
+                old_path: None,
+                status: FileStatus::Modified,
+                is_binary: true,
+                hunks: Arc::from([]),
+                counts: domain::ChangeCounts::default(),
+                lines: Arc::from([]),
+            }]
+            .into(),
+        )
+        .unwrap();
+
+        let detail = project_file(&session, 0).expect("index zero is in range");
+
+        assert!(detail.rows.is_empty());
+        let reason = detail.empty_reason.expect("a binary file explains itself");
+        assert_eq!(reason.label, "Binary file");
+        assert_eq!(reason.detail, "ZReview does not render binary content yet.");
+    }
+
+    #[test]
+    fn project_file_carries_no_empty_reason_when_there_are_rows() {
+        let session = demo_session();
+        let detail = project_file(&session, 0).expect("index zero is in range");
+        assert!(detail.empty_reason.is_none());
+    }
+
+    #[test]
+    fn snapshot_carries_the_sessions_warnings() {
+        let mut session = demo_session();
+        session.push_warning(SessionFailure::new("drafts are not being saved"));
+
+        let snapshot = project_snapshot(&session);
+
+        assert_eq!(snapshot.warnings.len(), 1);
+        assert_eq!(snapshot.warnings[0].summary, "drafts are not being saved");
     }
 }

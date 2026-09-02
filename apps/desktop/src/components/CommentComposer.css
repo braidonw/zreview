@@ -1,0 +1,48 @@
+.comment-composer {
+  margin-left: calc(var(--gutter-width) * 2 + 20px);
+  margin-right: 12px;
+  margin-top: 4px;
+  margin-bottom: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  font-family: var(--font-sans);
+}
+
+.comment-composer__editor .cm-editor {
+  height: 104px;
+  border-radius: 6px;
+  border: 1px solid var(--border-default);
+}
+
+.comment-composer__editor .cm-scroller {
+  overflow: auto;
+}
+
+.comment-composer__actions {
+  display: flex;
+  gap: 8px;
+}
+
+.comment-composer__done,
+.comment-composer__discard {
+  height: 32px;
+  padding: 0 12px;
+  border-radius: 6px;
+  border: 1px solid var(--border-strong);
+  background: transparent;
+  color: var(--text-secondary);
+  font-family: var(--font-sans);
+  font-size: var(--size-body);
+  cursor: pointer;
+}
+
+.comment-composer__discard {
+  border-color: var(--severity-error-dim);
+  color: var(--severity-error-text);
+}
+
+.comment-composer__notice {
+  font-size: var(--size-label);
+  color: var(--severity-warning-text);
+}

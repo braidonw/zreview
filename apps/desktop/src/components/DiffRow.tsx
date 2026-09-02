@@ -1,4 +1,4 @@
-import type { DiffLineKindDto, RowDto } from "../bindings";
+import type { AnchoredDraftDto, DiffLineKindDto, RowDto } from "../bindings";
 import "./DiffRow.css";
 
 const KIND_CLASS: Record<DiffLineKindDto, string> = {
@@ -19,14 +19,21 @@ export function DiffRow({
   row,
   selected,
   inSelection,
+  draft,
+  showPill,
   onClick,
+  onOpenComposer,
 }: {
   row: RowDto;
   selected: boolean;
   inSelection: boolean;
+  draft?: AnchoredDraftDto;
+  /** Shown only at the cursor's own row, while the composer is not open there. */
+  showPill?: boolean;
   onClick: () => void;
+  onOpenComposer?: () => void;
 }) {
-  const rail = railClass(row, selected, inSelection);
+  const rail = railClass(row, selected, inSelection, draft);
 
   return (
     <div
@@ -40,16 +47,34 @@ export function DiffRow({
       <div className="diff-row__gutter diff-row__gutter--new">{row.new_line ?? ""}</div>
       <div className="diff-row__marker">{KIND_MARKER[row.kind]}</div>
       <div className="diff-row__text">{row.text}</div>
+      {draft && <span className="diff-row__draft-chip">draft</span>}
+      {showPill && (
+        <button
+          type="button"
+          className="diff-row__pill"
+          onClick={(event) => {
+            event.stopPropagation();
+            onOpenComposer?.();
+          }}
+        >
+          {draft ? "Edit" : "Comment"}
+        </button>
+      )}
     </div>
   );
 }
 
-function railClass(row: RowDto, selected: boolean, inSelection: boolean): string {
+function railClass(
+  row: RowDto,
+  selected: boolean,
+  inSelection: boolean,
+  draft: AnchoredDraftDto | undefined,
+): string {
   if (selected || inSelection) {
     return "diff-row__rail--accent";
   }
-  if (row.has_draft) {
-    return row.draft_is_proposed ? "diff-row__rail--proposed" : "diff-row__rail--accent-dim";
+  if (draft) {
+    return draft.is_proposed ? "diff-row__rail--proposed" : "diff-row__rail--accent-dim";
   }
   if (row.thread_count > 0) {
     return "diff-row__rail--thread";
