@@ -1,0 +1,89 @@
+{
+  "data": {
+    "viewer": { "login": "reviewer" },
+    "rateLimit": { "cost": 6, "remaining": 4994, "resetAt": "2026-09-02T13:00:00Z" },
+    "toReview": {
+      "pageInfo": { "hasNextPage": false, "endCursor": "Y3Vyc29yOjI=" },
+      "nodes": [
+        {
+          "number": 42,
+          "title": "Improve the review flow",
+          "url": "https://github.com/acme/widgets/pull/42",
+          "isDraft": false,
+          "updatedAt": "2026-09-02T09:15:00Z",
+          "headRefOid": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "repository": { "nameWithOwner": "acme/widgets" },
+          "author": { "login": "contributor" },
+          "viewerLatestReview": { "commit": { "oid": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" } },
+          "statusCheckRollup": { "state": "SUCCESS" }
+        },
+        {
+          "number": 7,
+          "title": "Bump the parser",
+          "url": "https://github.com/acme/gadgets/pull/7",
+          "isDraft": false,
+          "updatedAt": "2026-09-01T18:02:00Z",
+          "headRefOid": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          "repository": { "nameWithOwner": "acme/gadgets" },
+          "author": null,
+          "viewerLatestReview": null,
+          "statusCheckRollup": null
+        }
+      ]
+    },
+    "authored": {
+      "pageInfo": { "hasNextPage": false, "endCursor": "Y3Vyc29yOjI=" },
+      "nodes": [
+        {
+          "number": 91,
+          "title": "Teach the loader about submodules",
+          "url": "https://github.com/acme/widgets/pull/91",
+          "isDraft": false,
+          "updatedAt": "2026-09-02T11:40:00Z",
+          "headRefOid": "cccccccccccccccccccccccccccccccccccccccc",
+          "repository": { "nameWithOwner": "acme/widgets" },
+          "author": { "login": "reviewer" },
+          "viewerLatestReview": null,
+          "statusCheckRollup": { "state": "FAILURE" },
+          "reviewDecision": "CHANGES_REQUESTED",
+          "latestOpinionatedReviews": {
+            "nodes": [
+              { "state": "CHANGES_REQUESTED", "author": { "login": "maintainer" } },
+              { "state": "APPROVED", "author": null }
+            ]
+          },
+          "reviewThreads": {
+            "totalCount": 2,
+            "pageInfo": { "hasNextPage": false, "endCursor": "Y3Vyc29yOjI=" },
+            "nodes": [
+              {
+                "isResolved": false,
+                "comments": { "nodes": [{ "author": { "login": "maintainer" } }] }
+              },
+              { "isResolved": true, "comments": { "nodes": [] } }
+            ]
+          }
+        },
+        {
+          "number": 92,
+          "title": "Draft: split the store",
+          "url": "https://github.com/acme/gadgets/pull/92",
+          "isDraft": true,
+          "updatedAt": "2026-08-30T08:00:00Z",
+          "headRefOid": "dddddddddddddddddddddddddddddddddddddddd",
+          "repository": { "nameWithOwner": "acme/gadgets" },
+          "author": { "login": "reviewer" },
+          "viewerLatestReview": null,
+          "statusCheckRollup": { "state": "PENDING" },
+          "reviewDecision": null,
+          "latestOpinionatedReviews": { "nodes": [] },
+          "reviewThreads": {
+            "totalCount": 0,
+            "pageInfo": { "hasNextPage": false, "endCursor": null },
+            "nodes": []
+          }
+        }
+      ]
+    }
+  }
+}

@@ -3,12 +3,20 @@ use std::{
     path::{Path, PathBuf},
     process::{Command, Output, Stdio},
     sync::Arc,
+    time::Duration,
 };
 
 use domain::{DiffSide, LoadStage, ReviewComment, ReviewSubmission};
 use git::{ComparisonDiff, ComparisonMode, GitRemote};
 use serde::Deserialize;
 use thiserror::Error;
+
+mod home;
+
+pub use home::{
+    DEFAULT_GRAPHQL_TIMEOUT, HomeFetch, HomePullRequest, HomeRepository, HomeSearch,
+    OpinionatedReview, RateLimit, ReviewDecision, ReviewState, ReviewThread, StatusCheckState,
+};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RepositorySlug {
@@ -108,6 +116,12 @@ pub enum GithubError {
     #[error("gh api failed with status {status}: {stderr}")]
     Command { status: i32, stderr: String },
 
+    #[error("gh did not respond within {timeout_ms}ms")]
+    Timeout { timeout_ms: u64 },
+
+    #[error("GitHub returned more than {pages} pages of {subject}")]
+    PagingLimit { pages: usize, subject: &'static str },
+
     #[error("GitHub returned invalid pull request JSON: {0}")]
     InvalidResponse(#[from] serde_json::Error),
 
@@ -117,7 +131,7 @@ pub enum GithubError {
     #[error("GitHub returned PR #{actual} when #{expected} was requested")]
     UnexpectedPullRequest { expected: u64, actual: u64 },
 
-    #[error("GitHub returned base repository {actual}, expected {expected}")]
+    #[error("GitHub returned repository {actual}, expected {expected}")]
     UnexpectedRepository { expected: String, actual: String },
 
     #[error(
@@ -152,7 +166,7 @@ impl GithubError {
             Self::RateLimited { .. } => {
                 Some("Wait for the GitHub rate limit to reset, then retry.")
             }
-            Self::Network { .. } => {
+            Self::Network { .. } | Self::Timeout { .. } => {
                 Some("Check your network connection and https://githubstatus.com, then retry.")
             }
             Self::ServerError { .. } => Some("Check https://githubstatus.com, then retry."),
@@ -167,6 +181,7 @@ impl GithubError {
             ),
             Self::Command { .. }
             | Self::Execute { .. }
+            | Self::PagingLimit { .. }
             | Self::Validation { .. }
             | Self::InvalidResponse(_)
             | Self::InvalidComment { .. }
@@ -180,6 +195,7 @@ impl GithubError {
 #[derive(Clone, Debug)]
 pub struct GithubClient {
     gh_executable: PathBuf,
+    graphql_timeout: Duration,
 }
 
 impl Default for GithubClient {
@@ -193,7 +209,15 @@ impl GithubClient {
     pub fn new(executable: impl Into<PathBuf>) -> Self {
         Self {
             gh_executable: executable.into(),
+            graphql_timeout: DEFAULT_GRAPHQL_TIMEOUT,
         }
+    }
+
+    /// Sets how long one GraphQL call may run before `gh` is killed.
+    #[must_use]
+    pub const fn with_graphql_timeout(mut self, timeout: Duration) -> Self {
+        self.graphql_timeout = timeout;
+        self
     }
 
     /// Loads metadata and an exact local Git snapshot for one GitHub pull request.
