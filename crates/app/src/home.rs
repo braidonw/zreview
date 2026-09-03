@@ -298,8 +298,9 @@ impl HomeModel {
 
     /// Takes what a refresh read, or the failure that stopped it reading.
     ///
-    /// A failed read empties the list, because everything in it came from the
-    /// file that could not be read.
+    /// A failed read empties the list and ends the refresh as failed, because
+    /// everything in the list came from the file that could not be read. A read
+    /// that worked drops whatever a repository no longer listed had contributed.
     pub fn refreshed(&mut self, result: Result<Vec<RepositoryEntry>, SessionFailure>) {
         match result {
             Ok(repositories) => {
@@ -322,6 +323,7 @@ impl HomeModel {
     ///
     /// Returns `false` for a trigger that arrived mid-refresh, which is ignored
     /// rather than queued, so two refreshes never race.
+    #[must_use]
     pub fn begin_refresh(&mut self) -> bool {
         if matches!(self.refresh, RefreshState::Refreshing { .. }) {
             return false;
@@ -1094,7 +1096,7 @@ mod tests {
     #[test]
     fn a_refresh_where_every_repository_failed_reads_as_failed() {
         let mut home = four_repositories();
-        home.begin_refresh();
+        assert!(home.begin_refresh());
         home.fetching(2);
 
         home.batch_fetched(vec![
@@ -1111,7 +1113,7 @@ mod tests {
     #[test]
     fn a_refresh_where_one_repository_answered_still_settles() {
         let mut home = four_repositories();
-        home.begin_refresh();
+        assert!(home.begin_refresh());
         home.fetching(2);
 
         home.batch_fetched(vec![
@@ -1132,7 +1134,7 @@ mod tests {
     #[test]
     fn a_refresh_with_nothing_configured_settles_rather_than_failing() {
         let mut home = HomeModel::new();
-        home.begin_refresh();
+        assert!(home.begin_refresh());
         home.refreshed(Ok(Vec::new()));
         home.fetching(0);
 
@@ -1149,7 +1151,7 @@ mod tests {
     #[test]
     fn a_preflight_failure_is_the_whole_home_failure_and_ends_the_refresh() {
         let mut home = four_repositories();
-        home.begin_refresh();
+        assert!(home.begin_refresh());
 
         home.preflight_failed(
             SessionFailure::new("GitHub is not authenticated")
@@ -1170,7 +1172,7 @@ mod tests {
     #[test]
     fn a_preflight_failure_does_not_stand_in_the_way_of_adding_a_repository() {
         let mut home = four_repositories();
-        home.begin_refresh();
+        assert!(home.begin_refresh());
         home.preflight_failed(SessionFailure::new("GitHub is not authenticated"));
 
         let write = home.add_repositories(
@@ -1185,7 +1187,7 @@ mod tests {
     #[test]
     fn the_next_refresh_clears_the_preflight_failure() {
         let mut home = four_repositories();
-        home.begin_refresh();
+        assert!(home.begin_refresh());
         home.preflight_failed(SessionFailure::new("GitHub is not authenticated"));
 
         assert!(home.begin_refresh());
@@ -1196,7 +1198,7 @@ mod tests {
     #[test]
     fn a_settings_file_that_cannot_be_read_ends_the_refresh_as_failed() {
         let mut home = four_repositories();
-        home.begin_refresh();
+        assert!(home.begin_refresh());
 
         home.refreshed(Err(SessionFailure::new(
             "Home could not read your settings",
@@ -1208,7 +1210,7 @@ mod tests {
     #[test]
     fn a_repository_that_could_not_be_fetched_names_itself_its_error_and_its_entry() {
         let mut home = four_repositories();
-        home.begin_refresh();
+        assert!(home.begin_refresh());
         home.fetching(4);
 
         home.batch_fetched(vec![unreachable(
@@ -1226,7 +1228,7 @@ mod tests {
     #[test]
     fn a_repository_that_could_not_be_fetched_says_so_in_the_footer_and_the_summary() {
         let mut home = four_repositories();
-        home.begin_refresh();
+        assert!(home.begin_refresh());
         home.fetching(4);
 
         home.batch_fetched(vec![unreachable("acme/billing", "GitHub refused access")]);
@@ -1252,7 +1254,7 @@ mod tests {
             "/Developer/moved",
             "the folder no longer exists",
         )]));
-        home.begin_refresh();
+        assert!(home.begin_refresh());
         home.fetching(0);
 
         assert_eq!(
@@ -1271,7 +1273,7 @@ mod tests {
             valid("/Developer/widgets", "acme/widgets"),
             valid("/Developer/widgets-worktree", "acme/widgets"),
         ]));
-        home.begin_refresh();
+        assert!(home.begin_refresh());
         home.fetching(1);
 
         home.batch_fetched(vec![unreachable("acme/widgets", "GitHub refused access")]);
@@ -1283,12 +1285,12 @@ mod tests {
     #[test]
     fn a_refresh_that_succeeds_clears_the_failure_the_last_one_reported() {
         let mut home = four_repositories();
-        home.begin_refresh();
+        assert!(home.begin_refresh());
         home.fetching(1);
         home.batch_fetched(vec![unreachable("acme/billing", "GitHub refused access")]);
         home.finish_refresh(1_700_000_000_000);
 
-        home.begin_refresh();
+        assert!(home.begin_refresh());
         home.fetching(1);
         home.batch_fetched(vec![empty("acme/billing")]);
         home.finish_refresh(1_700_000_060_000);
@@ -1343,7 +1345,7 @@ mod tests {
         home.move_cursor_down();
         assert_eq!(home.cursor(), 2);
 
-        home.begin_refresh();
+        assert!(home.begin_refresh());
         home.fetching(1);
         home.batch_fetched(vec![loaded(vec![fetched(
             HomeSearch::ReviewRequested,
@@ -1359,7 +1361,7 @@ mod tests {
         let mut home = three_groups();
         home.move_cursor_down();
 
-        home.begin_refresh();
+        assert!(home.begin_refresh());
         home.fetching(1);
         home.batch_fetched(vec![empty("acme/widgets")]);
 
@@ -1376,7 +1378,7 @@ mod tests {
             valid("/Developer/widgets", "acme/widgets"),
             valid("/Developer/zreview", "braidonw/zreview"),
         ]));
-        home.begin_refresh();
+        assert!(home.begin_refresh());
         home.fetching(2);
         home.batch_fetched(vec![
             loaded(vec![fetched(HomeSearch::ReviewRequested, 1, 300)]),

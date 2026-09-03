@@ -57,6 +57,8 @@ fn refresh_home_on_model(
     report_refresh(home, report);
 
     read_into_model(home, settings_path);
+    // Only the settings file can have failed by here, the last refresh's
+    // preflight failure having gone with the trigger that started this one.
     if lock(&home.model).failure().is_some() {
         report_refresh(home, report);
         return;
