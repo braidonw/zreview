@@ -63,6 +63,12 @@ pub enum StoreError {
 
     #[error("no home directory to store review data in")]
     NoHomeDirectory,
+
+    #[error("no review database exists yet")]
+    Missing,
+
+    #[error("the review database's schema version {0} is not one this build knows")]
+    UnsupportedSchemaVersion(i64),
 }
 
 /// The database a review's local state lives in.
@@ -96,6 +102,35 @@ impl ReviewStore {
     pub fn open_in_memory() -> Result<Self, StoreError> {
         let connection = Connection::open_in_memory().map_err(StoreError::Open)?;
         Self::prepare(connection)
+    }
+
+    /// Opens read-only, neither creating the file nor migrating its schema.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::Missing`] when no database exists at `path` yet,
+    /// which is not a failure to a caller for whom that means no Drafts
+    /// anywhere. Returns [`StoreError::Open`] when it exists but cannot be
+    /// opened, and [`StoreError::UnsupportedSchemaVersion`] when its schema is
+    /// not the one this build knows how to read.
+    pub fn open_read_only(path: &Path) -> Result<Self, StoreError> {
+        if !path.exists() {
+            return Err(StoreError::Missing);
+        }
+        let connection = Connection::open_with_flags(
+            path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
+                | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX
+                | rusqlite::OpenFlags::SQLITE_OPEN_URI,
+        )
+        .map_err(StoreError::Open)?;
+        let version: i64 = connection
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .map_err(StoreError::Read)?;
+        if version != SCHEMA_VERSION {
+            return Err(StoreError::UnsupportedSchemaVersion(version));
+        }
+        Ok(Self { connection })
     }
 
     fn prepare(connection: Connection) -> Result<Self, StoreError> {
@@ -265,6 +300,38 @@ impl ReviewStore {
             ));
         }
         Ok(drafts)
+    }
+
+    /// Counts of stored Drafts per scope, summed across every head.
+    ///
+    /// A scope in `scopes` with nothing stored is absent from the map, never a
+    /// zero, so a caller can tell "asked about and empty" from "not asked
+    /// about" without another lookup.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::Read`] when the rows cannot be read.
+    pub fn count_by_scopes(&self, scopes: &[String]) -> Result<HashMap<String, usize>, StoreError> {
+        if scopes.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let placeholders = scopes.iter().map(|_| "?").collect::<Vec<_>>().join(", ");
+        let sql = format!(
+            "SELECT scope, COUNT(*) FROM drafts WHERE scope IN ({placeholders}) GROUP BY scope"
+        );
+        let mut statement = self.connection.prepare(&sql).map_err(StoreError::Read)?;
+        let rows = statement
+            .query_map(rusqlite::params_from_iter(scopes), |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+            })
+            .map_err(StoreError::Read)?;
+
+        let mut counts = HashMap::new();
+        for row in rows {
+            let (scope, count) = row.map_err(StoreError::Read)?;
+            counts.insert(scope, count.try_into().unwrap_or(usize::MAX));
+        }
+        Ok(counts)
     }
 
     /// Writes the current text at an anchor, replacing anything already there.
@@ -1278,5 +1345,117 @@ mod tests {
     fn the_default_path_is_under_application_support() {
         let path = default_database_path().unwrap();
         assert!(path.ends_with("Library/Application Support/ZReview/review-data.sqlite3"));
+    }
+
+    #[test]
+    fn counts_by_scope_sum_every_head_and_omit_scopes_with_nothing() {
+        const OTHER_SCOPE: &str = "github:acme/widgets#43";
+        let store = ReviewStore::open_in_memory().unwrap();
+        store
+            .upsert(
+                SCOPE,
+                &anchor("src/a.rs", 1, DiffSide::Right, OTHER_HEAD),
+                "before the push",
+            )
+            .unwrap();
+        store
+            .upsert(
+                SCOPE,
+                &anchor("src/a.rs", 2, DiffSide::Right, HEAD),
+                "after the push",
+            )
+            .unwrap();
+        store
+            .upsert(
+                OTHER_SCOPE,
+                &anchor("src/b.rs", 1, DiffSide::Right, HEAD),
+                "a different review",
+            )
+            .unwrap();
+
+        let counts = store
+            .count_by_scopes(&[
+                SCOPE.to_owned(),
+                OTHER_SCOPE.to_owned(),
+                "github:acme/widgets#99".to_owned(),
+            ])
+            .unwrap();
+
+        assert_eq!(counts.get(SCOPE), Some(&2), "both heads count");
+        assert_eq!(counts.get(OTHER_SCOPE), Some(&1));
+        assert_eq!(
+            counts.get("github:acme/widgets#99"),
+            None,
+            "a scope with nothing stored is absent, not zero",
+        );
+    }
+
+    #[test]
+    fn counting_with_no_scopes_asked_about_reads_nothing() {
+        let store = ReviewStore::open_in_memory().unwrap();
+        store
+            .upsert(SCOPE, &anchor("src/a.rs", 1, DiffSide::Right, HEAD), "body")
+            .unwrap();
+
+        assert!(store.count_by_scopes(&[]).unwrap().is_empty());
+    }
+
+    #[test]
+    fn open_read_only_refuses_a_missing_database_without_creating_it() {
+        let directory = TempDir::new().unwrap();
+        let path = directory.path().join("review-data.sqlite3");
+
+        let Err(error) = ReviewStore::open_read_only(&path) else {
+            panic!("a missing database must be refused");
+        };
+
+        assert!(
+            matches!(error, StoreError::Missing),
+            "unexpected error: {error}"
+        );
+        assert!(
+            !path.exists(),
+            "a read-only open must never create the file"
+        );
+    }
+
+    #[test]
+    fn open_read_only_reads_a_database_a_writer_already_created() {
+        let directory = TempDir::new().unwrap();
+        let path = directory.path().join("review-data.sqlite3");
+        {
+            let store = ReviewStore::open(&path).unwrap();
+            store
+                .upsert(SCOPE, &anchor("src/a.rs", 1, DiffSide::Right, HEAD), "body")
+                .unwrap();
+        }
+
+        let reader = ReviewStore::open_read_only(&path).unwrap();
+
+        assert_eq!(
+            reader.count_by_scopes(&[SCOPE.to_owned()]).unwrap()[SCOPE],
+            1
+        );
+    }
+
+    /// A schema this build has not migrated to is unreadable, not silently
+    /// treated as whatever the current schema means.
+    #[test]
+    fn open_read_only_refuses_a_schema_version_this_build_does_not_know() {
+        let directory = TempDir::new().unwrap();
+        let path = directory.path().join("review-data.sqlite3");
+        {
+            let connection = Connection::open(&path).unwrap();
+            connection.pragma_update(None, "user_version", 999).unwrap();
+        }
+
+        let Err(error) = ReviewStore::open_read_only(&path) else {
+            panic!("an unknown schema version must be refused");
+        };
+
+        assert!(
+            matches!(error, StoreError::UnsupportedSchemaVersion(999)),
+            "unexpected error: {error}",
+        );
     }
 }
