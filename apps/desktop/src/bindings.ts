@@ -5,13 +5,13 @@ import { invoke as __TAURI_INVOKE, Channel } from "@tauri-apps/api/core";
 /** Commands */
 export const commands = {
 	/**
-	 *  Which screen the binary was launched into, asked once before anything is
-	 *  rendered.
+	 *  Which screen the window shows, and the Session it is holding.
 	 * 
-	 *  A Session carries its request's own description, which is all the loading
+	 *  Asked once before anything is rendered, and again after every navigation. A
+	 *  Session carries its request's own description, which is all the loading
 	 *  screen can say before the load reaches the pull request itself.
 	 */
-	describeLaunch: () => __TAURI_INVOKE<LaunchDto>("describe_launch"),
+	describeWindow: () => __TAURI_INVOKE<WindowDto>("describe_window"),
 	/**
 	 *  Re-reads the settings file, then fetches what every clone it lists has open.
 	 * 
@@ -58,6 +58,34 @@ export const commands = {
 	removeRepository: (path: string) => typedError<HomeSnapshotDto, SessionFailureDto>(__TAURI_INVOKE("remove_repository", { path })),
 	/**  Opens or closes the Repositories footer. */
 	toggleRepositoriesFooter: () => __TAURI_INVOKE<HomeSnapshotDto>("toggle_repositories_footer"),
+	/**
+	 *  Opens the pull request a Home row names, replacing whatever Session was
+	 *  alive.
+	 * 
+	 *  # Errors
+	 * 
+	 *  Returns a failure when no configured clone resolves to `repository`, which
+	 *  leaves the Session that was alive exactly as it was.
+	 */
+	openRow: (repository: string, number: number) => typedError<WindowDto, SessionFailureDto>(__TAURI_INVOKE("open_row", { repository, number })),
+	/**
+	 *  Shows Home again, leaving the Session alive behind it.
+	 * 
+	 *  # Errors
+	 * 
+	 *  Returns a failure for a Session the command line opened, which has no Home
+	 *  behind it to go back to.
+	 */
+	returnToHome: () => typedError<WindowDto, SessionFailureDto>(__TAURI_INVOKE("return_to_home")),
+	/**
+	 *  Shows the Session alive behind Home again, exactly as it was left.
+	 * 
+	 *  # Errors
+	 * 
+	 *  Returns a failure when no Session is alive, which the header slot's own
+	 *  absence already keeps a reviewer from asking for.
+	 */
+	returnToSession: () => typedError<WindowDto, SessionFailureDto>(__TAURI_INVOKE("return_to_session")),
 	/**
 	 *  Loads the review session the window was opened with, reporting each stage on
 	 *  `on_stage` as it goes.
@@ -209,6 +237,9 @@ export type HomeRowDto = {
 	index: number,
 	title: string,
 	url: string,
+	/**  `owner/name`, which opening this row names its pull request by. */
+	repository: string,
+	number: number,
 	/**  `owner/name#number`. */
 	identity: string,
 	/**  Absent once GitHub has forgotten the account. */
@@ -256,10 +287,21 @@ export type HomeSnapshotDto = {
 	drafts_failure: SessionFailureDto | null,
 };
 
-/**  Which screen the binary was launched into. */
-export type LaunchDto = "Home" | { Session: {
+/**  The one Session the window holds, in front of Home or alive behind it. */
+export type OpenSessionDto = {
+	/**
+	 *  What is being opened, which is all the loading screen can say before the
+	 *  load reaches the pull request itself.
+	 */
 	description: string,
-} };
+	/**
+	 *  `owner/name#number` of the row this Session was opened from, which the
+	 *  header slot reads and Home marks that row by. Absent for a Session the
+	 *  command line opened, and its absence is what says there is no Home to go
+	 *  back to.
+	 */
+	row_identity: string | null,
+};
 
 /**  How current the list is, which the header stamp reads. */
 export type RefreshStateDto = 
@@ -337,6 +379,20 @@ export type StaleDraftDto = {
  *  sheet that owns them.
  */
 export type StatusToneDto = "Success" | "Error" | "Warning" | "Muted";
+
+/**  Which screen the window shows, and the Session it is holding. */
+export type WindowDto = 
+/**
+ *  Home, with the Session alive behind it when there is one. That Session's
+ *  tree stays mounted and hidden, which is what makes returning instant.
+ */
+({ Home: {
+	alive: OpenSessionDto | null,
+} }) & { Session?: never } | 
+/**  The Session, in front of Home or with no Home behind it at all. */
+({ Session: {
+	session: OpenSessionDto,
+} }) & { Home?: never };
 
 /* Tauri Specta runtime */
 async function typedError<T, E>(result: Promise<T>): Promise<{ status: "ok"; data: T } | { status: "error"; error: E }> {

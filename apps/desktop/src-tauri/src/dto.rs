@@ -54,11 +54,27 @@ impl From<DiffLineKind> for DiffLineKindDto {
     }
 }
 
-/// Which screen the binary was launched into.
+/// The one Session the window holds, in front of Home or alive behind it.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, specta::Type)]
-pub enum LaunchDto {
-    Home,
-    Session { description: String },
+pub struct OpenSessionDto {
+    /// What is being opened, which is all the loading screen can say before the
+    /// load reaches the pull request itself.
+    pub description: String,
+    /// `owner/name#number` of the row this Session was opened from, which the
+    /// header slot reads and Home marks that row by. Absent for a Session the
+    /// command line opened, and its absence is what says there is no Home to go
+    /// back to.
+    pub row_identity: Option<String>,
+}
+
+/// Which screen the window shows, and the Session it is holding.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, specta::Type)]
+pub enum WindowDto {
+    /// Home, with the Session alive behind it when there is one. That Session's
+    /// tree stays mounted and hidden, which is what makes returning instant.
+    Home { alive: Option<OpenSessionDto> },
+    /// The Session, in front of Home or with no Home behind it at all.
+    Session { session: OpenSessionDto },
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, specta::Type)]
@@ -261,6 +277,9 @@ pub struct HomeRowDto {
     pub index: u32,
     pub title: String,
     pub url: String,
+    /// `owner/name`, which opening this row names its pull request by.
+    pub repository: String,
+    pub number: u32,
     /// `owner/name#number`.
     pub identity: String,
     /// Absent once GitHub has forgotten the account.
@@ -443,6 +462,8 @@ fn project_home_row(row: &app::HomeRow, index: u32) -> HomeRowDto {
         index,
         title: row.title.clone(),
         url: row.url.clone(),
+        repository: row.repository.clone(),
+        number: u32::try_from(row.number).expect("a pull request number fits comfortably in a u32"),
         identity: row.identity(),
         author: row.author_login.clone(),
         updated_at_ms: row.updated_at_ms,
