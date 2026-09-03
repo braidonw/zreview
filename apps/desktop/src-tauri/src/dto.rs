@@ -6,8 +6,8 @@
 
 use app::{PullRequestId, ReviewModel, ReviewRunState};
 use domain::{
-    DiffFile, DiffLineKind, DiffSide, EmptyDiffReason, FileStatus, GuidanceSelection, ReviewSession,
-    SessionFailure, SessionSource,
+    DiffFile, DiffLineKind, DiffSide, EmptyDiffReason, FileStatus, GuidanceSelection,
+    ReviewSession, SessionFailure, SessionSource,
 };
 use serde::{Deserialize, Serialize};
 

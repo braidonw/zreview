@@ -11,7 +11,10 @@ use std::{
 use app::{
     Opened, PullRequestId, RepositoryOutcome, SessionPhase, SettingsWrite, Showing, lock, try_lock,
 };
-use domain::DiffSide;
+use domain::{
+    DiffSide, ReviewBackend, ReviewEventSink, ReviewProgress, ReviewSession, SessionSource,
+};
+use review::{Agent, CodingAgent};
 use session::{ReviewStorage, SessionRequest};
 use tauri::ipc::Channel;
 use tauri_specta::collect_commands;
@@ -37,6 +40,11 @@ pub fn specta_builder() -> tauri_specta::Builder<tauri::Wry> {
         edit_draft,
         discard_draft,
         reanchor_draft,
+        review_panel,
+        run_review,
+        cancel_review,
+        toggle_guidance_panel,
+        toggle_guidance,
     ])
 }
 
@@ -452,6 +460,134 @@ fn reanchor_draft_on_model(
     Ok(drafts_snapshot(&guard, selected))
 }
 
+/// Publishes a run's progress into the model and out to whoever asked for it, and
+/// tells the backend when the reviewer has abandoned the run.
+struct RunEvents<'a> {
+    model: &'a Mutex<app::SessionModel>,
+    /// Set by [`cancel_review_on_model`]. The backend polls it between steps, so
+    /// cancelling costs nothing until the backend next looks.
+    cancel: Arc<AtomicBool>,
+    report: &'a (dyn Fn(dto::ReviewPanelDto) + Sync),
+}
+
+impl ReviewEventSink for RunEvents<'_> {
+    fn progress(&self, progress: ReviewProgress) {
+        let moved = {
+            let mut guard = lock(self.model);
+            let moved = guard.review_progress(progress.to_string());
+            moved.then(|| panel_of(&guard).expect("a running review has a panel"))
+        };
+        // A line that has not moved is not worth a message to the frontend.
+        if let Some(panel) = moved {
+            (self.report)(panel);
+        }
+    }
+
+    fn is_cancelled(&self) -> bool {
+        self.cancel.load(Ordering::Relaxed)
+    }
+}
+
+/// Runs a review of the session in `model`, publishing the panel as it changes.
+///
+/// The session is cloned out from under the lock and the backend is built from
+/// that clone, so nothing holds the model while the backend runs, which takes
+/// minutes. A trigger that arrives while a run is in flight starts nothing and
+/// answers with the panel already on screen.
+///
+/// Takes the backend as a factory and the reporter as a plain callback, so both
+/// can be tested without a coding agent or a Tauri channel.
+fn run_review_on_model(
+    model: &Mutex<app::SessionModel>,
+    make_backend: impl FnOnce(&ReviewSession) -> Box<dyn ReviewBackend>,
+    report: &(dyn Fn(dto::ReviewPanelDto) + Sync),
+) -> Option<dto::ReviewPanelDto> {
+    let mut guard = lock(model);
+    let Some(session) = guard.review_request() else {
+        return panel_of(&guard);
+    };
+    let cancel = Arc::new(AtomicBool::new(false));
+    guard.review_started(Arc::clone(&cancel));
+    let started = panel_of(&guard).expect("a running review has a panel");
+    drop(guard);
+
+    // Reported before the work starts, so the panel shows a running review at once
+    // rather than after the first line the backend happens to send.
+    report(started);
+
+    let backend = make_backend(&session);
+    let events = RunEvents {
+        model,
+        cancel,
+        report,
+    };
+    let result = session::run_review(&session, backend.as_ref(), &events);
+
+    let mut guard = lock(model);
+    match result {
+        Ok(run) => guard.review_finished(
+            run.findings,
+            run.excluded.into_iter().chain(run.omitted).collect(),
+        ),
+        Err(error) => guard.review_failed(error.to_string(), error.remediation()),
+    }
+    panel_of(&guard)
+}
+
+/// The backend a run uses: the Claude coding agent, at the repository the session
+/// was opened from, which is what the GPUI binary runs.
+fn coding_agent(session: &ReviewSession) -> Box<dyn ReviewBackend> {
+    Box::new(CodingAgent::new(
+        Agent::ClaudeCode,
+        repository_root(session),
+    ))
+}
+
+/// Where the backend runs, so relative paths in the diff resolve.
+///
+/// A session with no repository never reaches one: `run_review` refuses it,
+/// because there would be no anchors to validate findings against.
+fn repository_root(session: &ReviewSession) -> PathBuf {
+    match session.source() {
+        SessionSource::LocalComparison {
+            repository_root, ..
+        }
+        | SessionSource::GitHubPullRequest {
+            repository_root, ..
+        } => repository_root.clone(),
+        SessionSource::Demo => PathBuf::from("."),
+    }
+}
+
+/// Asks the running review to stop. It ends at the backend's next step.
+fn cancel_review_on_model(model: &Mutex<app::SessionModel>) -> Option<dto::ReviewPanelDto> {
+    let guard = lock(model);
+    guard.cancel_review();
+    panel_of(&guard)
+}
+
+/// Opens or closes the guidance section.
+fn toggle_guidance_panel_on_model(model: &Mutex<app::SessionModel>) -> Option<dto::ReviewPanelDto> {
+    let mut guard = lock(model);
+    guard.toggle_guidance_panel();
+    panel_of(&guard)
+}
+
+/// Turns one guidance file on or off for the next run.
+///
+/// A path naming no discovered file is refused rather than answered with an
+/// unchanged panel, which would hide the mismatch.
+fn toggle_guidance_on_model(
+    model: &Mutex<app::SessionModel>,
+    path: &str,
+) -> Result<Option<dto::ReviewPanelDto>, dto::SessionFailureDto> {
+    let mut guard = lock(model);
+    if !guard.toggle_guidance(path) {
+        return Err(dto::command_failure(format!("no guidance file at {path}")));
+    }
+    Ok(panel_of(&guard))
+}
+
 /// Loads the review session the window was opened with, reporting each stage on
 /// `on_stage` as it goes.
 ///
@@ -863,6 +999,101 @@ pub fn reanchor_draft(
         line,
         row as usize,
     )
+}
+
+/// The Session's review panel, asked for once the session is ready.
+///
+/// `null` means this snapshot cannot be reviewed at all, which is the generated
+/// fixture, and the Session shows no panel.
+///
+/// # Errors
+///
+/// Returns a failure when no session is open.
+#[tauri::command]
+#[specta::specta]
+#[allow(clippy::needless_pass_by_value)]
+pub fn review_panel(
+    state: tauri::State<'_, AppRoot>,
+) -> Result<Option<dto::ReviewPanelDto>, dto::SessionFailureDto> {
+    let model = session_model(&state)?;
+    let panel = panel_of(&lock(&model));
+    Ok(panel)
+}
+
+/// Runs a review against the Claude coding agent at the repository root, on a
+/// background thread, reporting the panel to `on_progress` as the backend speaks.
+///
+/// A trigger that arrives while a run is in flight starts nothing and answers with
+/// the panel already on screen. The model is taken out of the window as its own
+/// handle, so a Session dropped or a window closed mid-run leaves the background
+/// work finishing into a model nobody reads rather than panicking.
+///
+/// # Errors
+///
+/// Returns a failure when no session is open, or when the task doing the review
+/// does not finish.
+#[tauri::command]
+#[specta::specta]
+#[allow(clippy::needless_pass_by_value)]
+pub async fn run_review(
+    state: tauri::State<'_, AppRoot>,
+    on_progress: Channel<dto::ReviewPanelDto>,
+) -> Result<Option<dto::ReviewPanelDto>, dto::SessionFailureDto> {
+    let model = session_model(&state)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        run_review_on_model(&model, coding_agent, &|panel| {
+            let _ = on_progress.send(panel);
+        })
+    })
+    .await
+    .map_err(|error| dto::command_failure(format!("the review did not finish: {error}")))
+}
+
+/// Asks the running review to stop. It ends at the backend's next step.
+///
+/// # Errors
+///
+/// Returns a failure when no session is open.
+#[tauri::command]
+#[specta::specta]
+#[allow(clippy::needless_pass_by_value)]
+pub fn cancel_review(
+    state: tauri::State<'_, AppRoot>,
+) -> Result<Option<dto::ReviewPanelDto>, dto::SessionFailureDto> {
+    let model = session_model(&state)?;
+    Ok(cancel_review_on_model(&model))
+}
+
+/// Opens or closes the guidance section.
+///
+/// # Errors
+///
+/// Returns a failure when no session is open.
+#[tauri::command]
+#[specta::specta]
+#[allow(clippy::needless_pass_by_value)]
+pub fn toggle_guidance_panel(
+    state: tauri::State<'_, AppRoot>,
+) -> Result<Option<dto::ReviewPanelDto>, dto::SessionFailureDto> {
+    let model = session_model(&state)?;
+    Ok(toggle_guidance_panel_on_model(&model))
+}
+
+/// Turns one guidance file on or off for the next run.
+///
+/// # Errors
+///
+/// Returns a failure when no session is open, or when `path` names no guidance
+/// file the session discovered.
+#[tauri::command]
+#[specta::specta]
+#[allow(clippy::needless_pass_by_value)]
+pub fn toggle_guidance(
+    state: tauri::State<'_, AppRoot>,
+    path: String,
+) -> Result<Option<dto::ReviewPanelDto>, dto::SessionFailureDto> {
+    let model = session_model(&state)?;
+    toggle_guidance_on_model(&model, &path)
 }
 
 #[cfg(test)]
@@ -2419,7 +2650,11 @@ mod tests {
         git(path, ["commit", "--quiet", "-m", "vendor"]);
         git(path, ["checkout", "--quiet", "main"]);
         std::fs::write(path.join("AGENTS.md"), "Never use unwrap.\n").unwrap();
-        std::fs::write(path.join("CLAUDE.md"), "x".repeat(review::MAX_FILE_BYTES + 1)).unwrap();
+        std::fs::write(
+            path.join("CLAUDE.md"),
+            "x".repeat(review::MAX_FILE_BYTES + 1),
+        )
+        .unwrap();
         std::fs::write(
             path.join(".zreview.toml"),
             "[review]\nexclude_files = [\"vendor/**\"]\n",
@@ -2438,7 +2673,9 @@ mod tests {
         assert_eq!(panel.heading, "Review");
         assert!(matches!(panel.run, dto::ReviewRunDto::Idle));
         assert!(panel.footer.is_none());
-        let note = panel.note.expect("an idle panel says no review has been run");
+        let note = panel
+            .note
+            .expect("an idle panel says no review has been run");
         assert_eq!(note.heading, "No review has been run.");
 
         let dto::GuidanceDto::Discovered {
@@ -2490,5 +2727,300 @@ mod tests {
         let model = loaded_model();
 
         assert!(panel_of(&lock(&model)).is_none());
+    }
+
+    /// A backend that reports the lines it was built with, stops as soon as the
+    /// reviewer cancels, and then answers with the outcome it was built with.
+    ///
+    /// Cloned into the run, so the test keeps a handle on what was sent.
+    #[derive(Clone)]
+    struct FakeBackend {
+        lines: Vec<&'static str>,
+        outcome: Result<Vec<domain::RawFinding>, domain::ReviewError>,
+        seen: Arc<Mutex<Option<domain::ReviewRequest>>>,
+    }
+
+    impl FakeBackend {
+        fn new(
+            lines: Vec<&'static str>,
+            outcome: Result<Vec<domain::RawFinding>, domain::ReviewError>,
+        ) -> Self {
+            Self {
+                lines,
+                outcome,
+                seen: Arc::new(Mutex::new(None)),
+            }
+        }
+
+        fn finding_free(lines: Vec<&'static str>) -> Self {
+            Self::new(lines, Ok(Vec::new()))
+        }
+
+        /// The guidance the run actually sent, in order.
+        fn guidance_sent(&self) -> Vec<String> {
+            self.seen
+                .lock()
+                .unwrap()
+                .as_ref()
+                .expect("the backend was called")
+                .guidance
+                .iter()
+                .map(|excerpt| excerpt.path.to_string())
+                .collect()
+        }
+    }
+
+    impl domain::ReviewBackend for FakeBackend {
+        fn name(&self) -> Arc<str> {
+            Arc::from("fake")
+        }
+
+        fn review(
+            &self,
+            request: &domain::ReviewRequest,
+            events: &dyn domain::ReviewEventSink,
+        ) -> Result<Vec<domain::RawFinding>, domain::ReviewError> {
+            *self.seen.lock().unwrap() = Some(request.clone());
+            for line in &self.lines {
+                if events.is_cancelled() {
+                    return Err(domain::ReviewError::Cancelled);
+                }
+                events.progress(domain::ReviewProgress::Running {
+                    detail: Arc::from(*line),
+                });
+            }
+            if events.is_cancelled() {
+                return Err(domain::ReviewError::Cancelled);
+            }
+            self.outcome.clone()
+        }
+    }
+
+    /// Runs `backend` over the session in `model`, collecting every panel the run
+    /// reported on its way.
+    fn run_with(
+        model: &Mutex<app::SessionModel>,
+        backend: &FakeBackend,
+    ) -> (Option<dto::ReviewPanelDto>, Vec<dto::ReviewPanelDto>) {
+        let reported = Mutex::new(Vec::new());
+        let finished = run_review_on_model(model, |_session| Box::new(backend.clone()), &|panel| {
+            reported.lock().unwrap().push(panel);
+        });
+        (finished, reported.into_inner().unwrap())
+    }
+
+    /// The progress line the panel is showing, whatever else it says.
+    fn progress_line(panel: &dto::ReviewPanelDto) -> Option<&str> {
+        match &panel.run {
+            dto::ReviewRunDto::Running { detail } => Some(detail),
+            dto::ReviewRunDto::Idle
+            | dto::ReviewRunDto::Complete { .. }
+            | dto::ReviewRunDto::Failed { .. } => None,
+        }
+    }
+
+    #[test]
+    fn a_run_reports_its_progress_and_ends_with_what_it_did_not_see() {
+        let repository = guided_repository();
+        let model = local_model(&local_request(&repository), &ReviewStorage::Disabled);
+        let backend = FakeBackend::finding_free(vec!["Reading the diff", "Writing findings"]);
+
+        let (finished, reported) = run_with(&model, &backend);
+
+        // Told before the work starts, so the panel shows a running review at once
+        // rather than after the first line the backend happens to report.
+        assert_eq!(
+            reported
+                .iter()
+                .filter_map(progress_line)
+                .collect::<Vec<_>>(),
+            vec!["Starting...", "Reading the diff", "Writing findings"]
+        );
+
+        let panel = finished.expect("the session can be reviewed");
+        let dto::ReviewRunDto::Complete {
+            accepted,
+            rejected,
+            suppressed,
+            unreviewed,
+        } = panel.run
+        else {
+            panic!("the run should have completed");
+        };
+        assert_eq!(accepted, 0);
+        assert_eq!(rejected, 0);
+        assert_eq!(suppressed, 0);
+        assert_eq!(unreviewed, vec!["vendor/lib.rs".to_owned()]);
+
+        let note = panel.note.expect("a run that found nothing says so");
+        assert_eq!(note.heading, "Nothing to act on.");
+        assert_eq!(
+            note.detail.as_deref(),
+            Some("The review found no problems.")
+        );
+        let footer = panel.footer.expect("a partial review says it was partial");
+        assert_eq!(
+            footer.not_reviewed.as_deref(),
+            Some("1 file(s) not reviewed")
+        );
+        assert_eq!(footer.refused, None);
+    }
+
+    /// The guidance section is the disclosure notice for what leaves the machine,
+    /// so a file turned off must actually stop being sent.
+    #[test]
+    fn a_run_sends_only_the_guidance_the_reviewer_left_on() {
+        let repository = guided_repository();
+        std::fs::write(repository.path().join("CONTRIBUTING.md"), "Be kind.\n").unwrap();
+        let model = local_model(&local_request(&repository), &ReviewStorage::Disabled);
+
+        let panel = toggle_guidance_on_model(&model, "AGENTS.md")
+            .expect("AGENTS.md was discovered")
+            .expect("the session can be reviewed");
+        let dto::GuidanceDto::Discovered {
+            summary, entries, ..
+        } = panel.guidance
+        else {
+            panic!("guidance was discovered");
+        };
+        assert_eq!(summary, "1 guidance file \u{00B7} 0 KB");
+        assert!(!entries[0].included, "AGENTS.md is off now");
+
+        let backend = FakeBackend::finding_free(Vec::new());
+        run_with(&model, &backend);
+
+        assert_eq!(backend.guidance_sent(), vec!["CONTRIBUTING.md".to_owned()]);
+    }
+
+    #[test]
+    fn toggling_a_path_that_names_no_guidance_file_is_refused() {
+        let repository = guided_repository();
+        let model = local_model(&local_request(&repository), &ReviewStorage::Disabled);
+
+        let error = toggle_guidance_on_model(&model, "NOWHERE.md").unwrap_err();
+
+        assert_eq!(error.summary, "no guidance file at NOWHERE.md");
+    }
+
+    /// The disclosure has served its purpose once a run has happened; the summary
+    /// line stays visible either way.
+    #[test]
+    fn the_guidance_section_collapses_once_a_run_has_happened() {
+        let repository = guided_repository();
+        let model = local_model(&local_request(&repository), &ReviewStorage::Disabled);
+
+        let (finished, _) = run_with(&model, &FakeBackend::finding_free(Vec::new()));
+
+        let panel = finished.expect("the session can be reviewed");
+        let dto::GuidanceDto::Discovered { expanded, .. } = panel.guidance else {
+            panic!("guidance was discovered");
+        };
+        assert!(!expanded);
+
+        let reopened = toggle_guidance_panel_on_model(&model).expect("the panel is showing");
+        let dto::GuidanceDto::Discovered { expanded, .. } = reopened.guidance else {
+            panic!("guidance was discovered");
+        };
+        assert!(expanded);
+    }
+
+    /// A run already in flight owns the session. A second trigger answers with
+    /// what is already on screen and reaches no backend at all.
+    #[test]
+    fn a_second_trigger_while_a_run_is_in_flight_starts_nothing() {
+        let repository = guided_repository();
+        let model = local_model(&local_request(&repository), &ReviewStorage::Disabled);
+        let second = Mutex::new(None);
+
+        let finished = run_review_on_model(
+            &model,
+            |_session| Box::new(FakeBackend::finding_free(vec!["Reading the diff"])),
+            &|panel| {
+                if progress_line(&panel) != Some("Reading the diff") {
+                    return;
+                }
+                *second.lock().unwrap() = Some(run_review_on_model(
+                    &model,
+                    |_session| panic!("a second run must not start a backend"),
+                    &|_panel| panic!("a second run must not report progress"),
+                ));
+            },
+        );
+
+        let refused = second
+            .into_inner()
+            .unwrap()
+            .expect("the second trigger answered")
+            .expect("the session can be reviewed");
+        assert_eq!(progress_line(&refused), Some("Reading the diff"));
+        assert!(matches!(
+            finished.expect("the session can be reviewed").run,
+            dto::ReviewRunDto::Complete { .. }
+        ));
+    }
+
+    #[test]
+    fn cancelling_ends_the_run_saying_so() {
+        let repository = guided_repository();
+        let model = local_model(&local_request(&repository), &ReviewStorage::Disabled);
+
+        let finished = run_review_on_model(
+            &model,
+            |_session| {
+                Box::new(FakeBackend::finding_free(vec![
+                    "Reading the diff",
+                    "Writing findings",
+                ]))
+            },
+            &|panel| {
+                if progress_line(&panel) == Some("Reading the diff") {
+                    cancel_review_on_model(&model);
+                }
+            },
+        );
+
+        let panel = finished.expect("the session can be reviewed");
+        let dto::ReviewRunDto::Failed {
+            summary,
+            remediation,
+        } = panel.run
+        else {
+            panic!("a cancelled run ends failed");
+        };
+        assert_eq!(summary, "the review was cancelled");
+        assert_eq!(remediation, None, "cancelling was deliberate");
+    }
+
+    #[test]
+    fn a_backend_failure_shows_its_summary_and_remediation() {
+        let repository = guided_repository();
+        let model = local_model(&local_request(&repository), &ReviewStorage::Disabled);
+        let backend = FakeBackend::new(
+            Vec::new(),
+            Err(domain::ReviewError::NotInstalled {
+                program: Arc::from("claude"),
+            }),
+        );
+
+        let (finished, _) = run_with(&model, &backend);
+
+        let panel = finished.expect("the session can be reviewed");
+        let dto::ReviewRunDto::Failed {
+            summary,
+            remediation,
+        } = panel.run
+        else {
+            panic!("the run should have failed");
+        };
+        assert_eq!(summary, "claude is not installed");
+        assert!(
+            remediation
+                .expect("a missing backend says how to get it")
+                .contains("PATH")
+        );
+        let note = panel
+            .note
+            .expect("the failure is what the panel has to say");
+        assert_eq!(note.heading, "claude is not installed");
     }
 }
