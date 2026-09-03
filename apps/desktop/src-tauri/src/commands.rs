@@ -1445,7 +1445,12 @@ mod tests {
         let directory = TempDir::new().unwrap();
         let settings_path = settings_listing(&directory, &[&clone]);
         let root = home_root(home_with(&gh));
-        refresh_home_on_model(&root, &settings_path, &|_progress| {});
+        refresh_home_on_model(
+            &root,
+            &settings_path,
+            &no_drafts_database(),
+            &|_progress| {},
+        );
         assert!(
             shown_home(&root).groups[0]
                 .rows
@@ -1561,7 +1566,12 @@ mod tests {
 
     /// A refresh with nothing listening to its progress.
     fn refresh(home: &ManagedHome, settings_path: &Path) {
-        refresh_home_on_model(&home_root(home.clone()), settings_path, &no_drafts_database(), &|_progress| {});
+        refresh_home_on_model(
+            &home_root(home.clone()),
+            settings_path,
+            &no_drafts_database(),
+            &|_progress| {},
+        );
     }
 
     /// A settings file listing `clones`.
@@ -1642,9 +1652,14 @@ mod tests {
     /// Everything a refresh reported, in the order it said it.
     fn reported_by(home: &ManagedHome, settings_path: &Path) -> Vec<dto::HomeSnapshotDto> {
         let reported = Mutex::new(Vec::new());
-        refresh_home_on_model(&home_root(home.clone()), settings_path, &no_drafts_database(), &|shown| {
-            reported.lock().unwrap().push(shown);
-        });
+        refresh_home_on_model(
+            &home_root(home.clone()),
+            settings_path,
+            &no_drafts_database(),
+            &|shown| {
+                reported.lock().unwrap().push(shown);
+            },
+        );
         reported.into_inner().unwrap()
     }
 
@@ -1743,12 +1758,17 @@ mod tests {
         let reports = std::sync::atomic::AtomicUsize::new(0);
 
         let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            refresh_home_on_model(&home_root(home.clone()), &settings_path, &no_drafts_database(), &|_shown| {
-                assert!(
-                    reports.fetch_add(1, Ordering::AcqRel) < 2,
-                    "the refresh gave up here"
-                );
-            });
+            refresh_home_on_model(
+                &home_root(home.clone()),
+                &settings_path,
+                &no_drafts_database(),
+                &|_shown| {
+                    assert!(
+                        reports.fetch_add(1, Ordering::AcqRel) < 2,
+                        "the refresh gave up here"
+                    );
+                },
+            );
         }));
 
         assert!(panicked.is_err(), "the refresh was stopped by a panic");
@@ -1770,9 +1790,12 @@ mod tests {
         let settings_path = settings_listing(&directory, &[&clone]);
         let home = home_with(&gh);
         let _panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            refresh_home_on_model(&home_root(home.clone()), &settings_path, &no_drafts_database(), &|_shown| {
-                panic!("gave up")
-            });
+            refresh_home_on_model(
+                &home_root(home.clone()),
+                &settings_path,
+                &no_drafts_database(),
+                &|_shown| panic!("gave up"),
+            );
         }));
 
         refresh(&home, &settings_path);

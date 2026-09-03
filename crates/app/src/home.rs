@@ -977,6 +977,7 @@ mod tests {
             updated_at_ms: 0,
             review_status: None,
             check_status: None,
+            draft_count: None,
         }
     }
 

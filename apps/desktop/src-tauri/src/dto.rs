@@ -987,7 +987,7 @@ mod tests {
             3,
         )])));
 
-        let snapshot = project_home(&home);
+        let snapshot = project_home(&home, None);
 
         let by_identity = |identity: &str| {
             snapshot.groups[0]
@@ -1008,7 +1008,7 @@ mod tests {
         let mut home = app::HomeModel::new();
         home.drafts_read(Err(SessionFailure::new("Drafts could not be read")));
 
-        let snapshot = project_home(&home);
+        let snapshot = project_home(&home, None);
 
         assert_eq!(
             snapshot
