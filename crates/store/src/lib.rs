@@ -106,13 +106,20 @@ impl ReviewStore {
 
     /// Opens read-only, neither creating the file nor migrating its schema.
     ///
+    /// Any schema from `1` up to [`SCHEMA_VERSION`] is readable: an older build
+    /// migrated it to less than this one knows, but every table this reads has
+    /// existed since version 1. Home refreshes and reads this before a Session
+    /// has had a chance to migrate an older database, so refusing anything
+    /// less than the current version would refuse databases this build can
+    /// read perfectly well.
+    ///
     /// # Errors
     ///
     /// Returns [`StoreError::Missing`] when no database exists at `path` yet,
     /// which is not a failure to a caller for whom that means no Drafts
     /// anywhere. Returns [`StoreError::Open`] when it exists but cannot be
     /// opened, and [`StoreError::UnsupportedSchemaVersion`] when its schema is
-    /// not the one this build knows how to read.
+    /// newer than this build knows how to read.
     pub fn open_read_only(path: &Path) -> Result<Self, StoreError> {
         if !path.exists() {
             return Err(StoreError::Missing);
@@ -127,7 +134,7 @@ impl ReviewStore {
         let version: i64 = connection
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .map_err(StoreError::Read)?;
-        if version != SCHEMA_VERSION {
+        if !(1..=SCHEMA_VERSION).contains(&version) {
             return Err(StoreError::UnsupportedSchemaVersion(version));
         }
         Ok(Self { connection })
@@ -302,26 +309,32 @@ impl ReviewStore {
         Ok(drafts)
     }
 
-    /// Counts of stored Drafts per scope, summed across every head.
+    /// Counts of every stored Draft, by scope and summed across every head.
     ///
-    /// A scope in `scopes` with nothing stored is absent from the map, never a
-    /// zero, so a caller can tell "asked about and empty" from "not asked
-    /// about" without another lookup.
+    /// Grouped by `lower(scope)`, and every key comes back lowercased, so a
+    /// Session's scope and Home's row agree on one pull request whatever
+    /// casing each spelled its repository with. The table is the reviewer's
+    /// own unsent comments, never large enough to ask for less than all of it.
+    ///
+    /// A scope with nothing stored is absent from the map, never a zero, so a
+    /// caller can tell "asked about and empty" from "not asked about" without
+    /// another lookup.
     ///
     /// # Errors
     ///
     /// Returns [`StoreError::Read`] when the rows cannot be read.
-    pub fn count_by_scopes(&self, scopes: &[String]) -> Result<HashMap<String, usize>, StoreError> {
-        if scopes.is_empty() {
-            return Ok(HashMap::new());
-        }
-        let placeholders = scopes.iter().map(|_| "?").collect::<Vec<_>>().join(", ");
-        let sql = format!(
-            "SELECT scope, COUNT(*) FROM drafts WHERE scope IN ({placeholders}) GROUP BY scope"
-        );
-        let mut statement = self.connection.prepare(&sql).map_err(StoreError::Read)?;
+    ///
+    /// # Panics
+    ///
+    /// Panics if a single scope's draft count overflows `usize`, which the
+    /// reviewer's own unsent comments never approach.
+    pub fn count_by_scope(&self) -> Result<HashMap<String, usize>, StoreError> {
+        let mut statement = self
+            .connection
+            .prepare("SELECT lower(scope), COUNT(*) FROM drafts GROUP BY lower(scope)")
+            .map_err(StoreError::Read)?;
         let rows = statement
-            .query_map(rusqlite::params_from_iter(scopes), |row| {
+            .query_map([], |row| {
                 Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
             })
             .map_err(StoreError::Read)?;
@@ -329,7 +342,10 @@ impl ReviewStore {
         let mut counts = HashMap::new();
         for row in rows {
             let (scope, count) = row.map_err(StoreError::Read)?;
-            counts.insert(scope, count.try_into().unwrap_or(usize::MAX));
+            counts.insert(
+                scope,
+                count.try_into().expect("a draft count fits in usize"),
+            );
         }
         Ok(counts)
     }
@@ -1348,7 +1364,7 @@ mod tests {
     }
 
     #[test]
-    fn counts_by_scope_sum_every_head_and_omit_scopes_with_nothing() {
+    fn count_by_scope_sums_every_head_and_every_scope_stored() {
         const OTHER_SCOPE: &str = "github:acme/widgets#43";
         let store = ReviewStore::open_in_memory().unwrap();
         store
@@ -1373,13 +1389,7 @@ mod tests {
             )
             .unwrap();
 
-        let counts = store
-            .count_by_scopes(&[
-                SCOPE.to_owned(),
-                OTHER_SCOPE.to_owned(),
-                "github:acme/widgets#99".to_owned(),
-            ])
-            .unwrap();
+        let counts = store.count_by_scope().unwrap();
 
         assert_eq!(counts.get(SCOPE), Some(&2), "both heads count");
         assert_eq!(counts.get(OTHER_SCOPE), Some(&1));
@@ -1391,13 +1401,37 @@ mod tests {
     }
 
     #[test]
-    fn counting_with_no_scopes_asked_about_reads_nothing() {
+    fn count_by_scope_reads_nothing_from_an_empty_table() {
+        let store = ReviewStore::open_in_memory().unwrap();
+
+        assert!(store.count_by_scope().unwrap().is_empty());
+    }
+
+    /// A Session writes the scope with whatever casing the remote URL carried,
+    /// while Home asks with GitHub's own canonical casing. Both must count as
+    /// the one pull request they are.
+    #[test]
+    fn count_by_scope_groups_the_same_pull_request_written_under_different_casing() {
         let store = ReviewStore::open_in_memory().unwrap();
         store
-            .upsert(SCOPE, &anchor("src/a.rs", 1, DiffSide::Right, HEAD), "body")
+            .upsert(
+                "github:Acme/Widgets#412",
+                &anchor("src/a.rs", 1, DiffSide::Right, HEAD),
+                "from a mixed-case remote",
+            )
+            .unwrap();
+        store
+            .upsert(
+                "github:acme/widgets#412",
+                &anchor("src/a.rs", 2, DiffSide::Right, HEAD),
+                "from the canonical casing",
+            )
             .unwrap();
 
-        assert!(store.count_by_scopes(&[]).unwrap().is_empty());
+        let counts = store.count_by_scope().unwrap();
+
+        assert_eq!(counts.len(), 1, "one pull request, one entry");
+        assert_eq!(counts["github:acme/widgets#412"], 2);
     }
 
     #[test]
@@ -1432,16 +1466,49 @@ mod tests {
 
         let reader = ReviewStore::open_read_only(&path).unwrap();
 
-        assert_eq!(
-            reader.count_by_scopes(&[SCOPE.to_owned()]).unwrap()[SCOPE],
-            1
-        );
+        assert_eq!(reader.count_by_scope().unwrap()[SCOPE], 1);
     }
 
-    /// A schema this build has not migrated to is unreadable, not silently
+    /// Home refreshes and reads Drafts before a Session has had a chance to
+    /// migrate an older database, so a schema this build has already migrated
+    /// past must still read, not just the exact current version.
+    #[test]
+    fn open_read_only_reads_a_schema_version_older_than_this_build() {
+        let directory = TempDir::new().unwrap();
+        let path = directory.path().join("review-data.sqlite3");
+        {
+            // Exactly what version 3 looked like: no draft_provenance yet.
+            let connection = Connection::open(&path).unwrap();
+            connection
+                .execute_batch(
+                    "CREATE TABLE drafts (
+                        scope TEXT NOT NULL, head_sha TEXT NOT NULL, path TEXT NOT NULL,
+                        side TEXT NOT NULL, line INTEGER NOT NULL, body TEXT NOT NULL,
+                        updated_at INTEGER NOT NULL, start_line INTEGER,
+                        PRIMARY KEY (scope, head_sha, path, side, line)
+                     ) STRICT;",
+                )
+                .unwrap();
+            connection
+                .execute(
+                    "INSERT INTO drafts
+                        (scope, head_sha, path, side, line, body, updated_at, start_line)
+                     VALUES (?1, ?2, 'src/old.rs', 'RIGHT', 3, 'written before the upgrade', 0, NULL)",
+                    rusqlite::params![SCOPE, HEAD],
+                )
+                .unwrap();
+            connection.pragma_update(None, "user_version", 3).unwrap();
+        }
+
+        let reader = ReviewStore::open_read_only(&path).unwrap();
+
+        assert_eq!(reader.count_by_scope().unwrap()[SCOPE], 1);
+    }
+
+    /// A schema newer than this build knows is unreadable, not silently
     /// treated as whatever the current schema means.
     #[test]
-    fn open_read_only_refuses_a_schema_version_this_build_does_not_know() {
+    fn open_read_only_refuses_a_schema_version_newer_than_this_build_knows() {
         let directory = TempDir::new().unwrap();
         let path = directory.path().join("review-data.sqlite3");
         {
@@ -1450,7 +1517,7 @@ mod tests {
         }
 
         let Err(error) = ReviewStore::open_read_only(&path) else {
-            panic!("an unknown schema version must be refused");
+            panic!("a newer schema version must be refused");
         };
 
         assert!(
