@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useReducer, useRef } from "react";
 import { Channel } from "@tauri-apps/api/core";
 import { writeText } from "@tauri-apps/plugin-clipboard-manager";
-import type { DiffSideDto } from "../bindings";
+import type { DiffSideDto, ReviewPanelDto } from "../bindings";
 import { commands } from "../bindings";
 import { clamp } from "../lib/clamp";
 import { toFailure } from "../lib/failure";
@@ -20,6 +20,9 @@ export function useSession(description: string, isShowing: boolean) {
   stateRef.current = state;
   const hasOpened = useRef(false);
   const draftQueue = useDraftQueue(dispatch);
+  // Held here rather than read off the panel, because a second trigger can arrive
+  // before the first run's own "Running" panel has come back over the channel.
+  const isRunning = useRef(false);
 
   useEffect(() => {
     if (hasOpened.current) {
@@ -39,12 +42,16 @@ export function useSession(description: string, isShowing: boolean) {
           return;
         }
         const snapshot = opened.data;
-        commands.selectFile(0).then((selected) => {
+        Promise.all([commands.selectFile(0), commands.reviewPanel()]).then(([selected, panel]) => {
           if (selected.status === "error") {
             dispatch({ type: "failed", failure: toFailure(selected.error) });
             return;
           }
-          dispatch({ type: "ready", snapshot, file: selected.data });
+          if (panel.status === "error") {
+            dispatch({ type: "failed", failure: toFailure(panel.error) });
+            return;
+          }
+          dispatch({ type: "ready", snapshot, file: selected.data, panel: panel.data });
         });
       })
       .catch((error: unknown) => {
@@ -69,6 +76,69 @@ export function useSession(description: string, isShowing: boolean) {
         return;
       }
       dispatch({ type: "sidebar", sidebar: toggled.data });
+    });
+  }, []);
+
+  /**
+   * Starts a review, unless one is already in flight.
+   *
+   * The run holds the session in the backend for as long as the coding agent
+   * takes, so the panel arrives in pieces: the running state and every progress
+   * line over the channel, the outcome when the promise settles.
+   */
+  const runReview = useCallback(() => {
+    if (isRunning.current) {
+      return;
+    }
+    isRunning.current = true;
+
+    const channel = new Channel<ReviewPanelDto>();
+    channel.onmessage = (panel) => dispatch({ type: "panel", panel });
+
+    commands
+      .runReview(channel)
+      .then((finished) => {
+        isRunning.current = false;
+        if (finished.status === "error") {
+          dispatch({ type: "failed", failure: toFailure(finished.error) });
+          return;
+        }
+        dispatch({ type: "panel", panel: finished.data });
+      })
+      .catch((error: unknown) => {
+        isRunning.current = false;
+        dispatch({ type: "failed", failure: toFailure(error) });
+      });
+  }, []);
+
+  /** Asks the running review to stop. It ends at the backend's next step. */
+  const cancelReview = useCallback(() => {
+    commands.cancelReview().then((cancelled) => {
+      if (cancelled.status === "error") {
+        dispatch({ type: "failed", failure: toFailure(cancelled.error) });
+        return;
+      }
+      dispatch({ type: "panel", panel: cancelled.data });
+    });
+  }, []);
+
+  const toggleGuidanceSection = useCallback(() => {
+    commands.toggleGuidancePanel().then((toggled) => {
+      if (toggled.status === "error") {
+        dispatch({ type: "failed", failure: toFailure(toggled.error) });
+        return;
+      }
+      dispatch({ type: "panel", panel: toggled.data });
+    });
+  }, []);
+
+  const toggleGuidanceFile = useCallback((path: string) => {
+    commands.toggleGuidance(path).then((toggled) => {
+      if (toggled.status === "error") {
+        dispatch({ type: "failed", failure: toFailure(toggled.error) });
+        return;
+      }
+      dispatch({ type: "panel", panel: toggled.data });
     });
   }, []);
 
@@ -146,6 +216,11 @@ export function useSession(description: string, isShowing: boolean) {
         toggleViewed();
         return;
       }
+      if (event.metaKey && event.shiftKey && key === "r") {
+        event.preventDefault();
+        runReview();
+        return;
+      }
       if (event.metaKey && !event.shiftKey && key === "c") {
         event.preventDefault();
         const [start, end] = selectionRange(current);
@@ -174,7 +249,7 @@ export function useSession(description: string, isShowing: boolean) {
 
     window.addEventListener("keydown", handleKeydown);
     return () => window.removeEventListener("keydown", handleKeydown);
-  }, [state.status, isShowing, selectFile, toggleViewed]);
+  }, [state.status, isShowing, selectFile, toggleViewed, runReview]);
 
   return {
     state,
@@ -185,5 +260,9 @@ export function useSession(description: string, isShowing: boolean) {
     composerChange,
     composerDiscard,
     reanchorDraft,
+    runReview,
+    cancelReview,
+    toggleGuidanceSection,
+    toggleGuidanceFile,
   };
 }

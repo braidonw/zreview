@@ -2,6 +2,7 @@ import type {
   AnchoredDraftDto,
   DraftsDto,
   FileDetailDto,
+  ReviewPanelDto,
   SessionFailureDto,
   SessionSnapshotDto,
   SidebarDto,
@@ -25,6 +26,8 @@ export type SessionState =
       anchor: number;
       drafts: DraftsDto;
       composer: ComposerState;
+      /** The review panel, absent for a snapshot that cannot be reviewed at all. */
+      panel: ReviewPanelDto | null;
     };
 
 export type ReadyState = Extract<SessionState, { status: "ready" }>;
@@ -39,7 +42,13 @@ export type SessionAction =
   | { type: "describe"; description: string }
   | { type: "stage"; stage: string }
   | { type: "failed"; failure: SessionFailureDto }
-  | { type: "ready"; snapshot: SessionSnapshotDto; file: FileDetailDto }
+  | {
+      type: "ready";
+      snapshot: SessionSnapshotDto;
+      file: FileDetailDto;
+      panel: ReviewPanelDto | null;
+    }
+  | { type: "panel"; panel: ReviewPanelDto | null }
   | { type: "file"; file: FileDetailDto }
   | { type: "sidebar"; sidebar: SidebarDto }
   | { type: "move"; delta: 1 | -1; extend: boolean }
@@ -81,7 +90,14 @@ export function sessionReducer(state: SessionState, action: SessionAction): Sess
         anchor: 0,
         drafts: action.file.drafts,
         composer: null,
+        panel: action.panel,
       };
+
+    case "panel":
+      if (state.status !== "ready") {
+        return state;
+      }
+      return { ...state, panel: action.panel };
 
     case "file":
       if (state.status !== "ready") {
