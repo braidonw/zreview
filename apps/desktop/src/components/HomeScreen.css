@@ -108,6 +108,21 @@
   color: var(--text-secondary);
 }
 
+.home__drafts-failure {
+  min-height: var(--file-row-height);
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  font-family: var(--font-sans);
+  font-size: var(--size-body);
+  color: var(--severity-error-text);
+}
+
+.home__drafts-failure-detail {
+  font-size: var(--size-meta);
+  color: var(--text-secondary);
+}
+
 .home__group {
   padding-top: 20px;
   display: flex;
@@ -212,6 +227,15 @@
 
 .home__cell--drafts {
   width: 60px;
+}
+
+.home__drafts-badge {
+  padding: 0 6px;
+  border-radius: 4px;
+  background: var(--accent-dim);
+  color: var(--accent-text);
+  font-family: var(--font-mono);
+  font-size: var(--size-label);
 }
 
 /* Wide enough for "you reviewed this head", the longest label it carries. */

@@ -135,6 +135,7 @@ function HomeBody({
   return (
     <div className="home__body home__body--list">
       <WriteFailure failure={snapshot.write_failure} />
+      <DraftsFailure failure={snapshot.drafts_failure} />
       {snapshot.failed_repositories.map((repository) => (
         <div className="home__failed-repository" key={repository.path}>
           <span className="home__failed-detail">
@@ -180,6 +181,19 @@ function WriteFailure({ failure }: { failure: SessionFailureDto | null }) {
   );
 }
 
+/** Why the last Drafts read failed, above the list beside the failed repositories. */
+function DraftsFailure({ failure }: { failure: SessionFailureDto | null }) {
+  if (failure === null) {
+    return null;
+  }
+  return (
+    <div className="home__drafts-failure">
+      <span>{failure.summary}</span>
+      {failure.detail !== null && <span className="home__drafts-failure-detail">{failure.detail}</span>}
+    </div>
+  );
+}
+
 /** One pull request on one line, its columns aligned whether or not they speak. */
 function Row({ row, cursor, nowMs }: { row: HomeRowDto; cursor: boolean; nowMs: number }) {
   const line = useRef<HTMLLIElement>(null);
@@ -197,7 +211,9 @@ function Row({ row, cursor, nowMs }: { row: HomeRowDto; cursor: boolean; nowMs: 
       aria-selected={cursor}
     >
       <span className="home__row-title">{row.title}</span>
-      <span className="home__cell home__cell--drafts" />
+      <span className="home__cell home__cell--drafts">
+        {row.drafts !== null && <span className="home__drafts-badge">{row.drafts}</span>}
+      </span>
       <span className="home__cell home__cell--review">
         {row.review_status !== null && (
           <span className={`home__status home__status--${row.review_status.tone.toLowerCase()}`}>

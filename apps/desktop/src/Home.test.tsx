@@ -422,6 +422,53 @@ describe("Home", () => {
     expect(scrollIntoView).toHaveBeenCalledWith(expect.objectContaining({ block: "nearest" }));
   });
 
+  it("shows the Drafts badge on a row that has some, and a blank cell where it has none", async () => {
+    refreshHome.mockResolvedValue(
+      ok({
+        ...listed(),
+        groups: makeHomeGroups([
+          [
+            makeHomeRow({ index: 0, identity: "acme/widgets#412", drafts: "3 drafts" }),
+            makeHomeRow({ index: 1, identity: "acme/widgets#398", drafts: "1 draft" }),
+          ],
+          [],
+          [],
+        ]),
+      }),
+    );
+
+    render(<App />);
+
+    await waitFor(() => expect(screen.getByText("3 drafts")).toBeTruthy());
+    expect(screen.getByText("1 draft")).toBeTruthy();
+    const rows = screen.getAllByRole("listitem");
+    expect(rows[0].querySelector(".home__cell--drafts")?.textContent).toBe("3 drafts");
+  });
+
+  it("blanks the Drafts column and shows the reason when the store could not be read", async () => {
+    refreshHome.mockResolvedValue(
+      ok({
+        ...listed(),
+        drafts_failure: {
+          summary: "Drafts could not be read",
+          detail: "the review database's schema version 99 is not one this build knows",
+          remediation: null,
+        },
+      }),
+    );
+
+    render(<App />);
+
+    await waitFor(() => expect(screen.getByText(/Drafts could not be read/)).toBeTruthy());
+    expect(
+      screen.getByText(/schema version 99 is not one this build knows/),
+    ).toBeTruthy();
+    const rows = screen.getAllByRole("listitem");
+    expect(rows.every((row) => row.querySelector(".home__cell--drafts")?.textContent === "")).toBe(
+      true,
+    );
+  });
+
   it("shows a failed repository above the list with a Remove beside it", async () => {
     refreshHome.mockResolvedValue(
       ok({
