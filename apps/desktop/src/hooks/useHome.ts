@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
+import { Channel } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
-import type { HomeSnapshotDto, SessionFailureDto } from "../bindings";
+import type { CursorMoveDto, HomeSnapshotDto, RefreshStateDto, SessionFailureDto } from "../bindings";
 import { commands } from "../bindings";
 import { toFailure } from "../lib/failure";
 
@@ -37,8 +38,14 @@ export function useHome() {
       .catch((error: unknown) => setFailure(toFailure(error)));
   }, []);
 
+  /** What the running refresh last reported, which outranks the snapshot's own stamp. */
+  const [progress, setProgress] = useState<RefreshStateDto | null>(null);
+
   const refresh = useCallback(() => {
-    apply(commands.refreshHome());
+    const channel = new Channel<RefreshStateDto>();
+    channel.onmessage = setProgress;
+    // The answer carries the settled stamp, so the reported one has done its job.
+    apply(commands.refreshHome(channel).finally(() => setProgress(null)));
   }, [apply]);
 
   useEffect(() => {
@@ -84,7 +91,18 @@ export function useHome() {
       .catch((error: unknown) => setFailure(toFailure(error)));
   }, [apply]);
 
-  // r refreshes and e opens or closes the Repositories footer, as the layout prototype bound them.
+  const moveCursor = useCallback((moveTo: CursorMoveDto) => {
+    commands
+      .moveHomeCursor(moveTo)
+      .then((moved) => {
+        setFailure(null);
+        setSnapshot(moved);
+      })
+      .catch((error: unknown) => setFailure(toFailure(error)));
+  }, []);
+
+  // r refreshes, e opens or closes the Repositories footer, and j and k walk the
+  // rows, as the layout prototype bound them.
   useEffect(() => {
     function handleKeydown(event: KeyboardEvent) {
       if (event.metaKey || event.ctrlKey || event.altKey || event.shiftKey) {
@@ -102,12 +120,33 @@ export function useHome() {
       if (key === "e") {
         event.preventDefault();
         toggleFooter();
+        return;
+      }
+      if (key === "j") {
+        event.preventDefault();
+        moveCursor("Down");
+        return;
+      }
+      if (key === "k") {
+        event.preventDefault();
+        moveCursor("Up");
       }
     }
 
     window.addEventListener("keydown", handleKeydown);
     return () => window.removeEventListener("keydown", handleKeydown);
-  }, [refresh, toggleFooter]);
+  }, [moveCursor, refresh, toggleFooter]);
 
-  return { snapshot, failure, refresh, toggleFooter, addRepositories, removeRepository };
+  // What the running refresh reports outranks the stamp the last one left.
+  const refreshState = progress ?? snapshot?.refresh ?? null;
+
+  return {
+    snapshot,
+    refreshState,
+    failure,
+    refresh,
+    toggleFooter,
+    addRepositories,
+    removeRepository,
+  };
 }

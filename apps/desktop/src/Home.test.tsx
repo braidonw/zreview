@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { render, screen, waitFor } from "@testing-library/react";
+import { act, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import type { HomeSnapshotDto } from "./bindings";
 import App from "./App";
@@ -234,6 +234,216 @@ describe("Home", () => {
 
     await waitFor(() => expect(screen.queryByText("/Developer/zreview")).toBeNull());
     expect(screen.getByText("/Developer/moved")).toBeTruthy();
+  });
+
+  // Three rows across the three groups, which is what the cursor walks.
+  function listed() {
+    return makeHomeSnapshot({
+      count_line: "3 pull requests across 2 repositories",
+      groups: makeHomeGroups([
+        [
+          makeHomeRow({
+            index: 0,
+            identity: "acme/widgets#412",
+            title: "Retry webhook deliveries",
+            check_status: { label: "checks passing", tone: "Success" },
+          }),
+          makeHomeRow({
+            index: 1,
+            identity: "acme/widgets#398",
+            title: "Split the invoice renderer",
+            author: "priya",
+            review_status: { label: "you reviewed this head", tone: "Muted" },
+            check_status: { label: "checks failing", tone: "Error" },
+          }),
+        ],
+        [
+          makeHomeRow({
+            index: 2,
+            identity: "braidonw/zreview#77",
+            title: "Bound the retry ceiling",
+            author: "braidonw",
+            review_status: { label: "changes requested", tone: "Error" },
+            check_status: { label: "checks running", tone: "Warning" },
+          }),
+        ],
+        [],
+      ]),
+      repositories: [makeHomeRepository()],
+      footer_summary: "2 repositories",
+      // Two and a half minutes back, so a second either way still reads as 2 min.
+      refresh: { Refreshed: { at_ms: Date.now() - 150_000 } },
+    });
+  }
+
+  it("renders every row in group order with its statuses and its age", async () => {
+    refreshHome.mockResolvedValue(ok(listed()));
+
+    render(<App />);
+
+    await waitFor(() => expect(screen.getByText("Retry webhook deliveries")).toBeTruthy());
+    const rows = screen.getAllByRole("listitem");
+    expect(rows.map((row) => row.getAttribute("data-identity"))).toEqual([
+      "acme/widgets#412",
+      "acme/widgets#398",
+      "braidonw/zreview#77",
+    ]);
+    expect(screen.getByText("you reviewed this head")).toBeTruthy();
+    expect(screen.getByText("changes requested")).toBeTruthy();
+    expect(screen.getByText("checks passing")).toBeTruthy();
+    expect(screen.getByText("checks failing")).toBeTruthy();
+    expect(screen.getByText("checks running")).toBeTruthy();
+    expect(screen.getByText("Nothing waiting on others.")).toBeTruthy();
+  });
+
+  it("leaves an aligned gap where a row has no status", async () => {
+    refreshHome.mockResolvedValue(ok(listed()));
+
+    render(<App />);
+
+    await waitFor(() => expect(screen.getByText("Retry webhook deliveries")).toBeTruthy());
+    // Every row carries the same columns whether or not they say anything.
+    for (const row of screen.getAllByRole("listitem")) {
+      expect(row.querySelectorAll(".home__cell").length).toBe(6);
+    }
+  });
+
+  it("shows the stamp counting off the repositories while a refresh runs", async () => {
+    refreshHome.mockResolvedValue(
+      ok(makeHomeSnapshot({ refresh: { Refreshing: { done: 2, total: 4 } } })),
+    );
+
+    render(<App />);
+
+    await waitFor(() => expect(screen.getByText("Refreshing 2 of 4")).toBeTruthy());
+  });
+
+  it("shows the stamp as how long ago the refresh settled", async () => {
+    refreshHome.mockResolvedValue(ok(listed()));
+
+    render(<App />);
+
+    await waitFor(() => expect(screen.getByText("Refreshed 2 min ago")).toBeTruthy());
+    expect(screen.getByText("r")).toBeTruthy();
+  });
+
+  it("shows the stamp as a failure when nothing loaded", async () => {
+    refreshHome.mockResolvedValue(ok(makeHomeSnapshot({ refresh: "Failed" })));
+
+    render(<App />);
+
+    await waitFor(() => expect(screen.getByText("Refresh failed")).toBeTruthy());
+  });
+
+  it("shows no stamp at all before the first refresh answers", async () => {
+    refreshHome.mockResolvedValue(ok(makeHomeSnapshot({ refresh: "NeverRefreshed" })));
+
+    render(<App />);
+
+    await waitFor(() => expect(screen.getByText("No repositories yet")).toBeTruthy());
+    expect(screen.queryByText(/^Refresh/)).toBeNull();
+  });
+
+  it("moves the cursor down on j and up on k", async () => {
+    const user = userEvent.setup();
+    refreshHome.mockResolvedValue(ok(listed()));
+    moveHomeCursor.mockImplementation((moveTo: string) =>
+      Promise.resolve({ ...listed(), cursor: moveTo === "Down" ? 1 : 0 }),
+    );
+
+    render(<App />);
+    await waitFor(() => expect(screen.getByText("Retry webhook deliveries")).toBeTruthy());
+
+    await user.keyboard("j");
+
+    await waitFor(() => expect(moveHomeCursor).toHaveBeenCalledWith("Down"));
+    await waitFor(() =>
+      expect(
+        screen.getAllByRole("listitem")[1].getAttribute("data-cursor"),
+      ).toBe("true"),
+    );
+
+    await user.keyboard("k");
+
+    await waitFor(() => expect(moveHomeCursor).toHaveBeenCalledWith("Up"));
+    await waitFor(() =>
+      expect(
+        screen.getAllByRole("listitem")[0].getAttribute("data-cursor"),
+      ).toBe("true"),
+    );
+  });
+
+  it("shows a failed repository above the list with a Remove beside it", async () => {
+    refreshHome.mockResolvedValue(
+      ok({
+        ...listed(),
+        failed_repositories: [
+          {
+            path: "/Developer/billing",
+            slug: "acme/billing",
+            reason: "GitHub refused the request: SAML enforcement",
+          },
+        ],
+      }),
+    );
+
+    render(<App />);
+
+    await waitFor(() =>
+      expect(
+        screen.getByText(/acme\/billing.*SAML enforcement/),
+      ).toBeTruthy(),
+    );
+    const line = screen.getByText(/acme\/billing/).closest(".home__failed-repository");
+    expect(line).toBeTruthy();
+    expect(within(line as HTMLElement).getByRole("button", { name: "Remove" })).toBeTruthy();
+  });
+
+  it("removes the repository the failed line's Remove names", async () => {
+    const user = userEvent.setup();
+    refreshHome.mockResolvedValue(
+      ok({
+        ...listed(),
+        failed_repositories: [
+          { path: "/Developer/billing", slug: "acme/billing", reason: "GitHub refused" },
+        ],
+      }),
+    );
+    removeRepository.mockResolvedValue(ok(listed()));
+
+    render(<App />);
+    await waitFor(() => expect(screen.getByText(/acme\/billing/)).toBeTruthy());
+
+    const line = screen.getByText(/acme\/billing/).closest(".home__failed-repository");
+    await user.click(within(line as HTMLElement).getByRole("button", { name: "Remove" }));
+
+    await waitFor(() => expect(removeRepository).toHaveBeenCalledWith("/Developer/billing"));
+  });
+
+  it("stamps the progress the refresh channel reports, then the time it settled", async () => {
+    let progress: ((state: unknown) => void) | null = null;
+    let settle: ((snapshot: unknown) => void) | null = null;
+    refreshHome.mockImplementation((onProgress: { onmessage: (state: unknown) => void }) => {
+      progress = (state: unknown) => onProgress.onmessage(state);
+      return new Promise((resolve) => {
+        settle = resolve;
+      });
+    });
+
+    render(<App />);
+    await waitFor(() => expect(progress).not.toBeNull());
+
+    // The header goes up on the first report, so the window is never blank.
+    act(() => progress?.({ Refreshing: { done: 0, total: 0 } }));
+    await waitFor(() => expect(screen.getByText("Refreshing")).toBeTruthy());
+
+    act(() => progress?.({ Refreshing: { done: 1, total: 3 } }));
+    await waitFor(() => expect(screen.getByText("Refreshing 1 of 3")).toBeTruthy());
+
+    act(() => settle?.(ok(listed())));
+
+    await waitFor(() => expect(screen.getByText("Refreshed 2 min ago")).toBeTruthy());
+    expect(screen.getByText("Retry webhook deliveries")).toBeTruthy();
   });
 
   it("refreshes on r, showing what the settings file now holds", async () => {
