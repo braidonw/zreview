@@ -33,6 +33,7 @@ function readyState(overrides: Partial<ReadyState["file"]> = {}): ReadyState {
     drafts: makeFile().drafts,
     composer: null,
     panel: null,
+    panelNotice: null,
   };
 }
 

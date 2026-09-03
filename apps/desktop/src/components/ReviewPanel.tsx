@@ -11,12 +11,15 @@ import "./ReviewPanel.css";
  */
 export function ReviewPanel({
   panel,
+  notice,
   onRunReview,
   onCancelReview,
   onToggleGuidanceSection,
   onToggleGuidanceFile,
 }: {
   panel: ReviewPanelDto;
+  /** What a review command refused, until the next panel lands. */
+  notice: string | null;
   onRunReview: () => void;
   onCancelReview: () => void;
   onToggleGuidanceSection: () => void;
@@ -24,7 +27,6 @@ export function ReviewPanel({
 }) {
   const { run, note, footer } = panel;
   const isRunning = run.state === "Running";
-  const unreviewed = run.state === "Complete" ? run.unreviewed : [];
 
   return (
     <aside className="review-panel">
@@ -41,6 +43,7 @@ export function ReviewPanel({
         </div>
         {run.state === "Running" && <p className="review-panel__progress">{run.detail}</p>}
       </header>
+      {notice !== null && <p className="review-panel__notice">{notice}</p>}
       <GuidanceSection
         guidance={panel.guidance}
         onToggleSection={onToggleGuidanceSection}
@@ -61,7 +64,7 @@ export function ReviewPanel({
             <>
               <p className="review-panel__not-reviewed">{footer.not_reviewed}</p>
               <ul className="review-panel__unreviewed">
-                {unreviewed.map((path) => (
+                {footer.unreviewed.map((path) => (
                   <li key={path}>{path}</li>
                 ))}
               </ul>
@@ -90,7 +93,8 @@ function GuidanceSection({
 }) {
   if (guidance.kind === "NothingFound") {
     // Discovery ran and found nothing. Saying so is not the same as showing
-    // nothing, which would read as though guidance was never looked for.
+    // nothing. A reviewer needs to tell "this repository states no conventions"
+    // from "guidance was never looked for".
     return (
       <section className="review-panel__guidance">
         <p className="review-panel__nothing-found">{guidance.note}</p>

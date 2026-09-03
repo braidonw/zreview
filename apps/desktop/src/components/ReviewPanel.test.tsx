@@ -7,6 +7,7 @@ import { ReviewPanel } from "./ReviewPanel";
 /** Every handler the panel needs beyond the one a test wants to watch. */
 function baseHandlers() {
   return {
+    notice: null,
     onRunReview: () => {},
     onCancelReview: () => {},
     onToggleGuidanceSection: () => {},
@@ -181,13 +182,16 @@ describe("ReviewPanel", () => {
             accepted: 0,
             rejected: 2,
             suppressed: 1,
-            unreviewed: ["vendor/lib.rs", "huge.json"],
           },
           note: {
             heading: "Nothing to act on.",
             detail: "2 claim(s) did not check out and 1 were previously dismissed.",
           },
-          footer: { refused: "2 claim(s) refused", not_reviewed: "2 file(s) not reviewed" },
+          footer: {
+            refused: "2 claim(s) refused",
+            not_reviewed: "2 file(s) not reviewed",
+            unreviewed: ["vendor/lib.rs", "huge.json"],
+          },
         })}
         {...baseHandlers()}
       />,

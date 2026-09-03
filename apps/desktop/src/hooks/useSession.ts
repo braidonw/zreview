@@ -8,6 +8,11 @@ import { toFailure } from "../lib/failure";
 import { initialState, selectionRange, sessionReducer } from "./sessionReducer";
 import { useDraftQueue } from "./useDraftQueue";
 
+/** What a command answering with the review panel hands back. */
+type PanelResult =
+  | { status: "ok"; data: ReviewPanelDto | null }
+  | { status: "error"; error: unknown };
+
 /**
  * Loads one session and exposes every action the UI can take on it.
  *
@@ -92,55 +97,69 @@ export function useSession(description: string, isShowing: boolean) {
     }
     isRunning.current = true;
 
-    const channel = new Channel<ReviewPanelDto>();
-    channel.onmessage = (panel) => dispatch({ type: "panel", panel });
+    try {
+      const channel = new Channel<ReviewPanelDto>();
+      channel.onmessage = (panel) => dispatch({ type: "panel", panel });
 
-    commands
-      .runReview(channel)
-      .then((finished) => {
-        isRunning.current = false;
-        if (finished.status === "error") {
-          dispatch({ type: "failed", failure: toFailure(finished.error) });
-          return;
-        }
-        dispatch({ type: "panel", panel: finished.data });
-      })
-      .catch((error: unknown) => {
-        isRunning.current = false;
-        dispatch({ type: "failed", failure: toFailure(error) });
-      });
+      commands
+        .runReview(channel)
+        .then((finished) => {
+          if (finished.status === "error") {
+            dispatch({ type: "panelNotice", notice: toFailure(finished.error).summary });
+            return;
+          }
+          dispatch({ type: "panel", panel: finished.data });
+        })
+        .catch((error: unknown) => {
+          dispatch({ type: "panelNotice", notice: toFailure(error).summary });
+        })
+        .finally(() => {
+          isRunning.current = false;
+        });
+    } catch (error: unknown) {
+      // A throw before the promise exists would otherwise leave the flag set and
+      // no review startable for the rest of the sitting.
+      isRunning.current = false;
+      dispatch({ type: "panelNotice", notice: toFailure(error).summary });
+    }
   }, []);
+
+  /**
+   * Runs one of the panel's own commands, showing a refusal inside the panel.
+   *
+   * These are about the review, not the sitting. Replacing the Session with a
+   * failure screen would throw away the diff and whatever is unsent in the
+   * composer, over a toggle that did not take.
+   */
+  const onPanel = useCallback(
+    (call: Promise<PanelResult>) => {
+      call
+        .then((answered) => {
+          if (answered.status === "error") {
+            dispatch({ type: "panelNotice", notice: toFailure(answered.error).summary });
+            return;
+          }
+          dispatch({ type: "panel", panel: answered.data });
+        })
+        .catch((error: unknown) => {
+          dispatch({ type: "panelNotice", notice: toFailure(error).summary });
+        });
+    },
+    [],
+  );
 
   /** Asks the running review to stop. It ends at the backend's next step. */
-  const cancelReview = useCallback(() => {
-    commands.cancelReview().then((cancelled) => {
-      if (cancelled.status === "error") {
-        dispatch({ type: "failed", failure: toFailure(cancelled.error) });
-        return;
-      }
-      dispatch({ type: "panel", panel: cancelled.data });
-    });
-  }, []);
+  const cancelReview = useCallback(() => onPanel(commands.cancelReview()), [onPanel]);
 
-  const toggleGuidanceSection = useCallback(() => {
-    commands.toggleGuidancePanel().then((toggled) => {
-      if (toggled.status === "error") {
-        dispatch({ type: "failed", failure: toFailure(toggled.error) });
-        return;
-      }
-      dispatch({ type: "panel", panel: toggled.data });
-    });
-  }, []);
+  const toggleGuidanceSection = useCallback(
+    () => onPanel(commands.toggleGuidancePanel()),
+    [onPanel],
+  );
 
-  const toggleGuidanceFile = useCallback((path: string) => {
-    commands.toggleGuidance(path).then((toggled) => {
-      if (toggled.status === "error") {
-        dispatch({ type: "failed", failure: toFailure(toggled.error) });
-        return;
-      }
-      dispatch({ type: "panel", panel: toggled.data });
-    });
-  }, []);
+  const toggleGuidanceFile = useCallback(
+    (path: string) => onPanel(commands.toggleGuidance(path)),
+    [onPanel],
+  );
 
   const clickRow = useCallback((index: number) => dispatch({ type: "click", index }), []);
 

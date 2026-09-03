@@ -85,6 +85,7 @@ export function SessionShell({
       {state.panel !== null && (
         <ReviewPanel
           panel={state.panel}
+          notice={state.panelNotice}
           onRunReview={onRunReview}
           onCancelReview={onCancelReview}
           onToggleGuidanceSection={onToggleGuidanceSection}

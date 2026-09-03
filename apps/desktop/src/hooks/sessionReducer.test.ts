@@ -34,6 +34,7 @@ function readyState(rowCount: number, cursor = 0, anchor = 0): ReadyState {
     drafts: file.drafts,
     composer: null,
     panel: null,
+    panelNotice: null,
   };
 }
 
@@ -77,6 +78,43 @@ describe("sessionReducer", () => {
     const next = sessionReducer(initialState, { type: "panel", panel: makePanel() });
 
     expect(next).toEqual(initialState);
+  });
+
+  it("drops a panel that was read before the one it already holds", () => {
+    const held = sessionReducer(readyState(1), {
+      type: "panel",
+      panel: makePanel({ revision: 7, heading: "2 findings" }),
+    });
+
+    const next = sessionReducer(held, {
+      type: "panel",
+      panel: makePanel({ revision: 5, heading: "Review" }),
+    });
+
+    expect(next).toMatchObject({ panel: { revision: 7, heading: "2 findings" } });
+  });
+
+  it("keeps a panel read at the same revision, which carries the same state", () => {
+    const held = sessionReducer(readyState(1), { type: "panel", panel: makePanel({ revision: 7 }) });
+
+    const next = sessionReducer(held, {
+      type: "panel",
+      panel: makePanel({ revision: 7, heading: "1 finding" }),
+    });
+
+    expect(next).toMatchObject({ panel: { heading: "1 finding" } });
+  });
+
+  it("shows what a review command refused until the next panel lands", () => {
+    const refused = sessionReducer(readyState(1), {
+      type: "panelNotice",
+      notice: "no guidance file at AGENTS.md",
+    });
+    expect(refused).toMatchObject({ panelNotice: "no guidance file at AGENTS.md" });
+
+    const next = sessionReducer(refused, { type: "panel", panel: makePanel() });
+
+    expect(next).toMatchObject({ panelNotice: null });
   });
 
   it("clamps the cursor at the top of the file", () => {

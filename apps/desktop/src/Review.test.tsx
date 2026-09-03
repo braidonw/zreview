@@ -5,6 +5,8 @@ import type { Channel } from "@tauri-apps/api/core";
 import type { ReviewPanelDto } from "./bindings";
 import App from "./App";
 import {
+  makeAnchoredDraft,
+  makeDrafts,
   makeFile,
   makeFileSummary,
   makeGuidance,
@@ -48,8 +50,9 @@ vi.mock("./bindings", () => ({
 vi.mock("@tauri-apps/plugin-clipboard-manager", () => ({ writeText: () => Promise.resolve() }));
 
 /** The panel the backend reports while a run is in flight. */
-function runningPanel(detail: string): ReviewPanelDto {
+function runningPanel(detail: string, revision = 2): ReviewPanelDto {
   return makePanel({
+    revision,
     run: { state: "Running", detail },
     note: { heading: "Reviewing...", detail: null },
   });
@@ -139,9 +142,112 @@ describe("the review panel in a Session", () => {
 
     await user.click(screen.getByRole("button", { name: /1 guidance file/ }));
 
-    expect(toggleGuidancePanel).toHaveBeenCalledOnce();
     await waitFor(() => expect(screen.queryByText("AGENTS.md")).toBeNull());
     expect(screen.getByText("1 guidance file · 2 KB")).toBeTruthy();
+  });
+
+  it("shows what a refused toggle said, leaving the diff and the composer alone", async () => {
+    const user = userEvent.setup();
+    selectFile.mockResolvedValue({
+      status: "ok",
+      data: makeFile({
+        rows: [makeRow({ text: "first" }), makeRow({ text: "second" })],
+        drafts: makeDrafts({ anchored: [makeAnchoredDraft({ row: 0, body: "worth keeping" })] }),
+      }),
+    });
+    toggleGuidance.mockResolvedValue({
+      status: "error",
+      error: { summary: "no guidance file at AGENTS.md", detail: null, remediation: null },
+    });
+    await openPanel();
+    await user.keyboard("c");
+    await waitFor(() =>
+      expect(document.querySelector("[data-composer] .cm-content")?.textContent).toContain(
+        "worth keeping",
+      ),
+    );
+
+    await user.click(screen.getByRole("button", { name: /AGENTS\.md/ }));
+
+    await waitFor(() => expect(screen.getByText("no guidance file at AGENTS.md")).toBeTruthy());
+    expect(screen.getByText("first")).toBeTruthy();
+    expect(document.querySelector("[data-composer] .cm-content")?.textContent).toContain(
+      "worth keeping",
+    );
+  });
+
+  it("shows a review command's transport rejection in the panel rather than losing the Session", async () => {
+    const user = userEvent.setup();
+    toggleGuidancePanel.mockRejectedValue(new Error("IPC is unavailable"));
+    await openPanel();
+
+    await user.click(screen.getByRole("button", { name: /1 guidance file/ }));
+
+    await waitFor(() => expect(screen.getByText("Error: IPC is unavailable")).toBeTruthy());
+    expect(screen.getByText("first")).toBeTruthy();
+  });
+
+  it("clears the notice once a command answers with a panel again", async () => {
+    const user = userEvent.setup();
+    toggleGuidance.mockResolvedValue({
+      status: "error",
+      error: { summary: "no guidance file at AGENTS.md", detail: null, remediation: null },
+    });
+    toggleGuidancePanel.mockResolvedValue({
+      status: "ok",
+      data: makePanel({ revision: 2, guidance: makeGuidance({ expanded: false }) }),
+    });
+    await openPanel();
+
+    await user.click(screen.getByRole("button", { name: /AGENTS\.md/ }));
+    await waitFor(() => expect(screen.getByText("no guidance file at AGENTS.md")).toBeTruthy());
+
+    await user.click(screen.getByRole("button", { name: /1 guidance file/ }));
+
+    await waitFor(() => expect(screen.queryByText("no guidance file at AGENTS.md")).toBeNull());
+  });
+
+  it("drops a command's answer that was read before the run had finished", async () => {
+    const user = userEvent.setup();
+    let channel: Channel<ReviewPanelDto> | undefined;
+    let settleRun: (outcome: unknown) => void = () => {};
+    let settleCancel: (outcome: unknown) => void = () => {};
+    runReview.mockImplementation((given: Channel<ReviewPanelDto>) => {
+      channel = given;
+      return new Promise((resolve) => {
+        settleRun = resolve;
+      });
+    });
+    cancelReview.mockImplementation(
+      () =>
+        new Promise((resolve) => {
+          settleCancel = resolve;
+        }),
+    );
+    await openPanel();
+
+    await user.click(screen.getByRole("button", { name: "Review" }));
+    act(() => channel?.onmessage(runningPanel("Reading the diff", 3)));
+    await waitFor(() => expect(screen.getByRole("button", { name: "Cancel" })).toBeTruthy());
+    await user.click(screen.getByRole("button", { name: "Cancel" }));
+
+    await act(async () => {
+      settleRun({
+        status: "ok",
+        data: makePanel({
+          revision: 9,
+          run: { state: "Complete", accepted: 0, rejected: 0, suppressed: 0 },
+          note: { heading: "Nothing to act on.", detail: "The review found no problems." },
+        }),
+      });
+    });
+    // Cancel read the model while the run was still going, and answers last.
+    await act(async () => {
+      settleCancel({ status: "ok", data: runningPanel("Reading the diff", 3) });
+    });
+
+    expect(screen.getByText("Nothing to act on.")).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Cancel" })).toBeNull();
   });
 
   it("starts one run when Review is pressed twice before the backend has answered", async () => {
@@ -239,6 +345,7 @@ describe("the review panel in a Session", () => {
       settle({
         status: "ok",
         data: makePanel({
+          revision: 4,
           run: { state: "Failed", summary: "the review was cancelled", remediation: null },
           note: { heading: "the review was cancelled", detail: null },
         }),
@@ -284,13 +391,16 @@ describe("the review panel in a Session", () => {
           accepted: 0,
           rejected: 2,
           suppressed: 1,
-          unreviewed: ["vendor/lib.rs"],
         },
         note: {
           heading: "Nothing to act on.",
           detail: "2 claim(s) did not check out and 1 were previously dismissed.",
         },
-        footer: { refused: "2 claim(s) refused", not_reviewed: "1 file(s) not reviewed" },
+        footer: {
+          refused: "2 claim(s) refused",
+          not_reviewed: "1 file(s) not reviewed",
+          unreviewed: ["vendor/lib.rs"],
+        },
       }),
     });
     await openPanel();

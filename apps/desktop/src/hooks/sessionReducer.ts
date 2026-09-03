@@ -28,6 +28,14 @@ export type SessionState =
       composer: ComposerState;
       /** The review panel, absent for a snapshot that cannot be reviewed at all. */
       panel: ReviewPanelDto | null;
+      /**
+       * What a review command refused, shown inside the panel.
+       *
+       * A refused toggle or a cancel that could not be delivered is about the
+       * review, not the sitting. Replacing the Session with a failure screen
+       * would throw away the diff and whatever is unsent in the composer.
+       */
+      panelNotice: string | null;
     };
 
 export type ReadyState = Extract<SessionState, { status: "ready" }>;
@@ -49,6 +57,7 @@ export type SessionAction =
       panel: ReviewPanelDto | null;
     }
   | { type: "panel"; panel: ReviewPanelDto | null }
+  | { type: "panelNotice"; notice: string }
   | { type: "file"; file: FileDetailDto }
   | { type: "sidebar"; sidebar: SidebarDto }
   | { type: "move"; delta: 1 | -1; extend: boolean }
@@ -91,13 +100,32 @@ export function sessionReducer(state: SessionState, action: SessionAction): Sess
         drafts: action.file.drafts,
         composer: null,
         panel: action.panel,
+        panelNotice: null,
       };
 
-    case "panel":
+    case "panel": {
       if (state.status !== "ready") {
         return state;
       }
-      return { ...state, panel: action.panel };
+      // Several commands answer with the whole panel and they run at once. One
+      // that read the model before a change must not land on top of one that
+      // carries it, which would put a finished run back on screen as a running
+      // one with a live Cancel button.
+      const stale =
+        action.panel !== null &&
+        state.panel !== null &&
+        action.panel.revision < state.panel.revision;
+      if (stale) {
+        return state;
+      }
+      return { ...state, panel: action.panel, panelNotice: null };
+    }
+
+    case "panelNotice":
+      if (state.status !== "ready") {
+        return state;
+      }
+      return { ...state, panelNotice: action.notice };
 
     case "file":
       if (state.status !== "ready") {

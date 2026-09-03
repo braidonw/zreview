@@ -131,6 +131,7 @@ export function makeGuidance(overrides: Partial<DiscoveredGuidance> = {}): Guida
 
 export function makePanel(overrides: Partial<ReviewPanelDto> = {}): ReviewPanelDto {
   return {
+    revision: 1,
     heading: "Review",
     guidance: makeGuidance(),
     run: { state: "Idle" },
