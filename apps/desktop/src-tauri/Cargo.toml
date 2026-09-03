@@ -21,6 +21,7 @@ domain.workspace = true
 github.workspace = true
 session.workspace = true
 settings.workspace = true
+store.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tauri = { version = "=2.11.5", features = [] }

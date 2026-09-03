@@ -14,7 +14,7 @@ use session::{ReviewStorage, SessionRequest};
 use tauri::ipc::Channel;
 use tauri_specta::collect_commands;
 
-use crate::{AppRoot, ManagedHome, ManagedSession, dto, pull_requests, repositories};
+use crate::{AppRoot, ManagedHome, ManagedSession, drafts, dto, pull_requests, repositories};
 
 /// The specta builder, shared between the invoke handler and the bindings export.
 #[must_use]
@@ -41,11 +41,16 @@ pub fn specta_builder() -> tauri_specta::Builder<tauri::Wry> {
 /// It is not queued, because a refresh only ever asks what is true now, and the
 /// one already running is about to answer that.
 ///
+/// Once the fetch has landed, `database_path` is read for the Drafts count on
+/// every row. A missing database means no Drafts anywhere; anything else that
+/// stops it opening or reading is the failure Home shows above the list.
+///
 /// Takes the reporter as a plain callback so it can be tested without a Tauri
 /// channel, as `run_load` does.
 fn refresh_home_on_model(
     home: &ManagedHome,
     settings_path: &Path,
+    database_path: &Path,
     report: &dyn Fn(dto::HomeSnapshotDto),
 ) {
     let Some(_ordered) = try_lock(&home.settings_action) else {
@@ -79,6 +84,8 @@ fn refresh_home_on_model(
         lock(&home.model).batch_fetched(batch);
         report_home(home, report);
     });
+    let fetched_rows = lock(&home.model).rows().to_vec();
+    lock(&home.model).drafts_read(drafts::read(database_path, &fetched_rows));
     lock(&home.model).finish_refresh(now_ms());
     report_home(home, report);
 }
@@ -471,7 +478,9 @@ pub async fn refresh_home(
     let home = state.home.clone();
     off_the_ui_thread(move || {
         on_settings_file(&home, |home, settings_path| {
-            refresh_home_on_model(home, settings_path, &|shown| {
+            let database_path = store::default_database_path()
+                .expect("HOME is set, since the settings path just resolved from it");
+            refresh_home_on_model(home, settings_path, &database_path, &|shown| {
                 let _ = on_progress.send(shown);
             });
         })
@@ -994,9 +1003,15 @@ mod tests {
         settings::load(settings_path).unwrap().repositories
     }
 
+    /// A database path guaranteed not to exist, for tests that are not
+    /// exercising Drafts and want a refresh to see none.
+    fn no_drafts_database() -> PathBuf {
+        TempDir::new().unwrap().path().join("review-data.sqlite3")
+    }
+
     /// A refresh with nothing listening to its progress.
     fn refresh(home: &ManagedHome, settings_path: &Path) {
-        refresh_home_on_model(home, settings_path, &|_progress| {});
+        refresh_home_on_model(home, settings_path, &no_drafts_database(), &|_progress| {});
     }
 
     /// A settings file listing `clones`.
@@ -1077,7 +1092,7 @@ mod tests {
     /// Everything a refresh reported, in the order it said it.
     fn reported_by(home: &ManagedHome, settings_path: &Path) -> Vec<dto::HomeSnapshotDto> {
         let reported = Mutex::new(Vec::new());
-        refresh_home_on_model(home, settings_path, &|shown| {
+        refresh_home_on_model(home, settings_path, &no_drafts_database(), &|shown| {
             reported.lock().unwrap().push(shown);
         });
         reported.into_inner().unwrap()
@@ -1178,7 +1193,7 @@ mod tests {
         let reports = std::sync::atomic::AtomicUsize::new(0);
 
         let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            refresh_home_on_model(&home, &settings_path, &|_shown| {
+            refresh_home_on_model(&home, &settings_path, &no_drafts_database(), &|_shown| {
                 assert!(
                     reports.fetch_add(1, Ordering::AcqRel) < 2,
                     "the refresh gave up here"
@@ -1205,7 +1220,9 @@ mod tests {
         let settings_path = settings_listing(&directory, &[&clone]);
         let home = home_with(&gh);
         let _panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            refresh_home_on_model(&home, &settings_path, &|_shown| panic!("gave up"));
+            refresh_home_on_model(&home, &settings_path, &no_drafts_database(), &|_shown| {
+                panic!("gave up")
+            });
         }));
 
         refresh(&home, &settings_path);

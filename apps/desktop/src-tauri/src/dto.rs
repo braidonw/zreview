@@ -271,6 +271,8 @@ pub struct HomeRowDto {
     pub updated_at_ms: i64,
     pub review_status: Option<RowStatusDto>,
     pub check_status: Option<RowStatusDto>,
+    /// "1 draft" or "N drafts", absent for a blank cell.
+    pub drafts: Option<String>,
 }
 
 /// One of Home's three groups, always rendered whether or not it has rows.
@@ -368,6 +370,9 @@ pub struct HomeSnapshotDto {
     /// Why the last write did not reach the file, shown as a line above the
     /// list, which stays because reading it still worked.
     pub write_failure: Option<SessionFailureDto>,
+    /// Why the last Drafts read failed, shown as a line above the list beside
+    /// the failed repositories, with every row's Drafts column left blank.
+    pub drafts_failure: Option<SessionFailureDto>,
 }
 
 /// Everything Home shows, from the model that decided it.
@@ -429,6 +434,7 @@ pub fn project_home(home: &app::HomeModel) -> HomeSnapshotDto {
             .collect(),
         failure: home.failure().map(Into::into),
         write_failure: home.write_failure().map(Into::into),
+        drafts_failure: home.drafts_failure().map(Into::into),
     }
 }
 
@@ -442,6 +448,7 @@ fn project_home_row(row: &app::HomeRow, index: u32) -> HomeRowDto {
         updated_at_ms: row.updated_at_ms,
         review_status: row.review_status.map(Into::into),
         check_status: row.check_status.map(Into::into),
+        drafts: row.drafts_label(),
     }
 }
 
@@ -899,6 +906,88 @@ mod tests {
         );
         assert_eq!(snapshot.footer_summary, "No repositories");
         assert!(snapshot.count_line.is_none());
+    }
+
+    #[test]
+    fn home_projects_a_rows_drafts_as_its_singular_or_plural_label_or_blank() {
+        let mut home = app::HomeModel::new();
+        home.refreshed(Ok(vec![app::RepositoryEntry {
+            path: std::path::PathBuf::from("/Developer/widgets"),
+            outcome: app::RepositoryOutcome::Valid {
+                root: std::path::PathBuf::from("/Developer/widgets"),
+                slug: "acme/widgets".to_owned(),
+            },
+        }]));
+        home.batch_fetched(vec![app::RepositoryFetch {
+            slug: "acme/widgets".to_owned(),
+            outcome: Ok(vec![
+                app::FetchedPullRequest {
+                    search: app::HomeSearch::ReviewRequested,
+                    repository: "acme/widgets".to_owned(),
+                    number: 412,
+                    title: "Retry webhook deliveries".to_owned(),
+                    url: "https://github.com/acme/widgets/pull/412".to_owned(),
+                    author_login: Some("mlee".to_owned()),
+                    updated_at_ms: 100,
+                    head_sha: "head".to_owned(),
+                    viewer_latest_review_sha: None,
+                    check_state: None,
+                    review_decision: None,
+                    changes_requested: false,
+                    thread_awaiting_reply: false,
+                },
+                app::FetchedPullRequest {
+                    search: app::HomeSearch::ReviewRequested,
+                    repository: "acme/widgets".to_owned(),
+                    number: 398,
+                    title: "Split the renderer".to_owned(),
+                    url: "https://github.com/acme/widgets/pull/398".to_owned(),
+                    author_login: Some("priya".to_owned()),
+                    updated_at_ms: 50,
+                    head_sha: "head".to_owned(),
+                    viewer_latest_review_sha: None,
+                    check_state: None,
+                    review_decision: None,
+                    changes_requested: false,
+                    thread_awaiting_reply: false,
+                },
+            ]),
+        }]);
+        home.drafts_read(Ok(std::collections::HashMap::from([(
+            "github:acme/widgets#412".to_owned(),
+            3,
+        )])));
+
+        let snapshot = project_home(&home);
+
+        let by_identity = |identity: &str| {
+            snapshot.groups[0]
+                .rows
+                .iter()
+                .find(|row| row.identity == identity)
+                .unwrap()
+        };
+        assert_eq!(
+            by_identity("acme/widgets#412").drafts.as_deref(),
+            Some("3 drafts")
+        );
+        assert_eq!(by_identity("acme/widgets#398").drafts, None);
+    }
+
+    #[test]
+    fn home_projects_the_drafts_failure_beside_the_failed_repository_lines() {
+        let mut home = app::HomeModel::new();
+        home.drafts_read(Err(SessionFailure::new("Drafts could not be read")));
+
+        let snapshot = project_home(&home);
+
+        assert_eq!(
+            snapshot
+                .drafts_failure
+                .expect("the failure should be shown")
+                .summary,
+            "Drafts could not be read",
+        );
     }
 
     #[test]
