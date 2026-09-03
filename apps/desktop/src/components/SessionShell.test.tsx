@@ -16,6 +16,10 @@ function baseHandlers() {
     onComposerClose: () => {},
     onComposerDiscard: () => {},
     onReanchorDraft: () => {},
+    onRunReview: () => {},
+    onCancelReview: () => {},
+    onToggleGuidanceSection: () => {},
+    onToggleGuidanceFile: () => {},
   };
 }
 
@@ -28,6 +32,8 @@ function readyState(overrides: Partial<ReadyState["file"]> = {}): ReadyState {
     anchor: 0,
     drafts: makeFile().drafts,
     composer: null,
+    panel: null,
+    panelNotice: null,
   };
 }
 

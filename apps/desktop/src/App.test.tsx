@@ -12,6 +12,7 @@ const toggleViewed = vi.fn();
 const editDraft = vi.fn();
 const discardDraft = vi.fn();
 const reanchorDraft = vi.fn();
+const reviewPanel = vi.fn();
 
 vi.mock("./bindings", () => ({
   commands: {
@@ -22,6 +23,7 @@ vi.mock("./bindings", () => ({
     editDraft: (...args: unknown[]) => editDraft(...args),
     discardDraft: (...args: unknown[]) => discardDraft(...args),
     reanchorDraft: (...args: unknown[]) => reanchorDraft(...args),
+    reviewPanel: () => reviewPanel(),
   },
 }));
 
@@ -41,6 +43,8 @@ beforeEach(() => {
   editDraft.mockReset();
   discardDraft.mockReset();
   reanchorDraft.mockReset();
+  reviewPanel.mockReset();
+  reviewPanel.mockResolvedValue({ status: "ok", data: null });
   writeText.mockReset();
 });
 

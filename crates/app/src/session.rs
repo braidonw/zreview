@@ -237,7 +237,7 @@ impl SessionModel {
         let SessionPhase::Ready(review) = phase else {
             return FindingDisposition::Unknown;
         };
-        match review.session.accept_finding(id) {
+        let disposition = match review.session.accept_finding(id) {
             FindingAcceptance::Drafted { anchor, body } => {
                 let provenance = review
                     .session
@@ -282,7 +282,11 @@ impl SessionModel {
                 FindingDisposition::Summary { body: merged }
             }
             FindingAcceptance::Unknown => FindingDisposition::Unknown,
+        };
+        if !matches!(disposition, FindingDisposition::Unknown) {
+            review.touch();
         }
+        disposition
     }
 
     /// Rejects a claim and remembers the decision, so a re-run does not offer it
@@ -303,6 +307,7 @@ impl SessionModel {
         {
             sink.dismiss_finding(head_sha, &fingerprint);
         }
+        review.touch();
         true
     }
 
@@ -343,6 +348,7 @@ impl SessionModel {
             detail: "Starting...".to_owned(),
             cancel,
         };
+        review.touch();
     }
 
     /// Publishes the backend's latest progress line, reporting whether it changed.
@@ -362,6 +368,7 @@ impl SessionModel {
             return false;
         }
         *detail = line;
+        review.touch();
         true
     }
 
@@ -387,6 +394,7 @@ impl SessionModel {
         // The disclosure has served its purpose; the findings are what the reviewer
         // wants the space for now. The summary line stays visible either way.
         review.guidance_expanded = false;
+        review.touch();
     }
 
     /// Reports a run that produced nothing, with what to do about it.
@@ -398,6 +406,7 @@ impl SessionModel {
             summary: summary.into(),
             remediation,
         };
+        review.touch();
     }
 
     /// Asks the running review to stop.
@@ -414,6 +423,7 @@ impl SessionModel {
             return;
         };
         review.guidance_expanded = !review.guidance_expanded;
+        review.touch();
     }
 
     /// Turns one guidance file on or off for the next run.
@@ -424,7 +434,11 @@ impl SessionModel {
         let SessionPhase::Ready(review) = &mut self.phase else {
             return false;
         };
-        review.session.toggle_guidance(path).is_some()
+        let toggled = review.session.toggle_guidance(path).is_some();
+        if toggled {
+            review.touch();
+        }
+        toggled
     }
 
     /// Switches the displayed file, reporting whether it moved.
@@ -1061,6 +1075,118 @@ mod tests {
 
         model.cancel_review();
         assert!(cancel.load(Ordering::Relaxed));
+    }
+
+    /// Asserts the revision moved, and hands back the new one.
+    fn bumped(model: &SessionModel, previous: u32, what: &str) -> u32 {
+        let revision = review(model).revision();
+        assert!(revision > previous, "{what} did not bump the revision");
+        revision
+    }
+
+    /// The panel reaches a front end from several commands at once, and one that
+    /// read the model before a change can be delivered after it. Dropping the
+    /// stale one needs a number that only ever goes up.
+    #[test]
+    fn every_change_the_panel_shows_bumps_the_revision() {
+        let mut session = repository_backed_session(&["src/review.rs"]);
+        session.set_guidance(guidance_selection());
+        let mut model = loaded_model(session, None, None);
+        let mut revision = review(&model).revision();
+
+        model.toggle_guidance_panel();
+        revision = bumped(&model, revision, "opening the guidance section");
+
+        assert!(model.toggle_guidance("AGENTS.md"));
+        revision = bumped(&model, revision, "turning a guidance file off");
+
+        model.review_started(Arc::new(AtomicBool::new(false)));
+        revision = bumped(&model, revision, "starting a run");
+
+        assert!(model.review_progress("Reading the diff"));
+        revision = bumped(&model, revision, "a progress line");
+
+        assert!(!model.review_progress("Reading the diff"));
+        assert_eq!(
+            review(&model).revision(),
+            revision,
+            "a line that did not move is not a change"
+        );
+
+        model.review_failed("claude is not installed", None);
+        revision = bumped(&model, revision, "a failed run");
+
+        model.review_started(Arc::new(AtomicBool::new(false)));
+        revision = bumped(&model, revision, "starting a second run");
+
+        model.review_finished(Findings::default(), Vec::new());
+        revision = bumped(&model, revision, "a completed run");
+
+        let id = give_one_finding(&mut model, "risky() is unchecked");
+        revision = bumped(&model, revision, "findings arriving");
+
+        assert!(model.dismiss_finding(id));
+        revision = bumped(&model, revision, "dismissing a finding");
+
+        let id = give_one_finding(&mut model, "still risky");
+        revision = bumped(&model, revision, "findings arriving again");
+
+        assert_eq!(model.accept_finding(id), FindingDisposition::Drafted);
+        bumped(&model, revision, "accepting a finding");
+    }
+
+    /// The panel shows the latest line, so a report that arrives once the run is
+    /// over must not make a finished review look like it is still going.
+    #[test]
+    fn progress_lands_only_while_a_run_is_in_flight() {
+        let mut model = ready_model(None);
+
+        assert!(
+            !model.review_progress("Starting claude"),
+            "nothing is running yet"
+        );
+
+        model.review_started(Arc::new(AtomicBool::new(false)));
+        assert!(model.review_progress("Starting claude"));
+        assert!(
+            !model.review_progress("Starting claude"),
+            "the same line again is not worth a redraw"
+        );
+        let ReviewRunState::Running { detail, .. } = review(&model).run() else {
+            panic!("the run should be in flight");
+        };
+        assert_eq!(detail, "Starting claude");
+
+        model.review_finished(Findings::default(), Vec::new());
+        assert!(!model.review_progress("Reading the diff"));
+    }
+
+    /// A run that skipped files must not present itself as having covered the
+    /// change, and a run that suppressed claims must not look like one that
+    /// found nothing.
+    #[test]
+    fn a_completed_run_keeps_its_counts_and_what_it_did_not_see() {
+        let mut model = ready_model(None);
+        model.review_started(Arc::new(AtomicBool::new(false)));
+
+        model.review_finished(
+            Findings::default(),
+            vec!["vendor/lib.rs".to_owned(), "huge.json".to_owned()],
+        );
+
+        let ReviewRunState::Complete {
+            accepted,
+            rejected,
+            suppressed,
+            unreviewed,
+        } = review(&model).run()
+        else {
+            panic!("the run should have completed");
+        };
+        assert_eq!(*accepted, 0);
+        assert_eq!(*rejected, 0);
+        assert_eq!(*suppressed, 0);
+        assert_eq!(unreviewed, &["vendor/lib.rs", "huge.json"]);
     }
 
     #[test]
