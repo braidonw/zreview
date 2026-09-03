@@ -5,7 +5,10 @@
 //! arrives already read and already validated, so this model is all decisions
 //! and no I/O, and effects on the file come back as return values.
 
-use std::path::{Path, PathBuf};
+use std::{
+    collections::HashMap,
+    path::{Path, PathBuf},
+};
 
 use domain::SessionFailure;
 
@@ -225,6 +228,10 @@ pub struct HomeRow {
     pub updated_at_ms: i64,
     pub review_status: Option<ReviewStatus>,
     pub check_status: Option<CheckStatus>,
+    /// Unsent Drafts on this pull request, regardless of which head they were
+    /// written against. Absent means none, and a store failure blanks it too,
+    /// so neither reads as a zero.
+    pub drafts: Option<usize>,
 }
 
 impl HomeRow {
@@ -232,6 +239,24 @@ impl HomeRow {
     #[must_use]
     pub fn identity(&self) -> String {
         format!("{}#{}", self.repository, self.number)
+    }
+
+    /// The scope this row's Drafts are stored under.
+    #[must_use]
+    pub fn draft_scope(&self) -> String {
+        domain::github_draft_scope(&self.repository, self.number)
+    }
+
+    /// "1 draft" or "N drafts", the words the badge shows, absent for a blank cell.
+    #[must_use]
+    pub fn drafts_label(&self) -> Option<String> {
+        self.drafts.map(|count| {
+            if count == 1 {
+                "1 draft".to_owned()
+            } else {
+                format!("{count} drafts")
+            }
+        })
     }
 }
 
@@ -277,6 +302,9 @@ pub struct HomeModel {
     /// giving up part way.
     refresh_failure: Option<SessionFailure>,
     write_failure: Option<SessionFailure>,
+    /// Why the last Drafts read failed, if it did. Left standing until a read
+    /// that succeeds, unlike a row's own count, which a failure blanks at once.
+    drafts_failure: Option<SessionFailure>,
     footer_expanded: bool,
     refusals: Vec<Refusal>,
     /// Every listed row, in the order Home renders them, which is also the
@@ -560,6 +588,36 @@ impl HomeModel {
         self.write_failure.as_ref()
     }
 
+    /// Takes what a refresh's Drafts read found, keyed by [`HomeRow::draft_scope`],
+    /// or the failure that stopped it reading.
+    ///
+    /// A failure blanks every row rather than leaving stale counts standing, so
+    /// a Drafts column never shows a number the store could not back up. A
+    /// scope absent from a successful read means that pull request has no
+    /// Drafts, not that its column keeps whatever it last showed.
+    pub fn drafts_read(&mut self, result: Result<HashMap<String, usize>, SessionFailure>) {
+        match result {
+            Ok(counts) => {
+                for row in &mut self.rows {
+                    row.drafts = counts.get(&row.draft_scope()).copied();
+                }
+                self.drafts_failure = None;
+            }
+            Err(failure) => {
+                for row in &mut self.rows {
+                    row.drafts = None;
+                }
+                self.drafts_failure = Some(failure);
+            }
+        }
+    }
+
+    /// Why the last Drafts read failed, if it did.
+    #[must_use]
+    pub fn drafts_failure(&self) -> Option<&SessionFailure> {
+        self.drafts_failure.as_ref()
+    }
+
     /// How many configured clones list nothing, from either cause.
     #[must_use]
     pub fn failed_count(&self) -> usize {
@@ -816,6 +874,7 @@ fn into_row(fetched: FetchedPullRequest) -> HomeRow {
         url: fetched.url,
         author_login: fetched.author_login,
         updated_at_ms: fetched.updated_at_ms,
+        drafts: None,
     }
 }
 
@@ -2159,5 +2218,81 @@ mod tests {
         home.write_finished(Ok(()));
 
         assert!(home.write_failure().is_none());
+    }
+
+    #[test]
+    fn a_row_with_drafts_against_an_older_head_still_shows_the_count() {
+        let mut home = listing(vec![fetched(HomeSearch::ReviewRequested, 412, 100)]);
+        home.drafts_read(Ok(HashMap::from([(
+            "github:acme/widgets#412".to_owned(),
+            3,
+        )])));
+
+        assert_eq!(only_row(&home).drafts, Some(3));
+    }
+
+    #[test]
+    fn a_row_with_no_drafts_shows_a_blank_cell() {
+        let mut home = listing(vec![fetched(HomeSearch::ReviewRequested, 412, 100)]);
+
+        home.drafts_read(Ok(HashMap::new()));
+
+        assert_eq!(only_row(&home).drafts, None);
+    }
+
+    #[test]
+    fn a_store_failure_blanks_every_row_and_names_the_reason_above_the_list() {
+        let mut home = listing(vec![
+            fetched(HomeSearch::ReviewRequested, 412, 100),
+            fetched(HomeSearch::ReviewRequested, 398, 200),
+        ]);
+        home.drafts_read(Ok(HashMap::from([(
+            "github:acme/widgets#412".to_owned(),
+            2,
+        )])));
+
+        home.drafts_read(Err(SessionFailure::new("Drafts could not be read")));
+
+        assert!(home.rows().iter().all(|row| row.drafts.is_none()));
+        assert_eq!(
+            home.drafts_failure()
+                .expect("the failure should show")
+                .summary,
+            "Drafts could not be read",
+        );
+    }
+
+    #[test]
+    fn a_read_that_succeeds_after_a_failure_clears_it() {
+        let mut home = listing(vec![fetched(HomeSearch::ReviewRequested, 412, 100)]);
+        home.drafts_read(Err(SessionFailure::new("Drafts could not be read")));
+
+        home.drafts_read(Ok(HashMap::from([(
+            "github:acme/widgets#412".to_owned(),
+            1,
+        )])));
+
+        assert!(home.drafts_failure().is_none());
+        assert_eq!(only_row(&home).drafts, Some(1));
+    }
+
+    #[test]
+    fn every_draft_count_reads_as_its_singular_or_plural_label() {
+        let mut home = listing(vec![fetched(HomeSearch::ReviewRequested, 412, 100)]);
+
+        home.drafts_read(Ok(HashMap::from([(
+            "github:acme/widgets#412".to_owned(),
+            1,
+        )])));
+        assert_eq!(only_row(&home).drafts_label().as_deref(), Some("1 draft"));
+
+        home.drafts_read(Ok(HashMap::from([(
+            "github:acme/widgets#412".to_owned(),
+            4,
+        )])));
+        assert_eq!(only_row(&home).drafts_label().as_deref(), Some("4 drafts"));
+
+        home.drafts_read(Ok(HashMap::new()));
+        assert_eq!(only_row(&home).drafts_label(), None);
     }
 }
