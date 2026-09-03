@@ -329,6 +329,14 @@ fn toggle_viewed_on_model(
     Ok(dto::project_sidebar(review.session()))
 }
 
+/// The Session's review panel, from an already-locked model.
+///
+/// Absent while the session is loading or failed, and for a snapshot with no
+/// commit behind it, which cannot be reviewed at all.
+fn panel_of(model: &app::SessionModel) -> Option<dto::ReviewPanelDto> {
+    model.review().and_then(dto::project_panel)
+}
+
 /// Projects the drafts on `file_index` from an already-locked, `Ready` model.
 ///
 /// # Panics
@@ -2396,5 +2404,91 @@ mod tests {
             1,
             "the late reanchor must not have moved it"
         );
+    }
+
+    /// The repository the review tests run against: two changed files, guidance
+    /// the panel can list, a candidate too large to send, and one file
+    /// configuration keeps out of the review.
+    fn guided_repository() -> TempDir {
+        let repository = temporary_repository();
+        let path = repository.path();
+        git(path, ["checkout", "--quiet", "feature"]);
+        std::fs::create_dir_all(path.join("vendor")).unwrap();
+        std::fs::write(path.join("vendor/lib.rs"), "generated\n").unwrap();
+        git(path, ["add", "."]);
+        git(path, ["commit", "--quiet", "-m", "vendor"]);
+        git(path, ["checkout", "--quiet", "main"]);
+        std::fs::write(path.join("AGENTS.md"), "Never use unwrap.\n").unwrap();
+        std::fs::write(path.join("CLAUDE.md"), "x".repeat(review::MAX_FILE_BYTES + 1)).unwrap();
+        std::fs::write(
+            path.join(".zreview.toml"),
+            "[review]\nexclude_files = [\"vendor/**\"]\n",
+        )
+        .unwrap();
+        repository
+    }
+
+    #[test]
+    fn the_panel_lists_the_guidance_a_run_would_be_held_to() {
+        let repository = guided_repository();
+        let model = local_model(&local_request(&repository), &ReviewStorage::Disabled);
+
+        let panel = panel_of(&lock(&model)).expect("a repository-backed session can be reviewed");
+
+        assert_eq!(panel.heading, "Review");
+        assert!(matches!(panel.run, dto::ReviewRunDto::Idle));
+        assert!(panel.footer.is_none());
+        let note = panel.note.expect("an idle panel says no review has been run");
+        assert_eq!(note.heading, "No review has been run.");
+
+        let dto::GuidanceDto::Discovered {
+            summary,
+            expanded,
+            entries,
+            skipped,
+            excluded,
+        } = panel.guidance
+        else {
+            panic!("guidance was discovered");
+        };
+        assert!(expanded, "open before the first run");
+        assert_eq!(summary, "1 guidance file \u{00B7} 0 KB");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].path, "AGENTS.md");
+        assert_eq!(entries[0].scope, "whole repository");
+        assert!(entries[0].included);
+        assert_eq!(skipped.len(), 1);
+        assert_eq!(skipped[0].path, "CLAUDE.md");
+        assert!(skipped[0].reason.contains("over the 65536-byte limit"));
+        assert_eq!(
+            excluded.as_deref(),
+            Some("1 file excluded from review by .zreview.toml")
+        );
+    }
+
+    /// "None found" must not look like "never looked".
+    #[test]
+    fn a_repository_that_states_no_conventions_says_so_rather_than_showing_nothing() {
+        let repository = temporary_repository();
+        let model = local_model(&local_request(&repository), &ReviewStorage::Disabled);
+
+        let panel = panel_of(&lock(&model)).expect("a repository-backed session can be reviewed");
+
+        let dto::GuidanceDto::NothingFound { note } = panel.guidance else {
+            panic!("nothing was discovered");
+        };
+        assert_eq!(
+            note,
+            "No guidance files found. The review will judge the diff alone."
+        );
+    }
+
+    /// The generated fixture has no commit, so there are no anchors to validate
+    /// findings against and nothing to put a panel on.
+    #[test]
+    fn the_generated_fixture_offers_no_panel() {
+        let model = loaded_model();
+
+        assert!(panel_of(&lock(&model)).is_none());
     }
 }

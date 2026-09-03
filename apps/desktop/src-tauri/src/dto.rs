@@ -4,10 +4,10 @@
 //! `&SessionFailure`) and returns a value, which is what keeps them testable
 //! without a running app.
 
-use app::PullRequestId;
+use app::{PullRequestId, ReviewModel, ReviewRunState};
 use domain::{
-    DiffFile, DiffLineKind, DiffSide, EmptyDiffReason, FileStatus, ReviewSession, SessionFailure,
-    SessionSource,
+    DiffFile, DiffLineKind, DiffSide, EmptyDiffReason, FileStatus, GuidanceSelection, ReviewSession,
+    SessionFailure, SessionSource,
 };
 use serde::{Deserialize, Serialize};
 
@@ -207,6 +207,98 @@ pub struct FileDetailDto {
     pub rows: Vec<RowDto>,
     pub drafts: DraftsDto,
     pub empty_reason: Option<EmptyReasonDto>,
+}
+
+/// One guidance file discovery found, as the panel draws its row.
+#[derive(Clone, Debug, Serialize, specta::Type)]
+pub struct GuidanceEntryDto {
+    /// Repository-relative path, which is also how a finding cites it.
+    pub path: String,
+    /// What it applies to, already rendered, e.g. "whole repository".
+    pub scope: String,
+    pub kilobytes: u32,
+    /// Whether the next run will send it.
+    pub included: bool,
+}
+
+/// Something discovery found and will not use, and why.
+#[derive(Clone, Debug, Serialize, specta::Type)]
+pub struct GuidanceSkipDto {
+    pub path: String,
+    pub reason: String,
+}
+
+/// The guidance section at the top of the panel.
+#[derive(Clone, Debug, Serialize, specta::Type)]
+#[serde(tag = "kind")]
+pub enum GuidanceDto {
+    /// Discovery ran and found nothing. Saying so is not the same as showing
+    /// nothing: a reviewer needs to tell "this repository states no conventions"
+    /// from "guidance was never looked for".
+    NothingFound { note: String },
+    Discovered {
+        /// The one line that stays on screen whether or not the section is open.
+        summary: String,
+        expanded: bool,
+        entries: Vec<GuidanceEntryDto>,
+        skipped: Vec<GuidanceSkipDto>,
+        /// What configuration keeps out of the review, when it keeps anything out.
+        excluded: Option<String>,
+    },
+}
+
+/// How far the current review run has got.
+#[derive(Clone, Debug, Serialize, specta::Type)]
+#[serde(tag = "state")]
+pub enum ReviewRunDto {
+    Idle,
+    Running {
+        /// The backend's most recent progress line.
+        detail: String,
+    },
+    Complete {
+        accepted: u32,
+        rejected: u32,
+        /// Claims suppressed because the reviewer dismissed them before.
+        suppressed: u32,
+        /// Files the run did not see.
+        unreviewed: Vec<String>,
+    },
+    Failed {
+        summary: String,
+        remediation: Option<String>,
+    },
+}
+
+/// What the panel says when there is no finding to show.
+///
+/// Every run state has one. An empty panel with no explanation is the failure
+/// this projection exists to avoid.
+#[derive(Clone, Debug, Serialize, specta::Type)]
+pub struct PanelNoteDto {
+    pub heading: String,
+    pub detail: Option<String>,
+}
+
+/// The caveats under the panel: what was refused, and what was never looked at.
+#[derive(Clone, Debug, Serialize, specta::Type)]
+pub struct PanelFooterDto {
+    /// Claims that did not survive checking against the diff.
+    pub refused: Option<String>,
+    /// Present when a completed run did not see the whole change.
+    pub not_reviewed: Option<String>,
+}
+
+/// The Session's right-hand panel: what a review is held to, and how far the run
+/// that populates it has got.
+#[derive(Clone, Debug, Serialize, specta::Type)]
+pub struct ReviewPanelDto {
+    /// "Review" before there is anything to act on, otherwise the finding count.
+    pub heading: String,
+    pub guidance: GuidanceDto,
+    pub run: ReviewRunDto,
+    pub note: Option<PanelNoteDto>,
+    pub footer: Option<PanelFooterDto>,
 }
 
 #[derive(Clone, Debug, Serialize, specta::Type)]
@@ -647,6 +739,172 @@ pub fn project_drafts(session: &ReviewSession, file_index: usize) -> DraftsDto {
         file_draft_count,
         write_failure: None,
     }
+}
+
+/// The Session's review panel, or `None` when this session has nothing to put one
+/// on.
+///
+/// Mirrors `crates/ui/src/findings.rs`, which is the parity target: the same copy
+/// in the same order, read off the same model. The findings list itself is not
+/// projected yet.
+#[must_use]
+pub fn project_panel(review: &ReviewModel) -> Option<ReviewPanelDto> {
+    if !review.findings_panel_visible() {
+        return None;
+    }
+    let session = review.session();
+    let run = review.run();
+    Some(ReviewPanelDto {
+        heading: match session.findings().len() {
+            0 => "Review".to_owned(),
+            1 => "1 finding".to_owned(),
+            many => format!("{many} findings"),
+        },
+        guidance: project_guidance(session.guidance(), review.guidance_expanded()),
+        run: project_run(run),
+        note: project_note(session, run),
+        footer: project_footer(session, run),
+    })
+}
+
+fn project_guidance(guidance: &GuidanceSelection, expanded: bool) -> GuidanceDto {
+    if guidance.is_empty() {
+        return GuidanceDto::NothingFound {
+            note: "No guidance files found. The review will judge the diff alone.".to_owned(),
+        };
+    }
+    let count = guidance.included_count();
+    let kilobytes = guidance.included_bytes() / 1024;
+    let excluded = guidance.excluded_paths().len();
+    GuidanceDto::Discovered {
+        summary: if count == 0 {
+            "No guidance will be sent".to_owned()
+        } else {
+            format!(
+                "{count} guidance file{} \u{00B7} {kilobytes} KB",
+                plural(count)
+            )
+        },
+        expanded,
+        entries: guidance
+            .entries()
+            .iter()
+            .map(|entry| GuidanceEntryDto {
+                path: entry.path().to_string(),
+                scope: entry.excerpt.scope.to_string(),
+                kilobytes: as_u32(entry.bytes() / 1024),
+                included: entry.included,
+            })
+            .collect(),
+        skipped: guidance
+            .skipped()
+            .iter()
+            .map(|skip| GuidanceSkipDto {
+                path: skip.path.to_string(),
+                reason: skip.reason.to_string(),
+            })
+            .collect(),
+        excluded: (excluded > 0).then(|| {
+            format!(
+                "{excluded} file{} excluded from review by .zreview.toml",
+                plural(excluded)
+            )
+        }),
+    }
+}
+
+/// The plural suffix for a count, so no line ever reads "1 files".
+const fn plural(count: usize) -> &'static str {
+    if count == 1 { "" } else { "s" }
+}
+
+fn project_run(run: &ReviewRunState) -> ReviewRunDto {
+    match run {
+        ReviewRunState::Idle => ReviewRunDto::Idle,
+        ReviewRunState::Running { detail, .. } => ReviewRunDto::Running {
+            detail: detail.clone(),
+        },
+        ReviewRunState::Complete {
+            accepted,
+            rejected,
+            suppressed,
+            unreviewed,
+        } => ReviewRunDto::Complete {
+            accepted: as_u32(*accepted),
+            rejected: as_u32(*rejected),
+            suppressed: as_u32(*suppressed),
+            unreviewed: unreviewed.clone(),
+        },
+        ReviewRunState::Failed {
+            summary,
+            remediation,
+        } => ReviewRunDto::Failed {
+            summary: summary.clone(),
+            remediation: remediation.clone(),
+        },
+    }
+}
+
+/// What to say when there is no finding to show.
+///
+/// Every run state says something. An empty panel with no explanation is the
+/// failure this projection exists to avoid.
+fn project_note(session: &ReviewSession, run: &ReviewRunState) -> Option<PanelNoteDto> {
+    if !session.findings().is_empty() {
+        return None;
+    }
+    let (heading, detail) = match run {
+        ReviewRunState::Idle => (
+            "No review has been run.".to_owned(),
+            Some("Press Review to check this change against the repository's guidance.".to_owned()),
+        ),
+        ReviewRunState::Running { .. } => ("Reviewing...".to_owned(), None),
+        ReviewRunState::Complete {
+            rejected,
+            suppressed,
+            ..
+        } => (
+            "Nothing to act on.".to_owned(),
+            Some(nothing_to_act_on(*rejected, *suppressed)),
+        ),
+        ReviewRunState::Failed {
+            summary,
+            remediation,
+        } => (summary.clone(), remediation.clone()),
+    };
+    Some(PanelNoteDto { heading, detail })
+}
+
+/// Why a completed run left nothing to act on.
+fn nothing_to_act_on(rejected: usize, suppressed: usize) -> String {
+    match (rejected, suppressed) {
+        (0, 0) => "The review found no problems.".to_owned(),
+        (rejected, 0) => format!("{rejected} claim(s) did not survive checking against the diff."),
+        (0, suppressed) => format!("{suppressed} previously dismissed claim(s) were hidden."),
+        (rejected, suppressed) => format!(
+            "{rejected} claim(s) did not check out and {suppressed} were previously dismissed."
+        ),
+    }
+}
+
+/// The caveats: what was refused, and what was never looked at.
+fn project_footer(session: &ReviewSession, run: &ReviewRunState) -> Option<PanelFooterDto> {
+    let rejected = session.findings().rejected().len();
+    let refused = (rejected > 0).then(|| format!("{rejected} claim(s) refused"));
+    let ReviewRunState::Complete { unreviewed, .. } = run else {
+        return refused.map(|refused| PanelFooterDto {
+            refused: Some(refused),
+            not_reviewed: None,
+        });
+    };
+    if rejected == 0 && unreviewed.is_empty() {
+        return None;
+    }
+    Some(PanelFooterDto {
+        refused,
+        not_reviewed: (!unreviewed.is_empty())
+            .then(|| format!("{} file(s) not reviewed", unreviewed.len())),
+    })
 }
 
 #[cfg(test)]
