@@ -55,11 +55,6 @@ impl RepositoryEntry {
             RepositoryOutcome::Failed { .. } => None,
         }
     }
-
-    #[must_use]
-    const fn is_failed(&self) -> bool {
-        matches!(self.outcome, RepositoryOutcome::Failed { .. })
-    }
 }
 
 /// Something Home would not do, and why.
@@ -116,6 +111,160 @@ impl HomeGroup {
     }
 }
 
+/// Which of Home's two searches a pull request came back from.
+///
+/// The search is what decides whether a row is one the reviewer was asked to
+/// look at or one of their own, which no field on the pull request says.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum HomeSearch {
+    ReviewRequested,
+    Authored,
+}
+
+/// GitHub's combined state for every check on a head commit.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CheckState {
+    Expected,
+    Error,
+    Failure,
+    Pending,
+    Success,
+}
+
+/// GitHub's standing verdict on a pull request, folding in branch protection.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ReviewDecision {
+    ChangesRequested,
+    Approved,
+    ReviewRequired,
+}
+
+/// One fetched pull request, carrying only what grouping and rows read.
+///
+/// Deliberately not the forge's own type. Whoever fetches reduces threads and
+/// reviews to the two questions grouping asks of them, which keeps this model
+/// free of the API those answers came from.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FetchedPullRequest {
+    pub search: HomeSearch,
+    /// `owner/name`, which is also what the row's identity reads.
+    pub repository: String,
+    pub number: u64,
+    pub title: String,
+    pub url: String,
+    /// `None` once GitHub has forgotten the account.
+    pub author_login: Option<String>,
+    pub updated_at_ms: i64,
+    pub head_sha: String,
+    /// The commit the viewer's own latest review was left against.
+    pub viewer_latest_review_sha: Option<String>,
+    /// `None` when the head has no checks at all, which reads differently from
+    /// a pending one.
+    pub check_state: Option<CheckState>,
+    pub review_decision: Option<ReviewDecision>,
+    /// Whether any standing review asks the author for changes.
+    pub changes_requested: bool,
+    /// Whether any unresolved thread was last spoken in by somebody else.
+    pub thread_awaiting_reply: bool,
+}
+
+/// What one repository's fetch found, or why it found nothing.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RepositoryFetch {
+    pub slug: String,
+    pub outcome: Result<Vec<FetchedPullRequest>, String>,
+}
+
+/// What a row says about its checks, or nothing when there are none.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CheckStatus {
+    Passing,
+    Failing,
+    Running,
+}
+
+impl CheckStatus {
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Passing => "checks passing",
+            Self::Failing => "checks failing",
+            Self::Running => "checks running",
+        }
+    }
+}
+
+/// What a row says about its reviews, or nothing when it has none to report.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ReviewStatus {
+    ChangesRequested,
+    Approved,
+    ReviewedThisHead,
+}
+
+impl ReviewStatus {
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::ChangesRequested => "changes requested",
+            Self::Approved => "approved",
+            Self::ReviewedThisHead => "you reviewed this head",
+        }
+    }
+}
+
+/// One pull request as Home lists it, in the group it belongs to.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HomeRow {
+    pub group: HomeGroup,
+    pub repository: String,
+    pub number: u64,
+    pub title: String,
+    pub url: String,
+    pub author_login: Option<String>,
+    pub updated_at_ms: i64,
+    pub review_status: Option<ReviewStatus>,
+    pub check_status: Option<CheckStatus>,
+}
+
+impl HomeRow {
+    /// `owner/name#number`, which is how a row names its pull request.
+    #[must_use]
+    pub fn identity(&self) -> String {
+        format!("{}#{}", self.repository, self.number)
+    }
+}
+
+/// One configured repository whose pull requests could not be fetched.
+///
+/// Named by path as well as by slug, because the line it shows carries Remove,
+/// and Remove names the entry the settings file holds.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FetchFailure {
+    pub path: PathBuf,
+    pub slug: String,
+    pub reason: String,
+}
+
+/// How current the list is, which the header stamp reads.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum RefreshState {
+    /// Nothing has been fetched yet, so there is no stamp to show.
+    #[default]
+    NeverRefreshed,
+    Refreshing {
+        done: usize,
+        total: usize,
+    },
+    /// Epoch milliseconds at which the last refresh settled.
+    Refreshed {
+        at_ms: i64,
+    },
+    /// Nothing loaded at all, from the preflight, the settings file, or every
+    /// configured repository failing.
+    Failed,
+}
+
 /// Everything Home is, and every action that changes it.
 ///
 /// Held behind a lock and shared by whatever is displaying it, as the session
@@ -123,10 +272,21 @@ impl HomeGroup {
 #[derive(Debug, Default)]
 pub struct HomeModel {
     repositories: Vec<RepositoryEntry>,
-    failure: Option<SessionFailure>,
+    settings_failure: Option<SessionFailure>,
+    preflight_failure: Option<SessionFailure>,
     write_failure: Option<SessionFailure>,
     footer_expanded: bool,
     refusals: Vec<Refusal>,
+    /// Every listed row, in the order Home renders them, which is also the
+    /// order the cursor walks.
+    rows: Vec<HomeRow>,
+    fetch_failures: Vec<FetchFailure>,
+    refresh: RefreshState,
+    cursor: usize,
+    /// How many repositories this refresh has loaded and lost, which is what
+    /// separates "nothing loaded" from a list with a hole in it.
+    loaded_repositories: usize,
+    failed_repositories: usize,
 }
 
 impl HomeModel {
@@ -144,13 +304,194 @@ impl HomeModel {
         match result {
             Ok(repositories) => {
                 self.repositories = repositories;
-                self.failure = None;
+                self.settings_failure = None;
+                self.drop_unlisted_rows();
             }
             Err(failure) => {
                 self.repositories.clear();
-                self.failure = Some(failure);
+                self.settings_failure = Some(failure);
+                self.rows.clear();
+                self.fetch_failures.clear();
+                self.refresh = RefreshState::Failed;
             }
         }
+        self.clamp_cursor();
+    }
+
+    /// Starts a refresh, or leaves the one already running alone.
+    ///
+    /// Returns `false` for a trigger that arrived mid-refresh, which is ignored
+    /// rather than queued, so two refreshes never race.
+    pub fn begin_refresh(&mut self) -> bool {
+        if matches!(self.refresh, RefreshState::Refreshing { .. }) {
+            return false;
+        }
+        self.preflight_failure = None;
+        self.refresh = RefreshState::Refreshing { done: 0, total: 0 };
+        true
+    }
+
+    /// Stops the refresh before it fetched anything, `gh` being unusable.
+    ///
+    /// The list stays as it was, because nothing about it has been disproved.
+    /// It is the failure block in front of it that says why it is not moving.
+    pub fn preflight_failed(&mut self, failure: SessionFailure) {
+        self.preflight_failure = Some(failure);
+        self.refresh = RefreshState::Failed;
+    }
+
+    /// Says how many repositories this refresh is about to fetch.
+    ///
+    /// The rows the last refresh listed go now, because from here on this one's
+    /// rows arrive a batch at a time and the two must not be mixed.
+    pub fn fetching(&mut self, total: usize) {
+        self.rows.clear();
+        self.fetch_failures.clear();
+        self.loaded_repositories = 0;
+        self.failed_repositories = 0;
+        self.refresh = RefreshState::Refreshing { done: 0, total };
+        self.clamp_cursor();
+    }
+
+    /// Takes what one batch of repositories found, advancing the progress count.
+    pub fn batch_fetched(&mut self, batch: Vec<RepositoryFetch>) {
+        for fetch in batch {
+            match fetch.outcome {
+                Ok(pull_requests) => {
+                    self.loaded_repositories += 1;
+                    self.rows.extend(pull_requests.into_iter().map(into_row));
+                }
+                Err(reason) => {
+                    self.failed_repositories += 1;
+                    self.record_fetch_failure(&fetch.slug, &reason);
+                }
+            }
+            self.advance_progress();
+        }
+        self.order_rows();
+        self.clamp_cursor();
+    }
+
+    /// Ends the refresh, settled at `at_ms` or failed with nothing to show.
+    ///
+    /// A refresh that reached no repository at all is not a failure. There was
+    /// nothing configured to fail.
+    pub fn finish_refresh(&mut self, at_ms: i64) {
+        self.refresh = if self.loaded_repositories == 0 && self.failed_repositories > 0 {
+            RefreshState::Failed
+        } else {
+            RefreshState::Refreshed { at_ms }
+        };
+    }
+
+    #[must_use]
+    pub const fn refresh_state(&self) -> RefreshState {
+        self.refresh
+    }
+
+    /// Every listed row, in the order Home renders them.
+    #[must_use]
+    pub fn rows(&self) -> &[HomeRow] {
+        &self.rows
+    }
+
+    /// The rows in one group, newest updated first.
+    pub fn rows_in(&self, group: HomeGroup) -> impl Iterator<Item = &HomeRow> {
+        self.rows.iter().filter(move |row| row.group == group)
+    }
+
+    /// Every configured repository this refresh could not fetch.
+    #[must_use]
+    pub fn fetch_failures(&self) -> &[FetchFailure] {
+        &self.fetch_failures
+    }
+
+    /// Why the clone listed at `path` shows nothing, from resolving it or from
+    /// fetching it.
+    #[must_use]
+    pub fn repository_failure(&self, path: &Path) -> Option<&str> {
+        self.repositories
+            .iter()
+            .find(|entry| entry.path == path)
+            .and_then(|entry| {
+                entry.reason().or_else(|| {
+                    self.fetch_failures
+                        .iter()
+                        .find(|failure| Some(failure.slug.as_str()) == entry.slug())
+                        .map(|failure| failure.reason.as_str())
+                })
+            })
+    }
+
+    /// Where the cursor sits, as a flat index across every rendered row.
+    #[must_use]
+    pub const fn cursor(&self) -> usize {
+        self.cursor
+    }
+
+    /// Moves the cursor one row down, stopping at the last one.
+    pub fn move_cursor_down(&mut self) {
+        self.cursor = (self.cursor + 1).min(self.rows.len().saturating_sub(1));
+    }
+
+    /// Moves the cursor one row up, stopping at the first one.
+    pub const fn move_cursor_up(&mut self) {
+        self.cursor = self.cursor.saturating_sub(1);
+    }
+
+    /// Files every fetched repository's failure against every clone that points
+    /// at it, so two checkouts of one repository each say why they are empty.
+    fn record_fetch_failure(&mut self, slug: &str, reason: &str) {
+        let paths = self
+            .repositories
+            .iter()
+            .filter(|entry| entry.slug() == Some(slug))
+            .map(|entry| entry.path.clone())
+            .collect::<Vec<_>>();
+        self.fetch_failures
+            .extend(paths.into_iter().map(|path| FetchFailure {
+                path,
+                slug: slug.to_owned(),
+                reason: reason.to_owned(),
+            }));
+    }
+
+    fn advance_progress(&mut self) {
+        if let RefreshState::Refreshing { done, total } = self.refresh {
+            self.refresh = RefreshState::Refreshing {
+                done: (done + 1).min(total),
+                total,
+            };
+        }
+    }
+
+    /// Groups in their fixed order, and within a group the newest update first.
+    fn order_rows(&mut self) {
+        self.rows.sort_by(|left, right| {
+            group_order(left.group)
+                .cmp(&group_order(right.group))
+                .then(right.updated_at_ms.cmp(&left.updated_at_ms))
+        });
+    }
+
+    /// Drops what a repository that is no longer configured contributed.
+    ///
+    /// A removed clone's rows would otherwise sit in the list until the next
+    /// refresh, promising pull requests from somewhere Home no longer reads.
+    fn drop_unlisted_rows(&mut self) {
+        let listed = self
+            .repositories
+            .iter()
+            .filter_map(RepositoryEntry::slug)
+            .map(ToOwned::to_owned)
+            .collect::<Vec<_>>();
+        self.rows.retain(|row| listed.contains(&row.repository));
+        self.fetch_failures
+            .retain(|failure| listed.contains(&failure.slug));
+    }
+
+    fn clamp_cursor(&mut self) {
+        self.cursor = self.cursor.min(self.rows.len().saturating_sub(1));
     }
 
     /// Takes what came of writing the settings file.
@@ -169,11 +510,14 @@ impl HomeModel {
 
     /// What stops Home listing anything at all, if anything does.
     ///
-    /// Only a settings file that could not be read, or no home directory to look
-    /// for one in. A write that failed is [`Self::write_failure`].
+    /// A settings file that could not be read, no home directory to look for one
+    /// in, or a `gh` the refresh could not get past. A write that failed is
+    /// [`Self::write_failure`], which leaves a list worth showing.
     #[must_use]
-    pub const fn failure(&self) -> Option<&SessionFailure> {
-        self.failure.as_ref()
+    pub fn failure(&self) -> Option<&SessionFailure> {
+        self.settings_failure
+            .as_ref()
+            .or(self.preflight_failure.as_ref())
     }
 
     /// Why the last write did not reach the file, if it did not.
@@ -182,24 +526,23 @@ impl HomeModel {
         self.write_failure.as_ref()
     }
 
-    /// How many configured clones could not be resolved.
+    /// How many configured clones list nothing, from either cause.
     #[must_use]
     pub fn failed_count(&self) -> usize {
         self.repositories
             .iter()
-            .filter(|entry| entry.is_failed())
+            .filter(|entry| self.repository_failure(&entry.path).is_some())
             .count()
     }
 
     /// The header's count line, absent while there is nothing to count.
-    ///
-    /// No pull requests have been fetched yet, so the count of them is zero.
     #[must_use]
     pub fn count_line(&self) -> Option<String> {
         (!self.repositories.is_empty()).then(|| {
             format!(
-                "0 pull requests across {}",
-                repository_count(self.repositories.len())
+                "{} across {}",
+                pull_request_count(self.rows.len()),
+                repository_count(self.repositories.len()),
             )
         })
     }
@@ -282,7 +625,7 @@ impl HomeModel {
     /// A write replaces the whole file, and what an unreadable one holds is
     /// unknown, so writing would silently drop repositories Home never saw.
     fn unreadable_settings_refusal(&self, settings_path: &Path) -> Option<Refusal> {
-        self.failure.is_some().then(|| Refusal {
+        self.settings_failure.is_some().then(|| Refusal {
             path: settings_path.to_path_buf(),
             reason: "fix this file before changing your repositories".to_owned(),
         })
@@ -334,6 +677,84 @@ fn repository_count(count: usize) -> String {
     }
 }
 
+/// "1 pull request" or "8 pull requests", as the count requires.
+fn pull_request_count(count: usize) -> String {
+    if count == 1 {
+        "1 pull request".to_owned()
+    } else {
+        format!("{count} pull requests")
+    }
+}
+
+/// Where a group sits in the fixed order Home renders them in.
+const fn group_order(group: HomeGroup) -> usize {
+    match group {
+        HomeGroup::ToReview => 0,
+        HomeGroup::ToAddress => 1,
+        HomeGroup::WaitingOnOthers => 2,
+    }
+}
+
+/// Which group a fetched pull request belongs to.
+///
+/// The search it came back from decides first. Only the reviewer's own pull
+/// requests can be waiting on them, and everything asked of them is to review
+/// whether or not they have looked at it before.
+fn group_of(fetched: &FetchedPullRequest) -> HomeGroup {
+    match fetched.search {
+        HomeSearch::ReviewRequested => HomeGroup::ToReview,
+        HomeSearch::Authored => {
+            if fetched.changes_requested || fetched.thread_awaiting_reply {
+                HomeGroup::ToAddress
+            } else {
+                HomeGroup::WaitingOnOthers
+            }
+        }
+    }
+}
+
+/// What a row says about its checks, absent when the head has none.
+const fn check_status_of(state: Option<CheckState>) -> Option<CheckStatus> {
+    match state {
+        Some(CheckState::Success) => Some(CheckStatus::Passing),
+        Some(CheckState::Failure | CheckState::Error) => Some(CheckStatus::Failing),
+        Some(CheckState::Pending | CheckState::Expected) => Some(CheckStatus::Running),
+        None => None,
+    }
+}
+
+/// What a row says about its reviews, absent when it has nothing to report.
+///
+/// A standing request for changes outranks an approval, and both outrank the
+/// reviewer's own note that they have already looked at this head.
+fn review_status_of(fetched: &FetchedPullRequest) -> Option<ReviewStatus> {
+    if fetched.changes_requested {
+        return Some(ReviewStatus::ChangesRequested);
+    }
+    if matches!(fetched.review_decision, Some(ReviewDecision::Approved)) {
+        return Some(ReviewStatus::Approved);
+    }
+    let reviewed_this_head = fetched
+        .viewer_latest_review_sha
+        .as_ref()
+        .is_some_and(|sha| *sha == fetched.head_sha);
+    reviewed_this_head.then_some(ReviewStatus::ReviewedThisHead)
+}
+
+fn into_row(fetched: FetchedPullRequest) -> HomeRow {
+    HomeRow {
+        group: group_of(&fetched),
+        review_status: review_status_of(&fetched),
+        check_status: check_status_of(fetched.check_state),
+        repository: fetched.repository,
+        number: fetched.number,
+        title: fetched.title,
+        url: fetched.url,
+        author_login: fetched.author_login,
+        updated_at_ms: fetched.updated_at_ms,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::{Path, PathBuf};
@@ -359,6 +780,633 @@ mod tests {
                 reason: reason.to_owned(),
             },
         }
+    }
+
+    /// One fetched pull request, with nothing standing between it and its group.
+    fn fetched(search: HomeSearch, number: u64, updated_at_ms: i64) -> FetchedPullRequest {
+        FetchedPullRequest {
+            search,
+            repository: "acme/widgets".to_owned(),
+            number,
+            title: format!("Pull request {number}"),
+            url: format!("https://github.com/acme/widgets/pull/{number}"),
+            author_login: Some("mlee".to_owned()),
+            updated_at_ms,
+            head_sha: "head".to_owned(),
+            viewer_latest_review_sha: None,
+            check_state: None,
+            review_decision: None,
+            changes_requested: false,
+            thread_awaiting_reply: false,
+        }
+    }
+
+    /// One repository's fetch, having found `rows`.
+    fn loaded(rows: Vec<FetchedPullRequest>) -> RepositoryFetch {
+        RepositoryFetch {
+            slug: "acme/widgets".to_owned(),
+            outcome: Ok(rows),
+        }
+    }
+
+    #[test]
+    fn every_row_from_the_review_requested_search_lands_in_to_review() {
+        let mut home = HomeModel::new();
+        home.refreshed(Ok(vec![valid("/Developer/widgets", "acme/widgets")]));
+
+        home.batch_fetched(vec![loaded(vec![
+            fetched(HomeSearch::ReviewRequested, 412, 200),
+            fetched(HomeSearch::ReviewRequested, 398, 100),
+        ])]);
+
+        let rows = home.rows();
+        assert_eq!(rows.len(), 2);
+        assert!(rows.iter().all(|row| row.group == HomeGroup::ToReview));
+    }
+
+    /// Home with one repository configured, listing whatever it fetched.
+    fn listing(rows: Vec<FetchedPullRequest>) -> HomeModel {
+        let mut home = HomeModel::new();
+        home.refreshed(Ok(vec![valid("/Developer/widgets", "acme/widgets")]));
+        home.batch_fetched(vec![loaded(rows)]);
+        home
+    }
+
+    /// The single row a test that built one expects to find.
+    fn only_row(home: &HomeModel) -> &HomeRow {
+        assert_eq!(home.rows().len(), 1, "exactly one row was fetched");
+        &home.rows()[0]
+    }
+
+    /// A pull request the reviewer has already looked at, at this very head.
+    #[test]
+    fn a_review_request_already_answered_at_this_head_still_lands_in_to_review() {
+        let mut already_reviewed = fetched(HomeSearch::ReviewRequested, 398, 100);
+        already_reviewed.viewer_latest_review_sha = Some("head".to_owned());
+
+        let home = listing(vec![already_reviewed]);
+
+        let row = only_row(&home);
+        assert_eq!(row.group, HomeGroup::ToReview);
+        assert_eq!(row.review_status, Some(ReviewStatus::ReviewedThisHead));
+    }
+
+    #[test]
+    fn a_review_left_against_an_earlier_head_is_no_row_status_at_all() {
+        let mut reviewed_before = fetched(HomeSearch::ReviewRequested, 398, 100);
+        reviewed_before.viewer_latest_review_sha = Some("an older commit".to_owned());
+
+        let home = listing(vec![reviewed_before]);
+
+        assert_eq!(only_row(&home).review_status, None);
+    }
+
+    #[test]
+    fn an_authored_pull_request_with_a_standing_changes_requested_review_is_to_address() {
+        let mut changes_requested = fetched(HomeSearch::Authored, 412, 100);
+        changes_requested.changes_requested = true;
+
+        let home = listing(vec![changes_requested]);
+
+        let row = only_row(&home);
+        assert_eq!(row.group, HomeGroup::ToAddress);
+        assert_eq!(row.review_status, Some(ReviewStatus::ChangesRequested));
+    }
+
+    #[test]
+    fn an_authored_pull_request_whose_unresolved_thread_someone_else_answered_last_is_to_address() {
+        let mut awaiting_reply = fetched(HomeSearch::Authored, 412, 100);
+        awaiting_reply.thread_awaiting_reply = true;
+
+        let home = listing(vec![awaiting_reply]);
+
+        assert_eq!(only_row(&home).group, HomeGroup::ToAddress);
+    }
+
+    /// The reviewer having spoken last is what takes it off their hands, which
+    /// is the whole difference between the two authored groups.
+    #[test]
+    fn an_authored_pull_request_whose_unresolved_thread_the_viewer_answered_last_is_waiting() {
+        let answered = fetched(HomeSearch::Authored, 412, 100);
+
+        let home = listing(vec![answered]);
+
+        assert_eq!(only_row(&home).group, HomeGroup::WaitingOnOthers);
+    }
+
+    #[test]
+    fn every_other_authored_pull_request_is_waiting_on_others() {
+        let mut approved = fetched(HomeSearch::Authored, 412, 100);
+        approved.review_decision = Some(ReviewDecision::Approved);
+        approved.check_state = Some(CheckState::Success);
+
+        let home = listing(vec![approved]);
+
+        let row = only_row(&home);
+        assert_eq!(row.group, HomeGroup::WaitingOnOthers);
+        assert_eq!(row.review_status, Some(ReviewStatus::Approved));
+        assert_eq!(row.check_status, Some(CheckStatus::Passing));
+    }
+
+    #[test]
+    fn rows_are_grouped_in_a_fixed_order_and_newest_updated_first_within_each() {
+        let mut changes_requested = fetched(HomeSearch::Authored, 1, 100);
+        changes_requested.changes_requested = true;
+
+        let mut home = HomeModel::new();
+        home.refreshed(Ok(vec![valid("/Developer/widgets", "acme/widgets")]));
+        home.batch_fetched(vec![loaded(vec![
+            fetched(HomeSearch::Authored, 2, 300),
+            fetched(HomeSearch::ReviewRequested, 3, 200),
+            changes_requested,
+            fetched(HomeSearch::ReviewRequested, 4, 400),
+        ])]);
+
+        let listed = home
+            .rows()
+            .iter()
+            .map(|row| (row.group, row.number))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            listed,
+            [
+                (HomeGroup::ToReview, 4),
+                (HomeGroup::ToReview, 3),
+                (HomeGroup::ToAddress, 1),
+                (HomeGroup::WaitingOnOthers, 2),
+            ],
+        );
+    }
+
+    #[test]
+    fn a_row_names_its_pull_request_as_owner_name_and_number() {
+        let home = listing(vec![fetched(HomeSearch::ReviewRequested, 412, 100)]);
+
+        assert_eq!(only_row(&home).identity(), "acme/widgets#412");
+    }
+
+    #[test]
+    fn every_check_state_maps_to_one_of_three_statuses_or_a_gap() {
+        let mapped = [
+            (Some(CheckState::Success), Some(CheckStatus::Passing)),
+            (Some(CheckState::Failure), Some(CheckStatus::Failing)),
+            (Some(CheckState::Error), Some(CheckStatus::Failing)),
+            (Some(CheckState::Pending), Some(CheckStatus::Running)),
+            (Some(CheckState::Expected), Some(CheckStatus::Running)),
+            (None, None),
+        ];
+
+        for (state, expected) in mapped {
+            let mut row = fetched(HomeSearch::ReviewRequested, 412, 100);
+            row.check_state = state;
+
+            let home = listing(vec![row]);
+
+            assert_eq!(only_row(&home).check_status, expected, "{state:?}");
+        }
+    }
+
+    /// Precedence, top down. A request for changes is what the author has to
+    /// act on, and it says so even where GitHub's own decision has moved on.
+    #[test]
+    fn a_standing_request_for_changes_outranks_an_approval_and_a_review_of_this_head() {
+        let mut contested = fetched(HomeSearch::Authored, 412, 100);
+        contested.changes_requested = true;
+        contested.review_decision = Some(ReviewDecision::Approved);
+        contested.viewer_latest_review_sha = Some("head".to_owned());
+
+        let home = listing(vec![contested]);
+
+        assert_eq!(
+            only_row(&home).review_status,
+            Some(ReviewStatus::ChangesRequested),
+        );
+    }
+
+    #[test]
+    fn an_approval_outranks_a_review_of_this_head() {
+        let mut approved = fetched(HomeSearch::Authored, 412, 100);
+        approved.review_decision = Some(ReviewDecision::Approved);
+        approved.viewer_latest_review_sha = Some("head".to_owned());
+
+        let home = listing(vec![approved]);
+
+        assert_eq!(only_row(&home).review_status, Some(ReviewStatus::Approved));
+    }
+
+    /// Nobody has reviewed it, which is not something a row has to say.
+    #[test]
+    fn a_review_still_required_leaves_the_review_column_empty() {
+        let mut untouched = fetched(HomeSearch::Authored, 412, 100);
+        untouched.review_decision = Some(ReviewDecision::ReviewRequired);
+
+        let home = listing(vec![untouched]);
+
+        assert_eq!(only_row(&home).review_status, None);
+    }
+
+    /// One repository's fetch that could not be made.
+    fn unreachable(slug: &str, reason: &str) -> RepositoryFetch {
+        RepositoryFetch {
+            slug: slug.to_owned(),
+            outcome: Err(reason.to_owned()),
+        }
+    }
+
+    /// One repository's fetch that found nothing, which is not a failure.
+    fn empty(slug: &str) -> RepositoryFetch {
+        RepositoryFetch {
+            slug: slug.to_owned(),
+            outcome: Ok(Vec::new()),
+        }
+    }
+
+    /// Four configured clones, which is what a batch's progress counts against.
+    fn four_repositories() -> HomeModel {
+        let mut home = HomeModel::new();
+        home.refreshed(Ok(vec![
+            valid("/Developer/zreview", "braidonw/zreview"),
+            valid("/Developer/widgets", "acme/widgets"),
+            valid("/Developer/billing", "acme/billing"),
+            valid("/Developer/tokens", "acme/design-tokens"),
+        ]));
+        home
+    }
+
+    #[test]
+    fn there_is_no_stamp_at_all_before_the_first_refresh() {
+        let home = HomeModel::new();
+
+        assert_eq!(home.refresh_state(), RefreshState::NeverRefreshed);
+    }
+
+    #[test]
+    fn a_refresh_counts_off_the_repositories_as_each_batch_lands() {
+        let mut home = four_repositories();
+
+        assert!(home.begin_refresh());
+        assert_eq!(
+            home.refresh_state(),
+            RefreshState::Refreshing { done: 0, total: 0 },
+            "the total is unknown until the settings file has been read",
+        );
+
+        home.fetching(4);
+        assert_eq!(
+            home.refresh_state(),
+            RefreshState::Refreshing { done: 0, total: 4 },
+        );
+
+        home.batch_fetched(vec![empty("braidonw/zreview"), empty("acme/widgets")]);
+        assert_eq!(
+            home.refresh_state(),
+            RefreshState::Refreshing { done: 2, total: 4 },
+        );
+
+        home.batch_fetched(vec![empty("acme/billing"), empty("acme/design-tokens")]);
+        home.finish_refresh(1_700_000_000_000);
+        assert_eq!(
+            home.refresh_state(),
+            RefreshState::Refreshed {
+                at_ms: 1_700_000_000_000,
+            },
+        );
+    }
+
+    #[test]
+    fn a_trigger_that_arrives_while_a_refresh_runs_starts_nothing() {
+        let mut home = four_repositories();
+        assert!(home.begin_refresh());
+        home.fetching(4);
+        home.batch_fetched(vec![empty("braidonw/zreview")]);
+
+        assert!(
+            !home.begin_refresh(),
+            "a second trigger is ignored, not queued",
+        );
+        assert_eq!(
+            home.refresh_state(),
+            RefreshState::Refreshing { done: 1, total: 4 },
+            "the running refresh keeps its own progress",
+        );
+    }
+
+    #[test]
+    fn a_refresh_where_every_repository_failed_reads_as_failed() {
+        let mut home = four_repositories();
+        home.begin_refresh();
+        home.fetching(2);
+
+        home.batch_fetched(vec![
+            unreachable("braidonw/zreview", "GitHub could not be reached"),
+            unreachable("acme/widgets", "GitHub could not be reached"),
+        ]);
+        home.finish_refresh(1_700_000_000_000);
+
+        assert_eq!(home.refresh_state(), RefreshState::Failed);
+    }
+
+    /// One repository still answering is a list with a hole in it, not a
+    /// failure, and the stamp says when it was fetched.
+    #[test]
+    fn a_refresh_where_one_repository_answered_still_settles() {
+        let mut home = four_repositories();
+        home.begin_refresh();
+        home.fetching(2);
+
+        home.batch_fetched(vec![
+            unreachable("braidonw/zreview", "GitHub refused access"),
+            empty("acme/widgets"),
+        ]);
+        home.finish_refresh(1_700_000_000_000);
+
+        assert_eq!(
+            home.refresh_state(),
+            RefreshState::Refreshed {
+                at_ms: 1_700_000_000_000,
+            },
+        );
+    }
+
+    /// Nothing was configured, so nothing failed.
+    #[test]
+    fn a_refresh_with_nothing_configured_settles_rather_than_failing() {
+        let mut home = HomeModel::new();
+        home.begin_refresh();
+        home.refreshed(Ok(Vec::new()));
+        home.fetching(0);
+
+        home.finish_refresh(1_700_000_000_000);
+
+        assert_eq!(
+            home.refresh_state(),
+            RefreshState::Refreshed {
+                at_ms: 1_700_000_000_000,
+            },
+        );
+    }
+
+    #[test]
+    fn a_preflight_failure_is_the_whole_home_failure_and_ends_the_refresh() {
+        let mut home = four_repositories();
+        home.begin_refresh();
+
+        home.preflight_failed(
+            SessionFailure::new("GitHub is not authenticated")
+                .with_remediation("Run `gh auth login`, then press r."),
+        );
+
+        let failure = home.failure().expect("the preflight failure shows");
+        assert_eq!(failure.summary, "GitHub is not authenticated");
+        assert_eq!(home.refresh_state(), RefreshState::Failed);
+        assert_eq!(
+            home.repositories().len(),
+            4,
+            "an unusable gh says nothing about the configured clones",
+        );
+    }
+
+    /// The settings file is fine, so there is nothing about it to fix first.
+    #[test]
+    fn a_preflight_failure_does_not_stand_in_the_way_of_adding_a_repository() {
+        let mut home = four_repositories();
+        home.begin_refresh();
+        home.preflight_failed(SessionFailure::new("GitHub is not authenticated"));
+
+        let write = home.add_repositories(
+            &settings_path(),
+            vec![picked("/Developer/notes", "/Developer/notes", "acme/notes")],
+        );
+
+        assert!(write.is_some(), "the settings file can still be written");
+        assert!(home.refusals().is_empty());
+    }
+
+    #[test]
+    fn the_next_refresh_clears_the_preflight_failure() {
+        let mut home = four_repositories();
+        home.begin_refresh();
+        home.preflight_failed(SessionFailure::new("GitHub is not authenticated"));
+
+        assert!(home.begin_refresh());
+
+        assert!(home.failure().is_none());
+    }
+
+    #[test]
+    fn a_settings_file_that_cannot_be_read_ends_the_refresh_as_failed() {
+        let mut home = four_repositories();
+        home.begin_refresh();
+
+        home.refreshed(Err(SessionFailure::new(
+            "Home could not read your settings",
+        )));
+
+        assert_eq!(home.refresh_state(), RefreshState::Failed);
+    }
+
+    #[test]
+    fn a_repository_that_could_not_be_fetched_names_itself_its_error_and_its_entry() {
+        let mut home = four_repositories();
+        home.begin_refresh();
+        home.fetching(4);
+
+        home.batch_fetched(vec![unreachable(
+            "acme/billing",
+            "GitHub refused access to acme/billing",
+        )]);
+
+        let failures = home.fetch_failures();
+        assert_eq!(failures.len(), 1);
+        assert_eq!(failures[0].slug, "acme/billing");
+        assert_eq!(failures[0].reason, "GitHub refused access to acme/billing");
+        assert_eq!(failures[0].path, Path::new("/Developer/billing"));
+    }
+
+    #[test]
+    fn a_repository_that_could_not_be_fetched_says_so_in_the_footer_and_the_summary() {
+        let mut home = four_repositories();
+        home.begin_refresh();
+        home.fetching(4);
+
+        home.batch_fetched(vec![unreachable("acme/billing", "GitHub refused access")]);
+
+        assert_eq!(
+            home.repository_failure(Path::new("/Developer/billing")),
+            Some("GitHub refused access"),
+        );
+        assert_eq!(
+            home.repository_failure(Path::new("/Developer/widgets")),
+            None,
+        );
+        assert_eq!(home.failed_count(), 1);
+        assert_eq!(home.footer_summary(), "4 repositories \u{00B7} 1 failed");
+    }
+
+    /// A clone that never resolved was never fetched, so its own reason is the
+    /// only thing it has to say.
+    #[test]
+    fn a_clone_that_did_not_resolve_keeps_reporting_its_own_reason() {
+        let mut home = HomeModel::new();
+        home.refreshed(Ok(vec![failed(
+            "/Developer/moved",
+            "the folder no longer exists",
+        )]));
+        home.begin_refresh();
+        home.fetching(0);
+
+        assert_eq!(
+            home.repository_failure(Path::new("/Developer/moved")),
+            Some("the folder no longer exists"),
+        );
+        assert_eq!(home.failed_count(), 1);
+    }
+
+    /// Two checkouts of one repository are two entries with two Removes, and
+    /// the failure belongs to both of them.
+    #[test]
+    fn one_repository_failing_marks_every_clone_that_points_at_it() {
+        let mut home = HomeModel::new();
+        home.refreshed(Ok(vec![
+            valid("/Developer/widgets", "acme/widgets"),
+            valid("/Developer/widgets-worktree", "acme/widgets"),
+        ]));
+        home.begin_refresh();
+        home.fetching(1);
+
+        home.batch_fetched(vec![unreachable("acme/widgets", "GitHub refused access")]);
+
+        assert_eq!(home.fetch_failures().len(), 2);
+        assert_eq!(home.failed_count(), 2);
+    }
+
+    #[test]
+    fn a_refresh_that_succeeds_clears_the_failure_the_last_one_reported() {
+        let mut home = four_repositories();
+        home.begin_refresh();
+        home.fetching(1);
+        home.batch_fetched(vec![unreachable("acme/billing", "GitHub refused access")]);
+        home.finish_refresh(1_700_000_000_000);
+
+        home.begin_refresh();
+        home.fetching(1);
+        home.batch_fetched(vec![empty("acme/billing")]);
+        home.finish_refresh(1_700_000_060_000);
+
+        assert!(home.fetch_failures().is_empty());
+        assert_eq!(home.failed_count(), 0);
+    }
+
+    /// Home listing one row per group, which is what the cursor walks across.
+    fn three_groups() -> HomeModel {
+        let mut changes_requested = fetched(HomeSearch::Authored, 2, 200);
+        changes_requested.changes_requested = true;
+        listing(vec![
+            fetched(HomeSearch::ReviewRequested, 1, 300),
+            changes_requested,
+            fetched(HomeSearch::Authored, 3, 100),
+        ])
+    }
+
+    #[test]
+    fn the_cursor_walks_every_row_across_the_groups() {
+        let mut home = three_groups();
+        assert_eq!(home.cursor(), 0);
+
+        home.move_cursor_down();
+        assert_eq!(home.rows()[home.cursor()].number, 2, "into To address");
+
+        home.move_cursor_down();
+        assert_eq!(home.rows()[home.cursor()].number, 3, "into Waiting");
+
+        home.move_cursor_up();
+        assert_eq!(home.rows()[home.cursor()].number, 2);
+    }
+
+    #[test]
+    fn the_cursor_stops_at_the_ends_of_the_list() {
+        let mut home = three_groups();
+
+        home.move_cursor_up();
+        assert_eq!(home.cursor(), 0);
+
+        for _ in 0..10 {
+            home.move_cursor_down();
+        }
+        assert_eq!(home.cursor(), 2);
+    }
+
+    #[test]
+    fn the_cursor_is_pulled_back_onto_a_list_a_refresh_shortened() {
+        let mut home = three_groups();
+        home.move_cursor_down();
+        home.move_cursor_down();
+        assert_eq!(home.cursor(), 2);
+
+        home.begin_refresh();
+        home.fetching(1);
+        home.batch_fetched(vec![loaded(vec![fetched(
+            HomeSearch::ReviewRequested,
+            1,
+            300,
+        )])]);
+
+        assert_eq!(home.cursor(), 0, "the row it was on is gone");
+    }
+
+    #[test]
+    fn the_cursor_sits_at_the_top_of_a_list_that_has_emptied() {
+        let mut home = three_groups();
+        home.move_cursor_down();
+
+        home.begin_refresh();
+        home.fetching(1);
+        home.batch_fetched(vec![empty("acme/widgets")]);
+
+        assert_eq!(home.cursor(), 0);
+        assert!(home.rows().is_empty());
+    }
+
+    /// A removed clone takes its rows with it, so the list never promises pull
+    /// requests from somewhere Home no longer reads.
+    #[test]
+    fn removing_a_repository_takes_its_rows_out_of_the_list() {
+        let mut home = HomeModel::new();
+        home.refreshed(Ok(vec![
+            valid("/Developer/widgets", "acme/widgets"),
+            valid("/Developer/zreview", "braidonw/zreview"),
+        ]));
+        home.begin_refresh();
+        home.fetching(2);
+        home.batch_fetched(vec![
+            loaded(vec![fetched(HomeSearch::ReviewRequested, 1, 300)]),
+            RepositoryFetch {
+                slug: "braidonw/zreview".to_owned(),
+                outcome: Ok(vec![FetchedPullRequest {
+                    repository: "braidonw/zreview".to_owned(),
+                    ..fetched(HomeSearch::ReviewRequested, 2, 200)
+                }]),
+            },
+        ]);
+        assert_eq!(home.rows().len(), 2);
+
+        home.refreshed(Ok(vec![valid("/Developer/widgets", "acme/widgets")]));
+
+        assert_eq!(home.rows().len(), 1);
+        assert_eq!(home.rows()[0].repository, "acme/widgets");
+    }
+
+    #[test]
+    fn every_status_carries_the_words_its_column_shows() {
+        assert_eq!(CheckStatus::Passing.label(), "checks passing");
+        assert_eq!(CheckStatus::Failing.label(), "checks failing");
+        assert_eq!(CheckStatus::Running.label(), "checks running");
+        assert_eq!(ReviewStatus::ChangesRequested.label(), "changes requested");
+        assert_eq!(ReviewStatus::Approved.label(), "approved");
+        assert_eq!(
+            ReviewStatus::ReviewedThisHead.label(),
+            "you reviewed this head",
+        );
     }
 
     #[test]
@@ -420,6 +1468,53 @@ mod tests {
 
         assert!(home.failure().is_none());
         assert_eq!(home.repositories().len(), 1);
+    }
+
+    #[test]
+    fn the_count_line_counts_the_listed_rows_and_the_configured_repositories() {
+        let mut home = HomeModel::new();
+        home.refreshed(Ok(vec![valid("/Developer/widgets", "acme/widgets")]));
+
+        home.batch_fetched(vec![loaded(vec![
+            fetched(HomeSearch::ReviewRequested, 1, 100),
+            fetched(HomeSearch::Authored, 2, 200),
+        ])]);
+
+        assert_eq!(
+            home.count_line().as_deref(),
+            Some("2 pull requests across 1 repository"),
+        );
+    }
+
+    #[test]
+    fn the_count_line_counts_one_pull_request_in_the_singular() {
+        let mut home = HomeModel::new();
+        home.refreshed(Ok(vec![valid("/Developer/widgets", "acme/widgets")]));
+
+        home.batch_fetched(vec![loaded(vec![fetched(
+            HomeSearch::ReviewRequested,
+            1,
+            100,
+        )])]);
+
+        assert_eq!(
+            home.count_line().as_deref(),
+            Some("1 pull request across 1 repository"),
+        );
+    }
+
+    #[test]
+    fn a_group_holds_only_its_own_rows() {
+        let mut changes_requested = fetched(HomeSearch::Authored, 1, 100);
+        changes_requested.changes_requested = true;
+        let home = listing(vec![
+            fetched(HomeSearch::ReviewRequested, 2, 300),
+            changes_requested,
+        ]);
+
+        assert_eq!(home.rows_in(HomeGroup::ToReview).count(), 1);
+        assert_eq!(home.rows_in(HomeGroup::ToAddress).count(), 1);
+        assert_eq!(home.rows_in(HomeGroup::WaitingOnOthers).count(), 0);
     }
 
     #[test]

@@ -19,7 +19,11 @@ mod review;
 mod session;
 
 pub use handoff::Handoff;
-pub use home::{HomeGroup, HomeModel, Refusal, RepositoryEntry, RepositoryOutcome, SettingsWrite};
+pub use home::{
+    CheckState, CheckStatus, FetchFailure, FetchedPullRequest, HomeGroup, HomeModel, HomeRow,
+    HomeSearch, RefreshState, Refusal, RepositoryEntry, RepositoryFetch, RepositoryOutcome,
+    ReviewDecision, ReviewStatus, SettingsWrite,
+};
 pub use review::{FindingDisposition, ReviewModel, ReviewRunState};
 pub use session::{PendingSend, SessionModel, SessionPhase, SubmissionState};
 
