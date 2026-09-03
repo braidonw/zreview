@@ -36,6 +36,28 @@
   color: var(--text-tertiary);
 }
 
+.home__stamp {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.home__stamp-text {
+  font-family: var(--font-mono);
+  font-size: var(--size-meta);
+  color: var(--text-tertiary);
+}
+
+.home__keycap {
+  padding: 0 4px;
+  border: 1px solid var(--border-default);
+  border-radius: 3px;
+  background: var(--surface-overlay);
+  font-family: var(--font-mono);
+  font-size: var(--size-label);
+  color: var(--text-tertiary);
+}
+
 .home__body {
   flex: 1;
   min-height: 0;
@@ -121,6 +143,115 @@
   font-family: var(--font-sans);
   font-size: var(--size-body);
   color: var(--text-faint);
+}
+
+.home__failed-repository {
+  min-height: var(--file-row-height);
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.home__failed-detail {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  font-family: var(--font-mono);
+  font-size: var(--size-meta);
+  color: var(--severity-error-text);
+}
+
+.home__rows {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+/* One dense line per pull request, on the file row's scale. */
+.home__row {
+  height: var(--file-row-height);
+  padding: 0 12px;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  border-radius: 4px;
+  background: var(--surface-base);
+}
+
+.home__row:hover {
+  background: var(--surface-hover);
+}
+
+.home__row--cursor {
+  background: var(--surface-selected);
+}
+
+.home__row-title {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  font-family: var(--font-sans);
+  font-size: var(--size-body);
+  color: var(--text-primary);
+}
+
+/* Every status keeps its own column, so an absent one leaves an aligned gap. */
+.home__cell {
+  flex-shrink: 0;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  font-family: var(--font-mono);
+  font-size: var(--size-meta);
+  color: var(--text-tertiary);
+}
+
+.home__cell--drafts {
+  width: 60px;
+}
+
+/* Wide enough for "you reviewed this head", the longest label it carries. */
+.home__cell--review {
+  width: 172px;
+}
+
+.home__cell--checks {
+  width: 105px;
+}
+
+.home__cell--identity {
+  width: 200px;
+  text-align: right;
+  color: var(--text-secondary);
+}
+
+.home__cell--author {
+  width: 70px;
+}
+
+.home__cell--age {
+  width: 32px;
+  text-align: right;
+}
+
+.home__status--success {
+  color: var(--severity-success-text);
+}
+
+.home__status--error {
+  color: var(--severity-error-text);
+}
+
+.home__status--warning {
+  color: var(--severity-warning-text);
+}
+
+.home__status--muted {
+  color: var(--text-tertiary);
 }
 
 .home__footer {

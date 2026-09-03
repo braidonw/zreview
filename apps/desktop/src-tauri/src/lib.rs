@@ -3,10 +3,14 @@
 use std::sync::{Arc, Mutex, atomic::AtomicBool};
 
 use app::{HomeModel, SessionModel};
+use github::GithubClient;
 use session::{ReviewStorage, SessionRequest};
 
 mod commands;
 mod dto;
+#[cfg(test)]
+mod fake_gh;
+mod pull_requests;
 mod repositories;
 
 /// What the binary was asked to open.
@@ -48,13 +52,17 @@ pub(crate) struct ManagedHome {
     /// reads back. Two of them interleaving would let one write a list the
     /// other had already changed, resurrecting a repository just removed.
     pub(crate) settings_action: Arc<Mutex<()>>,
+    /// How a refresh reaches GitHub. Held rather than built per call so a test
+    /// can hand Home a `gh` of its own.
+    pub(crate) client: GithubClient,
 }
 
 impl ManagedHome {
-    pub(crate) fn new() -> Self {
+    pub(crate) fn new(client: GithubClient) -> Self {
         Self {
             model: Arc::new(Mutex::new(HomeModel::new())),
             settings_action: Arc::new(Mutex::new(())),
+            client,
         }
     }
 }
@@ -85,7 +93,7 @@ pub fn run(launch: Launch) {
         }),
     };
     let root = AppRoot {
-        home: ManagedHome::new(),
+        home: ManagedHome::new(GithubClient::default()),
         session,
     };
     let specta_builder = commands::specta_builder();

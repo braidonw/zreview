@@ -209,6 +209,70 @@ impl From<&SessionFailure> for SessionFailureDto {
     }
 }
 
+/// Which severity a status column paints itself in.
+///
+/// Named rather than coloured, so the values themselves stay in the one style
+/// sheet that owns them.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, specta::Type)]
+pub enum StatusToneDto {
+    Success,
+    Error,
+    Warning,
+    Muted,
+}
+
+/// One status column's words and the weight they carry.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, specta::Type)]
+pub struct RowStatusDto {
+    pub label: String,
+    pub tone: StatusToneDto,
+}
+
+impl From<app::CheckStatus> for RowStatusDto {
+    fn from(status: app::CheckStatus) -> Self {
+        Self {
+            label: status.label().to_owned(),
+            tone: match status {
+                app::CheckStatus::Passing => StatusToneDto::Success,
+                app::CheckStatus::Failing => StatusToneDto::Error,
+                app::CheckStatus::Running => StatusToneDto::Warning,
+            },
+        }
+    }
+}
+
+impl From<app::ReviewStatus> for RowStatusDto {
+    fn from(status: app::ReviewStatus) -> Self {
+        Self {
+            label: status.label().to_owned(),
+            tone: match status {
+                app::ReviewStatus::Approved => StatusToneDto::Success,
+                app::ReviewStatus::ChangesRequested => StatusToneDto::Error,
+                app::ReviewStatus::ReviewedThisHead => StatusToneDto::Muted,
+            },
+        }
+    }
+}
+
+/// One pull request, as one line of the ledger.
+#[derive(Clone, Debug, Serialize, specta::Type)]
+pub struct HomeRowDto {
+    /// Where this row sits in the flat order the cursor walks.
+    pub index: u32,
+    pub title: String,
+    pub url: String,
+    /// `owner/name#number`.
+    pub identity: String,
+    /// Absent once GitHub has forgotten the account.
+    pub author: Option<String>,
+    /// When the pull request last moved, as epoch milliseconds, which the age
+    /// column is worked out from.
+    #[specta(type = specta_typescript::Number)]
+    pub updated_at_ms: i64,
+    pub review_status: Option<RowStatusDto>,
+    pub check_status: Option<RowStatusDto>,
+}
+
 /// One of Home's three groups, always rendered whether or not it has rows.
 #[derive(Clone, Debug, Serialize, specta::Type)]
 pub struct HomeGroupDto {
@@ -216,6 +280,54 @@ pub struct HomeGroupDto {
     pub count: u32,
     /// The one line an empty group shows in place of rows.
     pub empty_copy: String,
+    pub rows: Vec<HomeRowDto>,
+}
+
+/// How current the list is, which the header stamp reads.
+#[derive(Clone, Debug, PartialEq, Serialize, specta::Type)]
+pub enum RefreshStateDto {
+    /// There is no stamp at all until the first refresh starts.
+    NeverRefreshed,
+    Refreshing {
+        done: u32,
+        total: u32,
+    },
+    /// Epoch milliseconds, which the relative stamp is worked out from.
+    Refreshed {
+        #[specta(type = specta_typescript::Number)]
+        at_ms: i64,
+    },
+    Failed,
+}
+
+impl From<app::RefreshState> for RefreshStateDto {
+    fn from(state: app::RefreshState) -> Self {
+        match state {
+            app::RefreshState::NeverRefreshed => Self::NeverRefreshed,
+            app::RefreshState::Refreshing { done, total } => Self::Refreshing {
+                done: as_u32(done),
+                total: as_u32(total),
+            },
+            app::RefreshState::Refreshed { at_ms } => Self::Refreshed { at_ms },
+            app::RefreshState::Failed => Self::Failed,
+        }
+    }
+}
+
+/// One configured repository whose pull requests could not be fetched.
+#[derive(Clone, Debug, Serialize, specta::Type)]
+pub struct FailedRepositoryDto {
+    /// The entry in the settings file, which is what Remove names.
+    pub path: String,
+    pub slug: String,
+    pub reason: String,
+}
+
+/// Which way the cursor is being moved.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize, specta::Type)]
+pub enum CursorMoveDto {
+    Down,
+    Up,
 }
 
 /// One configured clone as the footer lists it.
@@ -240,12 +352,18 @@ pub struct HomeSnapshotDto {
     /// The header's count line, absent until there is something to count.
     pub count_line: Option<String>,
     pub groups: Vec<HomeGroupDto>,
+    /// Where the cursor sits, as a flat index across every rendered row.
+    pub cursor: u32,
+    pub refresh: RefreshStateDto,
+    /// One line each above the list, naming a repository this refresh lost.
+    pub failed_repositories: Vec<FailedRepositoryDto>,
     pub repositories: Vec<HomeRepositoryDto>,
     pub footer_summary: String,
     pub footer_expanded: bool,
     pub refusals: Vec<RefusalDto>,
-    /// What replaces the list area when Home cannot read its repositories. The
-    /// header and footer stay either way, so Add still works.
+    /// What replaces the list area when Home cannot read its repositories or
+    /// cannot use `gh`. The header and footer stay either way, so Add still
+    /// works.
     pub failure: Option<SessionFailureDto>,
     /// Why the last write did not reach the file, shown as a line above the
     /// list, which stays because reading it still worked.
@@ -253,19 +371,41 @@ pub struct HomeSnapshotDto {
 }
 
 /// Everything Home shows, from the model that decided it.
-///
-/// No pull requests have been fetched yet, so every group is empty and no
-/// repository carries a count.
 #[must_use]
 pub fn project_home(home: &app::HomeModel) -> HomeSnapshotDto {
+    // Walked in the model's own order, so a row's index is where the cursor
+    // finds it rather than something counted twice and hoped to agree.
+    let mut index = 0_u32;
+    let mut groups = Vec::with_capacity(app::HomeGroup::ALL.len());
+    for group in app::HomeGroup::ALL {
+        let rows = home
+            .rows_in(group)
+            .map(|row| {
+                let projected = project_home_row(row, index);
+                index += 1;
+                projected
+            })
+            .collect::<Vec<_>>();
+        groups.push(HomeGroupDto {
+            title: group.title().to_owned(),
+            count: as_u32(rows.len()),
+            empty_copy: group.empty_copy().to_owned(),
+            rows,
+        });
+    }
+
     HomeSnapshotDto {
         count_line: home.count_line(),
-        groups: app::HomeGroup::ALL
-            .into_iter()
-            .map(|group| HomeGroupDto {
-                title: group.title().to_owned(),
-                count: 0,
-                empty_copy: group.empty_copy().to_owned(),
+        groups,
+        cursor: as_u32(home.cursor()),
+        refresh: home.refresh_state().into(),
+        failed_repositories: home
+            .fetch_failures()
+            .iter()
+            .map(|failure| FailedRepositoryDto {
+                path: failure.path.display().to_string(),
+                slug: failure.slug.clone(),
+                reason: failure.reason.clone(),
             })
             .collect(),
         repositories: home
@@ -274,7 +414,7 @@ pub fn project_home(home: &app::HomeModel) -> HomeSnapshotDto {
             .map(|entry| HomeRepositoryDto {
                 path: entry.path.display().to_string(),
                 slug: entry.slug().map(ToOwned::to_owned),
-                failure: entry.reason().map(ToOwned::to_owned),
+                failure: home.repository_failure(&entry.path).map(ToOwned::to_owned),
             })
             .collect(),
         footer_summary: home.footer_summary(),
@@ -289,6 +429,19 @@ pub fn project_home(home: &app::HomeModel) -> HomeSnapshotDto {
             .collect(),
         failure: home.failure().map(Into::into),
         write_failure: home.write_failure().map(Into::into),
+    }
+}
+
+fn project_home_row(row: &app::HomeRow, index: u32) -> HomeRowDto {
+    HomeRowDto {
+        index,
+        title: row.title.clone(),
+        url: row.url.clone(),
+        identity: row.identity(),
+        author: row.author_login.clone(),
+        updated_at_ms: row.updated_at_ms,
+        review_status: row.review_status.map(Into::into),
+        check_status: row.check_status.map(Into::into),
     }
 }
 

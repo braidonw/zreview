@@ -65,6 +65,9 @@ Range.prototype.getBoundingClientRect = () => stubRect;
 Element.prototype.getClientRects = () => [stubRect] as unknown as DOMRectList;
 Element.prototype.getBoundingClientRect = () => stubRect;
 
+// jsdom has no scroll machinery, so the cursor row's scrollIntoView is not there to call.
+Element.prototype.scrollIntoView = () => {};
+
 // jsdom has no ResizeObserver at all; CodeMirror's view and the virtualizer both construct one.
 class NoOpResizeObserver implements ResizeObserver {
   observe() {}
