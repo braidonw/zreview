@@ -8,30 +8,35 @@ use std::{collections::HashMap, path::Path};
 use domain::SessionFailure;
 use store::{ReviewStore, StoreError};
 
-/// Counts of stored Drafts per row, keyed by [`app::HomeRow::draft_scope`].
+/// Every stored Drafts count, by scope.
 ///
-/// A database that does not exist yet means no Drafts anywhere, which is not a
-/// failure.
+/// The table is the reviewer's own unsent comments, never large enough to ask
+/// for less than all of it, so the model joins rows onto this rather than the
+/// other way around. A database that does not exist yet means no Drafts
+/// anywhere, which is not a failure.
 ///
 /// # Errors
 ///
 /// Returns what Home shows above the list when the database cannot be opened
 /// or read.
-pub(crate) fn read(
-    database_path: &Path,
-    rows: &[app::HomeRow],
-) -> Result<HashMap<String, usize>, SessionFailure> {
+pub(crate) fn read(database_path: &Path) -> Result<HashMap<String, usize>, SessionFailure> {
     let store = match ReviewStore::open_read_only(database_path) {
         Ok(store) => store,
         Err(StoreError::Missing) => return Ok(HashMap::new()),
-        Err(error) => return Err(drafts_failure(&error)),
+        Err(
+            error @ (StoreError::CreateDirectory { .. }
+            | StoreError::Open(_)
+            | StoreError::Migrate(_)
+            | StoreError::Read(_)
+            | StoreError::Write(_)
+            | StoreError::UnknownSide(_)
+            | StoreError::UnknownOrigin(_)
+            | StoreError::NoHomeDirectory
+            | StoreError::UnsupportedSchemaVersion(_)),
+        ) => return Err(drafts_failure(&error)),
     };
-    let scopes = rows
-        .iter()
-        .map(app::HomeRow::draft_scope)
-        .collect::<Vec<_>>();
     store
-        .count_by_scopes(&scopes)
+        .count_by_scope()
         .map_err(|error| drafts_failure(&error))
 }
 
@@ -45,27 +50,12 @@ mod tests {
 
     use super::*;
 
-    fn row(repository: &str, number: u64) -> app::HomeRow {
-        app::HomeRow {
-            group: app::HomeGroup::ToReview,
-            repository: repository.to_owned(),
-            number,
-            title: "a pull request".to_owned(),
-            url: format!("https://github.com/{repository}/pull/{number}"),
-            author_login: None,
-            updated_at_ms: 0,
-            review_status: None,
-            check_status: None,
-            drafts: None,
-        }
-    }
-
     #[test]
     fn a_missing_database_reads_as_no_drafts() {
         let directory = TempDir::new().unwrap();
         let path = directory.path().join("review-data.sqlite3");
 
-        let counts = read(&path, &[row("acme/widgets", 412)]).unwrap();
+        let counts = read(&path).unwrap();
 
         assert!(counts.is_empty());
     }
@@ -91,7 +81,7 @@ mod tests {
                 .unwrap();
         }
 
-        let counts = read(&path, &[row("acme/widgets", 412)]).unwrap();
+        let counts = read(&path).unwrap();
 
         assert_eq!(counts["github:acme/widgets#412"], 1);
     }
@@ -102,7 +92,7 @@ mod tests {
         let path = directory.path().join("review-data.sqlite3");
         std::fs::write(&path, b"not a database").unwrap();
 
-        let failure = read(&path, &[row("acme/widgets", 412)]).unwrap_err();
+        let failure = read(&path).unwrap_err();
 
         assert_eq!(failure.summary, "Drafts could not be read");
     }

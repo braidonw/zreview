@@ -272,7 +272,7 @@ pub struct HomeRowDto {
     pub review_status: Option<RowStatusDto>,
     pub check_status: Option<RowStatusDto>,
     /// "1 draft" or "N drafts", absent for a blank cell.
-    pub drafts: Option<String>,
+    pub drafts_label: Option<String>,
 }
 
 /// One of Home's three groups, always rendered whether or not it has rows.
@@ -448,7 +448,7 @@ fn project_home_row(row: &app::HomeRow, index: u32) -> HomeRowDto {
         updated_at_ms: row.updated_at_ms,
         review_status: row.review_status.map(Into::into),
         check_status: row.check_status.map(Into::into),
-        drafts: row.drafts_label(),
+        drafts_label: row.drafts_label(),
     }
 }
 
@@ -968,10 +968,10 @@ mod tests {
                 .unwrap()
         };
         assert_eq!(
-            by_identity("acme/widgets#412").drafts.as_deref(),
+            by_identity("acme/widgets#412").drafts_label.as_deref(),
             Some("3 drafts")
         );
-        assert_eq!(by_identity("acme/widgets#398").drafts, None);
+        assert_eq!(by_identity("acme/widgets#398").drafts_label, None);
     }
 
     #[test]

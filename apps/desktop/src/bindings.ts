@@ -221,7 +221,7 @@ export type HomeRowDto = {
 	review_status: RowStatusDto | null,
 	check_status: RowStatusDto | null,
 	/**  "1 draft" or "N drafts", absent for a blank cell. */
-	drafts: string | null,
+	drafts_label: string | null,
 };
 
 /**  Everything Home renders, from its header to its footer. */

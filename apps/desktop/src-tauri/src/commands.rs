@@ -84,8 +84,10 @@ fn refresh_home_on_model(
         lock(&home.model).batch_fetched(batch);
         report_home(home, report);
     });
-    let fetched_rows = lock(&home.model).rows().to_vec();
-    lock(&home.model).drafts_read(drafts::read(database_path, &fetched_rows));
+    // Evaluated before the lock is taken, so the store open and query never
+    // hold the model mutex against every other command waiting on it.
+    let drafts_result = drafts::read(database_path);
+    lock(&home.model).drafts_read(drafts_result);
     lock(&home.model).finish_refresh(now_ms());
     report_home(home, report);
 }
