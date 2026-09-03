@@ -3,7 +3,9 @@ import type {
   DraftsDto,
   FileDetailDto,
   FileSummaryDto,
+  HomeGroupDto,
   HomeRepositoryDto,
+  HomeRowDto,
   HomeSnapshotDto,
   RowDto,
   SessionSnapshotDto,
@@ -108,14 +110,41 @@ export function makeHomeRepository(overrides: Partial<HomeRepositoryDto> = {}): 
   };
 }
 
+export function makeHomeRow(overrides: Partial<HomeRowDto> = {}): HomeRowDto {
+  return {
+    index: 0,
+    title: "Retry webhook deliveries with jittered backoff",
+    url: "https://github.com/acme/widgets/pull/412",
+    identity: "acme/widgets#412",
+    author: "mlee",
+    updated_at_ms: 1_788_266_096_000,
+    review_status: null,
+    check_status: null,
+    ...overrides,
+  };
+}
+
+/** The three groups in their fixed order, holding whatever rows are given. */
+export function makeHomeGroups(rows: HomeRowDto[][] = [[], [], []]): HomeGroupDto[] {
+  const shape = [
+    { title: "To review", empty_copy: "Nothing waiting for your review." },
+    { title: "To address", empty_copy: "Nothing to address." },
+    { title: "Waiting on others", empty_copy: "Nothing waiting on others." },
+  ];
+  return shape.map((group, index) => ({
+    ...group,
+    count: rows[index].length,
+    rows: rows[index],
+  }));
+}
+
 export function makeHomeSnapshot(overrides: Partial<HomeSnapshotDto> = {}): HomeSnapshotDto {
   return {
     count_line: null,
-    groups: [
-      { title: "To review", count: 0, empty_copy: "Nothing waiting for your review." },
-      { title: "To address", count: 0, empty_copy: "Nothing to address." },
-      { title: "Waiting on others", count: 0, empty_copy: "Nothing waiting on others." },
-    ],
+    groups: makeHomeGroups(),
+    cursor: 0,
+    refresh: "NeverRefreshed",
+    failed_repositories: [],
     repositories: [],
     footer_summary: "No repositories",
     footer_expanded: false,

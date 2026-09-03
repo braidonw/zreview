@@ -3,7 +3,12 @@ import { render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import type { HomeSnapshotDto } from "./bindings";
 import App from "./App";
-import { makeHomeRepository, makeHomeSnapshot } from "./test/fixtures";
+import {
+  makeHomeGroups,
+  makeHomeRepository,
+  makeHomeRow,
+  makeHomeSnapshot,
+} from "./test/fixtures";
 
 const describeLaunch = vi.fn();
 const refreshHome = vi.fn();
@@ -11,10 +16,13 @@ const addRepositories = vi.fn();
 const removeRepository = vi.fn();
 const toggleRepositoriesFooter = vi.fn();
 
+const moveHomeCursor = vi.fn();
+
 vi.mock("./bindings", () => ({
   commands: {
     describeLaunch: () => describeLaunch(),
-    refreshHome: () => refreshHome(),
+    refreshHome: (onProgress: unknown) => refreshHome(onProgress),
+    moveHomeCursor: (moveTo: unknown) => moveHomeCursor(moveTo),
     addRepositories: (folders: unknown) => addRepositories(folders),
     removeRepository: (path: unknown) => removeRepository(path),
     toggleRepositoriesFooter: () => toggleRepositoriesFooter(),
@@ -55,6 +63,7 @@ beforeEach(() => {
   addRepositories.mockReset();
   removeRepository.mockReset();
   toggleRepositoriesFooter.mockReset();
+  moveHomeCursor.mockReset();
   open.mockReset();
 });
 

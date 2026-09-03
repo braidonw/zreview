@@ -15,7 +15,8 @@ mod home;
 
 pub use home::{
     DEFAULT_GRAPHQL_TIMEOUT, HomeFetch, HomePullRequest, HomeRepository, HomeSearch,
-    OpinionatedReview, RateLimit, ReviewDecision, ReviewState, ReviewThread, StatusCheckState,
+    OpinionatedReview, REPOSITORIES_PER_BATCH, RateLimit, ReviewDecision, ReviewState,
+    ReviewThread, StatusCheckState,
 };
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -876,7 +877,12 @@ fn parse_remote_url(value: &str) -> Option<RepositorySlug> {
     parse_full_name(path)
 }
 
-fn parse_full_name(value: &str) -> Option<RepositorySlug> {
+/// Reads `owner/name` back into a slug, refusing anything else.
+///
+/// Public so a caller holding a formatted slug can ask for it in the shape the
+/// fetches take, without a parse of its own that could disagree with this one.
+#[must_use]
+pub fn parse_full_name(value: &str) -> Option<RepositorySlug> {
     let (owner, name) = value.split_once('/')?;
     if name.contains('/')
         || validate_slug_component(owner, value).is_err()

@@ -13,17 +13,23 @@ export const commands = {
 	 */
 	describeLaunch: () => __TAURI_INVOKE<LaunchDto>("describe_launch"),
 	/**
-	 *  Re-reads the settings file and resolves every clone it lists.
+	 *  Re-reads the settings file, then fetches what every clone it lists has open.
 	 * 
-	 *  Runs when Home opens, after an Add or a Remove, and on `r`. A settings file
-	 *  that cannot be read comes back inside the snapshot rather than as a command
-	 *  error, because the header and footer stay on screen either way.
+	 *  Runs when Home opens and on `r`, reporting how far it has got on
+	 *  `on_progress` as each batch of repositories lands. A trigger that arrives
+	 *  mid-refresh starts nothing and answers with what is already on screen.
+	 * 
+	 *  A settings file that cannot be read, or a `gh` that cannot be used, comes
+	 *  back inside the snapshot rather than as a command error, because the header
+	 *  and footer stay on screen either way.
 	 * 
 	 *  # Errors
 	 * 
-	 *  Returns a failure when the task doing the reading does not finish.
+	 *  Returns a failure when the task doing the fetching does not finish.
 	 */
-	refreshHome: () => typedError<HomeSnapshotDto, SessionFailureDto>(__TAURI_INVOKE("refresh_home")),
+	refreshHome: (onProgress: Channel<RefreshStateDto>) => typedError<HomeSnapshotDto, SessionFailureDto>(__TAURI_INVOKE("refresh_home", { onProgress })),
+	/**  Moves the cursor one row through the list, across the groups. */
+	moveHomeCursor: (moveTo: CursorMoveDto) => __TAURI_INVOKE<HomeSnapshotDto>("move_home_cursor", { moveTo }),
 	/**
 	 *  Adds the folders the reviewer picked, writing the file once and refreshing.
 	 * 
@@ -110,6 +116,9 @@ export type AnchoredDraftDto = {
 	is_proposed: boolean,
 };
 
+/**  Which way the cursor is being moved. */
+export type CursorMoveDto = "Down" | "Up";
+
 export type DiffLineKindDto = "Context" | "Addition" | "Deletion" | "NoNewlineMarker";
 
 export type DiffSideDto = "Left" | "Right";
@@ -140,6 +149,14 @@ export type EmptyReasonDto = {
 	detail: string,
 };
 
+/**  One configured repository whose pull requests could not be fetched. */
+export type FailedRepositoryDto = {
+	/**  The entry in the settings file, which is what Remove names. */
+	path: string,
+	slug: string,
+	reason: string,
+};
+
 export type FileDetailDto = {
 	index: number,
 	path: string,
@@ -168,6 +185,7 @@ export type HomeGroupDto = {
 	count: number,
 	/**  The one line an empty group shows in place of rows. */
 	empty_copy: string,
+	rows: HomeRowDto[],
 };
 
 /**  One configured clone as the footer lists it. */
@@ -178,18 +196,43 @@ export type HomeRepositoryDto = {
 	failure: string | null,
 };
 
+/**  One pull request, as one line of the ledger. */
+export type HomeRowDto = {
+	/**  Where this row sits in the flat order the cursor walks. */
+	index: number,
+	title: string,
+	url: string,
+	/**  `owner/name#number`. */
+	identity: string,
+	/**  Absent once GitHub has forgotten the account. */
+	author: string | null,
+	/**
+	 *  When the pull request last moved, as epoch milliseconds, which the age
+	 *  column is worked out from.
+	 */
+	updated_at_ms: number,
+	review_status: RowStatusDto | null,
+	check_status: RowStatusDto | null,
+};
+
 /**  Everything Home renders, from its header to its footer. */
 export type HomeSnapshotDto = {
 	/**  The header's count line, absent until there is something to count. */
 	count_line: string | null,
 	groups: HomeGroupDto[],
+	/**  Where the cursor sits, as a flat index across every rendered row. */
+	cursor: number,
+	refresh: RefreshStateDto,
+	/**  One line each above the list, naming a repository this refresh lost. */
+	failed_repositories: FailedRepositoryDto[],
 	repositories: HomeRepositoryDto[],
 	footer_summary: string,
 	footer_expanded: boolean,
 	refusals: RefusalDto[],
 	/**
-	 *  What replaces the list area when Home cannot read its repositories. The
-	 *  header and footer stay either way, so Add still works.
+	 *  What replaces the list area when Home cannot read its repositories or
+	 *  cannot use `gh`. The header and footer stay either way, so Add still
+	 *  works.
 	 */
 	failure: SessionFailureDto | null,
 	/**
@@ -203,6 +246,18 @@ export type HomeSnapshotDto = {
 export type LaunchDto = "Home" | { Session: {
 	description: string,
 } };
+
+/**  How current the list is, which the header stamp reads. */
+export type RefreshStateDto = 
+/**  There is no stamp at all until the first refresh starts. */
+"NeverRefreshed" | ({ Refreshing: {
+	done: number,
+	total: number,
+} }) & { Refreshed?: never } | 
+/**  Epoch milliseconds, which the relative stamp is worked out from. */
+({ Refreshed: {
+	at_ms: number,
+} }) & { Refreshing?: never } | "Failed";
 
 /**  Something Home would not do, and why. */
 export type RefusalDto = {
@@ -223,6 +278,12 @@ export type RowDto = {
 	 */
 	hunk_header: string | null,
 	thread_count: number,
+};
+
+/**  One status column's words and the weight they carry. */
+export type RowStatusDto = {
+	label: string,
+	tone: StatusToneDto,
 };
 
 export type SessionFailureDto = {
@@ -254,6 +315,14 @@ export type StaleDraftDto = {
 	/**  Where the draft used to sit, formatted for display, e.g. "was RIGHT line 42". */
 	location: string,
 };
+
+/**
+ *  Which severity a status column paints itself in.
+ * 
+ *  Named rather than coloured, so the values themselves stay in the one style
+ *  sheet that owns them.
+ */
+export type StatusToneDto = "Success" | "Error" | "Warning" | "Muted";
 
 /* Tauri Specta runtime */
 async function typedError<T, E>(result: Promise<T>): Promise<{ status: "ok"; data: T } | { status: "error"; error: E }> {

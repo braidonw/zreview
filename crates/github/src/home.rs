@@ -25,7 +25,10 @@ use crate::{
 /// GitHub documents a 256 character ceiling on a search query and at most five
 /// boolean operators, and eight `repo:` terms is what fits under the advanced
 /// syntax the query plan was measured against.
-const REPOSITORIES_PER_BATCH: usize = 8;
+///
+/// Public because a caller that reports progress per batch has to ask for one
+/// batch at a time, and a batch is this many repositories.
+pub const REPOSITORIES_PER_BATCH: usize = 8;
 
 /// GitHub serves at most 1,000 search results, which is twenty pages of fifty.
 /// Anything past that is a runaway rather than a long list.

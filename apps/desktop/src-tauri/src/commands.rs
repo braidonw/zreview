@@ -8,13 +8,13 @@ use std::{
     },
 };
 
-use app::{SessionPhase, SettingsWrite, lock};
+use app::{SessionPhase, SettingsWrite, lock, try_lock};
 use domain::DiffSide;
 use session::{ReviewStorage, SessionRequest};
 use tauri::ipc::Channel;
 use tauri_specta::collect_commands;
 
-use crate::{AppRoot, ManagedHome, ManagedSession, dto, repositories};
+use crate::{AppRoot, ManagedHome, ManagedSession, dto, pull_requests, repositories};
 
 /// The specta builder, shared between the invoke handler and the bindings export.
 #[must_use]
@@ -22,6 +22,7 @@ pub fn specta_builder() -> tauri_specta::Builder<tauri::Wry> {
     tauri_specta::Builder::<tauri::Wry>::new().commands(collect_commands![
         describe_launch,
         refresh_home,
+        move_home_cursor,
         add_repositories,
         remove_repository,
         toggle_repositories_footer,
@@ -34,10 +35,102 @@ pub fn specta_builder() -> tauri_specta::Builder<tauri::Wry> {
     ])
 }
 
-/// Re-reads the settings file and resolves every clone it lists.
-fn refresh_home_on_model(home: &ManagedHome, settings_path: &Path) {
-    let _ordered = lock(&home.settings_action);
+/// Re-reads the settings file, then fetches what every clone it lists has open.
+///
+/// A trigger that arrives while any settings action is running starts nothing.
+/// It is not queued, because a refresh only ever asks what is true now, and the
+/// one already running is about to answer that.
+///
+/// Takes the reporter as a plain callback so it can be tested without a Tauri
+/// channel, as `run_load` does.
+fn refresh_home_on_model(
+    home: &ManagedHome,
+    settings_path: &Path,
+    report: &dyn Fn(app::RefreshState),
+) {
+    let Some(_ordered) = try_lock(&home.settings_action) else {
+        return;
+    };
+    if !lock(&home.model).begin_refresh() {
+        return;
+    }
+    report_refresh(home, report);
+
     read_into_model(home, settings_path);
+    if lock(&home.model).failure().is_some() {
+        report_refresh(home, report);
+        return;
+    }
+    let (slugs, preflight_in) = to_fetch(&lock(&home.model));
+    if let Some(clone) = preflight_in
+        && let Err(failure) = pull_requests::preflight(&home.client, &clone)
+    {
+        lock(&home.model).preflight_failed(failure);
+        report_refresh(home, report);
+        return;
+    }
+
+    lock(&home.model).fetching(slugs.len());
+    report_refresh(home, report);
+    for batch in slugs.chunks(github::REPOSITORIES_PER_BATCH) {
+        let fetched = pull_requests::fetch_batch(&home.client, batch);
+        lock(&home.model).batch_fetched(fetched);
+        report_refresh(home, report);
+    }
+    lock(&home.model).finish_refresh(now_ms());
+    report_refresh(home, report);
+}
+
+fn report_refresh(home: &ManagedHome, report: &dyn Fn(app::RefreshState)) {
+    let state = lock(&home.model).refresh_state();
+    report(state);
+}
+
+/// The repositories a refresh will ask about, and the clone to preflight in.
+///
+/// One entry per distinct repository, so two checkouts of one project are
+/// fetched once and counted once.
+fn to_fetch(home: &app::HomeModel) -> (Vec<github::RepositorySlug>, Option<PathBuf>) {
+    let mut slugs: Vec<github::RepositorySlug> = Vec::new();
+    let mut preflight_in = None;
+    for entry in home.repositories() {
+        let Some(slug) = entry.slug() else {
+            continue;
+        };
+        preflight_in.get_or_insert_with(|| entry.path.clone());
+        if slugs.iter().any(|listed| listed.full_name() == slug) {
+            continue;
+        }
+        slugs.push(
+            github::parse_full_name(slug).expect("a slug the github crate formatted parses back"),
+        );
+    }
+    (slugs, preflight_in)
+}
+
+/// Now, as the epoch milliseconds the stamp is worked out from.
+///
+/// # Panics
+///
+/// Panics if the system clock is set before 1970, against which no relative
+/// time this screen shows would mean anything.
+fn now_ms() -> i64 {
+    let since_epoch = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("the system clock is set after 1970");
+    i64::try_from(since_epoch.as_millis()).expect("the system clock is set before the year 292M")
+}
+
+fn move_home_cursor_on_model(
+    home: &ManagedHome,
+    move_to: dto::CursorMoveDto,
+) -> dto::HomeSnapshotDto {
+    let mut guard = lock(&home.model);
+    match move_to {
+        dto::CursorMoveDto::Down => guard.move_cursor_down(),
+        dto::CursorMoveDto::Up => guard.move_cursor_up(),
+    }
+    dto::project_home(&guard)
 }
 
 /// Adds the folders a reviewer picked, then leaves Home showing the file.
@@ -338,23 +431,46 @@ pub async fn open_session(
     }
 }
 
-/// Re-reads the settings file and resolves every clone it lists.
+/// Re-reads the settings file, then fetches what every clone it lists has open.
 ///
-/// Runs when Home opens, after an Add or a Remove, and on `r`. A settings file
-/// that cannot be read comes back inside the snapshot rather than as a command
-/// error, because the header and footer stay on screen either way.
+/// Runs when Home opens and on `r`, reporting how far it has got on
+/// `on_progress` as each batch of repositories lands. A trigger that arrives
+/// mid-refresh starts nothing and answers with what is already on screen.
+///
+/// A settings file that cannot be read, or a `gh` that cannot be used, comes
+/// back inside the snapshot rather than as a command error, because the header
+/// and footer stay on screen either way.
 ///
 /// # Errors
 ///
-/// Returns a failure when the task doing the reading does not finish.
+/// Returns a failure when the task doing the fetching does not finish.
 #[tauri::command]
 #[specta::specta]
 #[allow(clippy::needless_pass_by_value)]
 pub async fn refresh_home(
     state: tauri::State<'_, AppRoot>,
+    on_progress: Channel<dto::RefreshStateDto>,
 ) -> Result<dto::HomeSnapshotDto, dto::SessionFailureDto> {
     let home = state.home.clone();
-    off_the_ui_thread(move || on_settings_file(&home, refresh_home_on_model)).await
+    off_the_ui_thread(move || {
+        on_settings_file(&home, |home, settings_path| {
+            refresh_home_on_model(home, settings_path, &|state| {
+                let _ = on_progress.send(state.into());
+            });
+        })
+    })
+    .await
+}
+
+/// Moves the cursor one row through the list, across the groups.
+#[tauri::command]
+#[specta::specta]
+#[allow(clippy::needless_pass_by_value)]
+pub fn move_home_cursor(
+    state: tauri::State<'_, AppRoot>,
+    move_to: dto::CursorMoveDto,
+) -> dto::HomeSnapshotDto {
+    move_home_cursor_on_model(&state.home, move_to)
 }
 
 /// Adds the folders the reviewer picked, writing the file once and refreshing.
@@ -555,6 +671,7 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
+    use crate::fake_gh::FakeGh;
 
     /// A sink whose writes always fail, for exercising `draft_write_failure`.
     struct FailingSink;
@@ -794,7 +911,7 @@ mod tests {
             head: "feature".to_owned(),
         };
         let root = AppRoot {
-            home: ManagedHome::new(),
+            home: ManagedHome::new(github::GithubClient::default()),
             session: Some(ManagedSession {
                 model: Arc::new(Mutex::new(app::SessionModel::loading(
                     request.description(),
@@ -816,7 +933,7 @@ mod tests {
     #[test]
     fn a_launch_with_no_session_is_described_as_home() {
         let root = AppRoot {
-            home: ManagedHome::new(),
+            home: ManagedHome::new(github::GithubClient::default()),
             session: None,
         };
 
@@ -839,8 +956,9 @@ mod tests {
         directory
     }
 
+    /// Home with a `gh` that is never run, for the actions that never reach it.
     fn home_model() -> ManagedHome {
-        ManagedHome::new()
+        ManagedHome::new(github::GithubClient::new("gh-that-is-never-run"))
     }
 
     /// What Home shows once an action has finished.
@@ -853,6 +971,231 @@ mod tests {
         settings::load(settings_path).unwrap().repositories
     }
 
+    /// A refresh with nothing listening to its progress.
+    fn refresh(home: &ManagedHome, settings_path: &Path) {
+        refresh_home_on_model(home, settings_path, &|_progress| {});
+    }
+
+    /// A settings file listing `clones`.
+    fn settings_listing(directory: &TempDir, clones: &[&TempDir]) -> PathBuf {
+        let listed = clones
+            .iter()
+            .map(|clone| format!("{:?}", clone.path().display().to_string()))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let path = directory.path().join("settings.toml");
+        std::fs::write(&path, format!("repositories = [{listed}]\n")).unwrap();
+        path
+    }
+
+    /// One recorded search answering for `slug`, with two rows to review.
+    fn recorded_search(slug: &str) -> String {
+        format!(
+            r#"{{"data":{{
+                "viewer":{{"login":"braidonw"}},
+                "rateLimit":{{"cost":1,"remaining":4999,"resetAt":"2026-09-01T13:00:00Z"}},
+                "toReview":{{"issueCount":2,"pageInfo":{{"hasNextPage":false,"endCursor":null}},"nodes":[
+                  {{"number":412,"title":"Retry webhook deliveries","url":"https://github.com/{slug}/pull/412",
+                   "isDraft":false,"updatedAt":"2026-09-01T12:34:56Z","headRefOid":"abc123",
+                   "repository":{{"nameWithOwner":"{slug}"}},"author":{{"login":"mlee"}},
+                   "viewerLatestReview":null,"statusCheckRollup":{{"state":"SUCCESS"}}}},
+                  {{"number":398,"title":"Split the renderer","url":"https://github.com/{slug}/pull/398",
+                   "isDraft":false,"updatedAt":"2026-08-30T09:00:00Z","headRefOid":"def456",
+                   "repository":{{"nameWithOwner":"{slug}"}},"author":{{"login":"priya"}},
+                   "viewerLatestReview":null,"statusCheckRollup":null}}
+                ]}},
+                "authored":{{"issueCount":0,"pageInfo":{{"hasNextPage":false,"endCursor":null}},"nodes":[]}}
+            }}}}"#,
+        )
+    }
+
+    /// Home reading `settings_path`, with a `gh` a test has set up.
+    fn home_with(gh: &FakeGh) -> ManagedHome {
+        ManagedHome::new(gh.client())
+    }
+
+    #[test]
+    fn a_refresh_lists_the_pull_requests_it_fetched() {
+        let gh = FakeGh::new();
+        gh.answer_graphql(&recorded_search("acme/widgets"));
+        let clone = clone_of("acme/widgets");
+        let directory = TempDir::new().unwrap();
+        let settings_path = settings_listing(&directory, &[&clone]);
+        let home = home_with(&gh);
+
+        refresh(&home, &settings_path);
+
+        let shown = snapshot(&home);
+        assert_eq!(
+            shown.count_line.as_deref(),
+            Some("2 pull requests across 1 repository"),
+        );
+        let to_review = &shown.groups[0];
+        assert_eq!(to_review.title, "To review");
+        assert_eq!(to_review.count, 2);
+        assert_eq!(to_review.rows[0].identity, "acme/widgets#412");
+        assert_eq!(to_review.rows[0].title, "Retry webhook deliveries");
+        assert_eq!(to_review.rows[0].author.as_deref(), Some("mlee"));
+        assert_eq!(
+            to_review.rows[0]
+                .check_status
+                .as_ref()
+                .expect("the head has checks")
+                .label,
+            "checks passing",
+        );
+        assert!(
+            to_review.rows[1].check_status.is_none(),
+            "a head with no checks leaves the column empty",
+        );
+        assert!(shown.failed_repositories.is_empty());
+    }
+
+    #[test]
+    fn a_refresh_counts_off_the_repositories_and_ends_with_the_time_it_settled() {
+        let gh = FakeGh::new();
+        gh.answer_graphql(&recorded_search("acme/widgets"));
+        let clone = clone_of("acme/widgets");
+        let directory = TempDir::new().unwrap();
+        let settings_path = settings_listing(&directory, &[&clone]);
+        let home = home_with(&gh);
+        let reported = Mutex::new(Vec::new());
+
+        refresh_home_on_model(&home, &settings_path, &|progress| {
+            reported.lock().unwrap().push(progress);
+        });
+
+        let reported = reported.lock().unwrap().clone();
+        assert_eq!(
+            reported.first(),
+            Some(&app::RefreshState::Refreshing { done: 0, total: 0 }),
+            "the total is unknown until the settings file has been read",
+        );
+        assert!(
+            reported.contains(&app::RefreshState::Refreshing { done: 1, total: 1 }),
+            "every repository is counted off: {reported:?}",
+        );
+        assert!(
+            matches!(reported.last(), Some(app::RefreshState::Refreshed { .. })),
+            "the last thing reported is the settled stamp: {reported:?}",
+        );
+    }
+
+    /// Two refreshes never race, and the one that lost was not queued behind
+    /// the one that won.
+    #[test]
+    fn a_refresh_that_arrives_while_the_settings_guard_is_held_starts_nothing() {
+        let gh = FakeGh::new();
+        let clone = clone_of("acme/widgets");
+        let directory = TempDir::new().unwrap();
+        let settings_path = settings_listing(&directory, &[&clone]);
+        let home = home_with(&gh);
+        let held = lock(&home.settings_action);
+
+        refresh(&home, &settings_path);
+
+        assert_eq!(
+            lock(&home.model).refresh_state(),
+            app::RefreshState::NeverRefreshed,
+            "nothing was started while the guard was held",
+        );
+        assert!(lock(&home.model).repositories().is_empty());
+        drop(held);
+    }
+
+    #[test]
+    fn a_gh_that_cannot_be_used_stops_the_refresh_and_says_what_to_fix() {
+        let gh = FakeGh::new();
+        gh.refuse_authentication();
+        let clone = clone_of("acme/widgets");
+        let directory = TempDir::new().unwrap();
+        let settings_path = settings_listing(&directory, &[&clone]);
+        let home = home_with(&gh);
+
+        refresh(&home, &settings_path);
+
+        let shown = snapshot(&home);
+        let failure = shown
+            .failure
+            .expect("the preflight failure replaces the list");
+        assert_eq!(failure.summary, "Home could not use the GitHub CLI");
+        assert!(failure.remediation.unwrap().contains("gh auth login"));
+        assert_eq!(shown.refresh, dto::RefreshStateDto::Failed);
+        assert_eq!(
+            shown.repositories.len(),
+            1,
+            "an unusable gh says nothing about the configured clones",
+        );
+    }
+
+    /// Fixing `gh` and pressing `r` is all it takes to get the list back.
+    #[test]
+    fn a_refresh_after_gh_is_fixed_restores_the_list() {
+        let gh = FakeGh::new();
+        gh.refuse_authentication();
+        gh.answer_graphql(&recorded_search("acme/widgets"));
+        let clone = clone_of("acme/widgets");
+        let directory = TempDir::new().unwrap();
+        let settings_path = settings_listing(&directory, &[&clone]);
+        let home = home_with(&gh);
+        refresh(&home, &settings_path);
+        assert!(snapshot(&home).failure.is_some());
+
+        gh.allow_authentication();
+        refresh(&home, &settings_path);
+
+        let shown = snapshot(&home);
+        assert!(shown.failure.is_none());
+        assert_eq!(shown.groups[0].count, 2);
+    }
+
+    #[test]
+    fn a_repository_that_could_not_be_fetched_shows_above_the_list_and_in_the_footer() {
+        let gh = FakeGh::new();
+        let clone = clone_of("acme/widgets");
+        let directory = TempDir::new().unwrap();
+        let settings_path = settings_listing(&directory, &[&clone]);
+        let home = home_with(&gh);
+
+        refresh(&home, &settings_path);
+
+        let shown = snapshot(&home);
+        assert_eq!(shown.failed_repositories.len(), 1);
+        assert_eq!(shown.failed_repositories[0].slug, "acme/widgets");
+        assert_eq!(
+            shown.failed_repositories[0].path,
+            clone.path().display().to_string()
+        );
+        assert!(!shown.failed_repositories[0].reason.is_empty());
+        assert!(shown.repositories[0].failure.is_some());
+        assert_eq!(
+            shown.refresh,
+            dto::RefreshStateDto::Failed,
+            "nothing loaded at all",
+        );
+    }
+
+    #[test]
+    fn the_cursor_moves_down_and_up_over_the_rows_a_refresh_listed() {
+        let gh = FakeGh::new();
+        gh.answer_graphql(&recorded_search("acme/widgets"));
+        let clone = clone_of("acme/widgets");
+        let directory = TempDir::new().unwrap();
+        let settings_path = settings_listing(&directory, &[&clone]);
+        let home = home_with(&gh);
+        refresh(&home, &settings_path);
+        assert_eq!(snapshot(&home).cursor, 0);
+
+        assert_eq!(
+            move_home_cursor_on_model(&home, dto::CursorMoveDto::Down).cursor,
+            1
+        );
+        assert_eq!(
+            move_home_cursor_on_model(&home, dto::CursorMoveDto::Up).cursor,
+            0
+        );
+    }
+
     #[test]
     fn refreshing_home_reads_the_settings_file_every_time() {
         let clone = clone_of("acme/widgets");
@@ -860,7 +1203,7 @@ mod tests {
         let settings_path = directory.path().join("settings.toml");
         let home = home_model();
 
-        refresh_home_on_model(&home, &settings_path);
+        refresh(&home, &settings_path);
         assert!(lock(&home.model).repositories().is_empty());
 
         std::fs::write(
@@ -871,7 +1214,7 @@ mod tests {
             ),
         )
         .unwrap();
-        refresh_home_on_model(&home, &settings_path);
+        refresh(&home, &settings_path);
 
         let guard = lock(&home.model);
         assert_eq!(guard.repositories().len(), 1, "a hand edit is picked up");
@@ -981,7 +1324,7 @@ mod tests {
         let malformed = "repositories = [this is not valid toml";
         std::fs::write(&settings_path, malformed).unwrap();
         let home = home_model();
-        refresh_home_on_model(&home, &settings_path);
+        refresh(&home, &settings_path);
 
         add_repositories_on_model(&home, &settings_path, &[clone.path().to_path_buf()]);
 
@@ -1006,7 +1349,7 @@ mod tests {
         let malformed = "repositories = [this is not valid toml";
         std::fs::write(&settings_path, malformed).unwrap();
         let home = home_model();
-        refresh_home_on_model(&home, &settings_path);
+        refresh(&home, &settings_path);
 
         remove_repository_on_model(&home, &settings_path, Path::new("/Developer/zreview"));
 
