@@ -1063,6 +1063,60 @@ mod tests {
         assert!(cancel.load(Ordering::Relaxed));
     }
 
+    /// The panel shows the latest line, so a report that arrives once the run is
+    /// over must not make a finished review look like it is still going.
+    #[test]
+    fn progress_lands_only_while_a_run_is_in_flight() {
+        let mut model = ready_model(None);
+
+        assert!(
+            !model.review_progress("Starting claude"),
+            "nothing is running yet"
+        );
+
+        model.review_started(Arc::new(AtomicBool::new(false)));
+        assert!(model.review_progress("Starting claude"));
+        assert!(
+            !model.review_progress("Starting claude"),
+            "the same line again is not worth a redraw"
+        );
+        let ReviewRunState::Running { detail, .. } = review(&model).run() else {
+            panic!("the run should be in flight");
+        };
+        assert_eq!(detail, "Starting claude");
+
+        model.review_finished(Findings::default(), Vec::new());
+        assert!(!model.review_progress("Reading the diff"));
+    }
+
+    /// A run that skipped files must not present itself as having covered the
+    /// change, and a run that suppressed claims must not look like one that
+    /// found nothing.
+    #[test]
+    fn a_completed_run_keeps_its_counts_and_what_it_did_not_see() {
+        let mut model = ready_model(None);
+        model.review_started(Arc::new(AtomicBool::new(false)));
+
+        model.review_finished(
+            Findings::default(),
+            vec!["vendor/lib.rs".to_owned(), "huge.json".to_owned()],
+        );
+
+        let ReviewRunState::Complete {
+            accepted,
+            rejected,
+            suppressed,
+            unreviewed,
+        } = review(&model).run()
+        else {
+            panic!("the run should have completed");
+        };
+        assert_eq!(*accepted, 0);
+        assert_eq!(*rejected, 0);
+        assert_eq!(*suppressed, 0);
+        assert_eq!(unreviewed, &["vendor/lib.rs", "huge.json"]);
+    }
+
     #[test]
     fn a_failed_run_keeps_its_remediation() {
         let mut model = ready_model(None);
