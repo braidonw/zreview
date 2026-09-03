@@ -48,10 +48,7 @@ export default function App() {
     (repository: string, number: number) => navigate(commands.openRow(repository, number)),
     [navigate],
   );
-  const returnToSession = useCallback(
-    () => navigate(commands.returnToSession()),
-    [navigate],
-  );
+  const returnToSession = useCallback(() => navigate(commands.returnToSession()), [navigate]);
   const returnToHome = useCallback(() => navigate(commands.returnToHome()), [navigate]);
 
   const { isShowingHome, session } =
@@ -59,13 +56,13 @@ export default function App() {
   // Only a Session opened from a row has a Home behind it to go back to.
   const canGoBack = !isShowingHome && session !== null && session.row_identity !== null;
 
+  // Cmd-[ is the only binding that goes back. Escape stays reserved for
+  // dismissing composers and panels, so back never eats a dismissal.
   useEffect(() => {
     if (!canGoBack) {
       return;
     }
     function handleKeydown(event: KeyboardEvent) {
-      // Escape stays reserved for dismissing composers and panels, so back
-      // never eats a dismissal.
       if (event.metaKey && event.key === "[") {
         event.preventDefault();
         returnToHome();
