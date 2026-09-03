@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import type { HomeSnapshotDto, OpenSessionDto, WindowDto } from "./bindings";
 import App from "./App";
@@ -58,12 +58,16 @@ vi.mock("@tauri-apps/plugin-clipboard-manager", () => ({ writeText: () => Promis
 
 /** The handler the screen gave Tauri's window focus event, once it is listening. */
 let focusChanged: ((event: { payload: boolean }) => void) | null = null;
-const stopListening = vi.fn();
 vi.mock("@tauri-apps/api/window", () => ({
   getCurrentWindow: () => ({
     onFocusChanged: (handler: (event: { payload: boolean }) => void) => {
       focusChanged = handler;
-      return Promise.resolve(stopListening);
+      // Unlistening stops delivery, exactly as it does through Tauri.
+      return Promise.resolve(() => {
+        if (focusChanged === handler) {
+          focusChanged = null;
+        }
+      });
     },
   }),
 }));
@@ -115,6 +119,13 @@ function listed(): HomeSnapshotDto {
   });
 }
 
+/** The same list, with the first row marked as the alive Session's own. */
+function withAliveRow(): HomeSnapshotDto {
+  const shown = listed();
+  shown.groups[0].rows[0] = { ...shown.groups[0].rows[0], is_alive: true };
+  return shown;
+}
+
 /** Every row on screen, in the order the ledger renders them. */
 function rows() {
   return screen.getAllByRole("listitem");
@@ -133,7 +144,6 @@ function rowFor(identity: string) {
 
 beforeEach(() => {
   focusChanged = null;
-  stopListening.mockReset();
   describeWindow.mockReset();
   describeWindow.mockResolvedValue(showingHome());
   openRow.mockReset();
@@ -181,7 +191,8 @@ describe("opening a row", () => {
     await openTheCursorRow();
 
     expect(openRow).toHaveBeenCalledWith("acme/widgets", 412);
-    expect(screen.queryByText("Retry webhook deliveries")).toBeNull();
+    // The Session is in front, which is the only screen offering a way back.
+    expect(screen.getByRole("button", { name: "Back to Home" })).toBeTruthy();
   });
 
   it("opens the row a click lands on", async () => {
@@ -193,7 +204,8 @@ describe("opening a row", () => {
     await waitFor(() => expect(openRow).toHaveBeenCalledWith("acme/widgets", 398));
   });
 
-  it("shows the failure when the row could not be opened", async () => {
+  it("shows a refused open inside Home, leaving its header and footer up", async () => {
+    describeWindow.mockResolvedValue(showingHome(alive("acme/billing#7")));
     openRow.mockResolvedValue({
       status: "error",
       error: {
@@ -209,6 +221,26 @@ describe("opening a row", () => {
     await waitFor(() =>
       expect(screen.getByText("Home has no configured clone of acme/widgets")).toBeTruthy(),
     );
+    expect(screen.getByText("Home")).toBeTruthy();
+    expect(screen.getByRole("button", { name: /acme\/billing#7/ })).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Add..." })).toBeTruthy();
+  });
+
+  it("clears a refused open on the next refresh", async () => {
+    openRow.mockResolvedValue({
+      status: "error",
+      error: { summary: "Home has no configured clone of acme/widgets", detail: null, remediation: null },
+    });
+    await openHome();
+    fireEvent.keyDown(window, { key: "Enter" });
+    await waitFor(() =>
+      expect(screen.getByText("Home has no configured clone of acme/widgets")).toBeTruthy(),
+    );
+
+    fireEvent.keyDown(window, { key: "r" });
+
+    await waitFor(() => expect(screen.getByText("Retry webhook deliveries")).toBeTruthy());
+    expect(screen.queryByText("Home has no configured clone of acme/widgets")).toBeNull();
   });
 });
 
@@ -273,29 +305,24 @@ describe("the Session kept alive behind Home", () => {
     await openTheCursorRow();
     await user.keyboard("j");
     await user.keyboard("c");
-    const composer = await waitFor(() => {
-      const element = document.querySelector("[data-composer] .cm-content");
-      if (!element) {
-        throw new Error("composer editor not mounted yet");
-      }
-      return element;
-    });
-    expect(composer.textContent).toContain("worth keeping");
+    await waitFor(() =>
+      expect(document.querySelector("[data-composer] .cm-content")?.textContent).toContain(
+        "worth keeping",
+      ),
+    );
 
     fireEvent.keyDown(window, { key: "[", metaKey: true });
     await waitFor(() => expect(screen.getByText("Retry webhook deliveries")).toBeTruthy());
-
-    // Hidden rather than unmounted, which is what makes returning free.
-    expect(document.querySelector(".app__session")?.hasAttribute("hidden")).toBe(true);
-    expect(document.querySelector("[data-composer] .cm-content")).toBe(composer);
     await user.click(screen.getByRole("button", { name: /acme\/widgets#412/ }));
 
     await waitFor(() => expect(screen.getByText("first")).toBeTruthy());
-    expect(document.querySelector("[data-composer] .cm-content")).toBe(composer);
-    expect(composer.textContent).toContain("worth keeping");
+    expect(document.querySelector("[data-composer] .cm-content")?.textContent).toContain(
+      "worth keeping",
+    );
     expect(screen.getByText("second").closest(".diff-row")?.className).toContain(
       "diff-row--selected",
     );
+    expect(openSession).toHaveBeenCalledTimes(1);
   });
 
   it("leaves the hidden Session's keys alone while Home has them", async () => {
@@ -330,6 +357,7 @@ describe("the Session kept alive behind Home", () => {
 
   it("marks the alive Session's row and leaves every other row unmarked", async () => {
     describeWindow.mockResolvedValue(showingHome(alive()));
+    refreshHome.mockResolvedValue(ok(withAliveRow()));
 
     await openHome();
 
@@ -339,6 +367,7 @@ describe("the Session kept alive behind Home", () => {
 
   it("returns to the alive Session rather than reloading it when its row is opened", async () => {
     describeWindow.mockResolvedValue(showingHome(alive()));
+    refreshHome.mockResolvedValue(ok(withAliveRow()));
     await openHome();
 
     fireEvent.keyDown(window, { key: "Enter" });
@@ -350,6 +379,7 @@ describe("the Session kept alive behind Home", () => {
   it("still opens a different row while a Session is alive", async () => {
     const user = userEvent.setup();
     describeWindow.mockResolvedValue(showingHome(alive()));
+    refreshHome.mockResolvedValue(ok(withAliveRow()));
     await openHome();
 
     await user.click(screen.getByText("Split the invoice renderer"));
@@ -389,10 +419,43 @@ describe("refreshing on focus", () => {
     expect(refreshHome).not.toHaveBeenCalled();
   });
 
-  it("stops listening once the Session replaces Home", async () => {
+  it("refreshes nothing on focus once the Session is showing", async () => {
     await openTheCursorRow();
+    refreshHome.mockClear();
 
-    expect(stopListening).toHaveBeenCalled();
+    focusChanged?.({ payload: true });
+
+    expect(refreshHome).not.toHaveBeenCalled();
+  });
+
+  /// A refresh running when a row is opened has nowhere to report to if Home
+  /// goes, and the return would then wait on a refresh that never settles.
+  it("lands the snapshot of a refresh still running when the row was opened", async () => {
+    let settle: ((snapshot: unknown) => void) | null = null;
+    let progress: ((shown: unknown) => void) | null = null;
+    refreshHome.mockImplementation((onProgress: { onmessage: (shown: unknown) => void }) => {
+      progress = (shown: unknown) => onProgress.onmessage(shown);
+      return new Promise((resolve) => {
+        settle = resolve;
+      });
+    });
+    render(<App />);
+    await waitFor(() => expect(progress).not.toBeNull());
+    act(() => progress?.({ ...listed(), refresh: { Refreshing: { done: 1, total: 3 } } }));
+    await waitFor(() => expect(screen.getByText("Refreshing 1 of 3")).toBeTruthy());
+
+    fireEvent.keyDown(window, { key: "Enter" });
+    await waitFor(() => expect(screen.getByText("first")).toBeTruthy());
+    fireEvent.keyDown(window, { key: "[", metaKey: true });
+    await waitFor(() => expect(screen.getByText("Retry webhook deliveries")).toBeTruthy());
+    // The refresh already running answers the return; a second never starts.
+    expect(refreshHome).toHaveBeenCalledTimes(1);
+
+    act(() =>
+      settle?.(ok({ ...listed(), refresh: { Refreshed: { at_ms: Date.now() - 150_000 } } })),
+    );
+
+    await waitFor(() => expect(screen.getByText("Refreshed 2 min ago")).toBeTruthy());
   });
 
   it("refreshes on no timer at all", async () => {

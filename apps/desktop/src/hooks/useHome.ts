@@ -19,20 +19,24 @@ function isTyping(target: EventTarget | null): boolean {
   return target.isContentEditable || target.closest("input, textarea") !== null;
 }
 
-/** Reads Home's pull requests and exposes every action the screen can take on them. */
+/**
+ * Reads Home's pull requests and exposes every action the screen can take.
+ *
+ * Home stays mounted behind a Session, so `isShowing` is what decides whether
+ * it answers the keyboard, listens for focus, and refreshes.
+ */
 export function useHome({
-  aliveIdentity,
+  isShowing,
   onOpenRow,
   onReturnToSession,
 }: {
-  /** `owner/name#number` of the Session alive behind Home, if one is. */
-  aliveIdentity: string | null;
-  onOpenRow: (repository: string, number: number) => void;
-  onReturnToSession: () => void;
+  isShowing: boolean;
+  onOpenRow: (repository: string, number: number) => Promise<SessionFailureDto | null>;
+  onReturnToSession: () => Promise<SessionFailureDto | null>;
 }) {
   const [snapshot, setSnapshot] = useState<HomeSnapshotDto | null>(null);
   const [failure, setFailure] = useState<SessionFailureDto | null>(null);
-  const hasOpened = useRef(false);
+  const [openFailure, setOpenFailure] = useState<SessionFailureDto | null>(null);
   const refreshing = useRef(false);
   // Read by the key handler, which is attached once and must still see the
   // list as it stands rather than as it was when it was attached.
@@ -69,6 +73,7 @@ export function useHome({
       return;
     }
     refreshing.current = true;
+    setOpenFailure(null);
     // Every batch carries what Home shows by then, so the list fills in as it loads.
     const channel = new Channel<HomeSnapshotDto>();
     channel.onmessage = (shown) => {
@@ -80,20 +85,29 @@ export function useHome({
     });
   }, [apply]);
 
+  // Home refreshes when it appears, which is the first time it is drawn and
+  // every return from a Session. What it last showed is what decides, so
+  // StrictMode's double mount effect refreshes once and a refresh already
+  // running is left to settle the screen itself.
+  const showed = useRef(false);
   useEffect(() => {
-    // Guarded so StrictMode's double mount effect does not refresh twice.
-    if (hasOpened.current) {
+    if (showed.current === isShowing) {
       return;
     }
-    hasOpened.current = true;
-    refresh();
-  }, [refresh]);
+    showed.current = isShowing;
+    if (isShowing) {
+      refresh();
+    }
+  }, [isShowing, refresh]);
 
   // Coming back from the browser shows the current state. Nothing polls, so
   // this and `r` are all that ever ask GitHub anything while Home is up. The
   // listener goes with the screen, so a Session in front of Home refreshes
   // nothing.
   useEffect(() => {
+    if (!isShowing) {
+      return;
+    }
     let listening = true;
     let stopListening: (() => void) | null = null;
     getCurrentWindow()
@@ -114,7 +128,7 @@ export function useHome({
       listening = false;
       stopListening?.();
     };
-  }, [refresh]);
+  }, [isShowing, refresh]);
 
   const toggleFooter = useCallback(() => {
     commands
@@ -172,30 +186,19 @@ export function useHome({
       .catch((error: unknown) => setFailure(toFailure(error)));
   }, []);
 
-  /** Whether this row's pull request is the one the alive Session is open on. */
-  const isAliveRow = useCallback(
-    (row: HomeRowDto) =>
-      // GitHub compares two repository names without regard to case, so a row
-      // that came back cased differently is still the alive Session's own.
-      aliveIdentity !== null && row.identity.toLowerCase() === aliveIdentity.toLowerCase(),
-    [aliveIdentity],
-  );
-
   /**
    * Opens `row`'s pull request, or returns to it when its Session is the one
    * alive behind Home.
    *
    * Returning never reloads, which is what keeps a half-finished review whole.
+   * A refusal stays on Home, which is where the reviewer can act on it.
    */
   const openRow = useCallback(
     (row: HomeRowDto) => {
-      if (isAliveRow(row)) {
-        onReturnToSession();
-        return;
-      }
-      onOpenRow(row.repository, row.number);
+      const navigated = row.is_alive ? onReturnToSession() : onOpenRow(row.repository, row.number);
+      navigated.then(setOpenFailure);
     },
-    [isAliveRow, onOpenRow, onReturnToSession],
+    [onOpenRow, onReturnToSession],
   );
 
   const openCursorRow = useCallback(() => {
@@ -215,6 +218,9 @@ export function useHome({
   // r refreshes, e opens or closes the Repositories footer, j and k walk the
   // rows, and Enter opens the one under the cursor.
   useEffect(() => {
+    if (!isShowing) {
+      return;
+    }
     function handleKeydown(event: KeyboardEvent) {
       if (event.metaKey || event.ctrlKey || event.altKey || event.shiftKey) {
         return;
@@ -251,15 +257,15 @@ export function useHome({
 
     window.addEventListener("keydown", handleKeydown);
     return () => window.removeEventListener("keydown", handleKeydown);
-  }, [moveCursor, openCursorRow, refresh, toggleFooter]);
+  }, [isShowing, moveCursor, openCursorRow, refresh, toggleFooter]);
 
   return {
     snapshot,
     failure,
+    openFailure,
     toggleFooter,
     addRepositories,
     removeRepository,
     openRow,
-    isAliveRow,
   };
 }

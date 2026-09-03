@@ -24,17 +24,20 @@ function stampText(refresh: RefreshStateDto, nowMs: number): string | null {
 
 /** The screen ZReview opens on when no pull request has been named. */
 export function HomeScreen({
+  isShowing,
   aliveIdentity,
   onOpenRow,
   onReturnToSession,
 }: {
+  /** False while a Session is in front, which is when Home goes quiet. */
+  isShowing: boolean;
   /** `owner/name#number` of the Session alive behind Home, if one is. */
   aliveIdentity: string | null;
-  onOpenRow: (repository: string, number: number) => void;
-  onReturnToSession: () => void;
+  onOpenRow: (repository: string, number: number) => Promise<SessionFailureDto | null>;
+  onReturnToSession: () => Promise<SessionFailureDto | null>;
 }) {
-  const { snapshot, failure, toggleFooter, addRepositories, removeRepository, openRow, isAliveRow } =
-    useHome({ aliveIdentity, onOpenRow, onReturnToSession });
+  const { snapshot, failure, openFailure, toggleFooter, addRepositories, removeRepository, openRow } =
+    useHome({ isShowing, onOpenRow, onReturnToSession });
   const nowMs = useNow();
 
   // A command that never answered leaves nothing worth trusting on screen.
@@ -58,8 +61,8 @@ export function HomeScreen({
       />
       <HomeBody
         snapshot={snapshot}
+        openFailure={openFailure}
         nowMs={nowMs}
-        isAliveRow={isAliveRow}
         onAdd={addRepositories}
         onRemove={removeRepository}
         onOpenRow={openRow}
@@ -138,23 +141,25 @@ function Header({
 /** The list area, which the empty state and a whole-Home failure each replace. */
 function HomeBody({
   snapshot,
+  openFailure,
   nowMs,
-  isAliveRow,
   onAdd,
   onRemove,
   onOpenRow,
 }: {
   snapshot: HomeSnapshotDto;
+  /** Why the last row would not open, until the next refresh asks again. */
+  openFailure: SessionFailureDto | null;
   nowMs: number;
-  isAliveRow: (row: HomeRowDto) => boolean;
   onAdd: () => void;
   onRemove: (path: string) => void;
   onOpenRow: (row: HomeRowDto) => void;
 }) {
-  if (snapshot.failure !== null) {
+  const blocked = snapshot.failure ?? openFailure;
+  if (blocked !== null) {
     return (
       <div className="home__body">
-        <FailureScreen failure={snapshot.failure} />
+        <FailureScreen failure={blocked} />
       </div>
     );
   }
@@ -200,7 +205,7 @@ function HomeBody({
                   key={row.identity}
                   row={row}
                   cursor={row.index === snapshot.cursor}
-                  alive={isAliveRow(row)}
+                  alive={row.is_alive}
                   nowMs={nowMs}
                   onOpen={onOpenRow}
                 />

@@ -34,6 +34,7 @@ export function SessionApp({
       return (
         <SessionShell
           state={state}
+          isShowing={isShowing}
           onBack={onBack}
           onSelectFile={selectFile}
           onRowClick={clickRow}

@@ -123,6 +123,7 @@ export function makeHomeRow(overrides: Partial<HomeRowDto> = {}): HomeRowDto {
     review_status: null,
     check_status: null,
     drafts_label: null,
+    is_alive: false,
     ...overrides,
   };
 }

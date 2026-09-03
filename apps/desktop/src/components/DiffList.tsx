@@ -11,6 +11,7 @@ import "./DiffList.css";
 
 export function DiffList({
   rows,
+  isShowing,
   fileIndex,
   cursor,
   selectionStart,
@@ -25,6 +26,8 @@ export function DiffList({
   onComposerDiscard,
 }: {
   rows: RowDto[];
+  /** False while Home is in front, which is when nothing here has a size. */
+  isShowing: boolean;
   fileIndex: number;
   cursor: number;
   selectionStart: number;
@@ -64,6 +67,17 @@ export function DiffList({
     virtualizer.scrollToIndex(cursor, { align: "auto" });
   }, [cursor, virtualizer]);
 
+  useEffect(() => {
+    // Nothing has a size while the Session is hidden, so what was measured
+    // then is worth nothing and the scroll it decided is gone. Measure again
+    // and put the cursor row back where the reviewer left it.
+    if (!isShowing || rows.length === 0) {
+      return;
+    }
+    virtualizer.measure();
+    virtualizer.scrollToIndex(cursor, { align: "auto" });
+  }, [isShowing]);
+
   return (
     <div ref={scrollRef} className="diff-list">
       <div className="diff-list__spacer" style={{ height: virtualizer.getTotalSize() }}>
@@ -96,6 +110,7 @@ export function DiffList({
               {composerOpenHere && composer && (
                 <CommentComposer
                   rows={composer.rows}
+                  isShowing={isShowing}
                   prefill={composerPrefill}
                   notice={composer.notice}
                   onChange={onComposerChange}

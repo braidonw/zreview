@@ -12,12 +12,19 @@ type WindowResult =
   | { status: "ok"; data: WindowDto }
   | { status: "error"; error: SessionFailureDto };
 
-/** Which screen is in front, and the Session the window holds either way. */
-function screens(shown: WindowDto): { isShowingHome: boolean; session: OpenSessionDto | null } {
+/** Which screen the window shows, and the Session it holds either way. */
+type Screen = { isShowingHome: boolean; session: OpenSessionDto | null };
+
+function currentScreen(shown: WindowDto): Screen {
   if ("Home" in shown && shown.Home !== undefined) {
     return { isShowingHome: true, session: shown.Home.alive };
   }
-  return { isShowingHome: false, session: shown.Session.session };
+  if ("Session" in shown && shown.Session !== undefined) {
+    return { isShowingHome: false, session: shown.Session.session };
+  }
+  // A window the backend grew a third screen for, which nothing here can draw.
+  const unknown: never = shown;
+  throw new Error(`the window is showing something unknown ${JSON.stringify(unknown)}`);
 }
 
 export default function App() {
@@ -31,17 +38,22 @@ export default function App() {
       .catch((error: unknown) => setFailure(toFailure(error)));
   }, []);
 
-  /** Takes what a navigation answered, so a refusal is shown rather than swallowed. */
+  /**
+   * Navigates, answering with the refusal when the window would not.
+   *
+   * A refusal is handed back rather than shown here, because the screen that
+   * asked is still on and is where the reviewer can act on it.
+   */
   const navigate = useCallback((call: Promise<WindowResult>) => {
-    call
+    return call
       .then((result) => {
         if (result.status === "error") {
-          setFailure(toFailure(result.error));
-          return;
+          return toFailure(result.error);
         }
         setShown(result.data);
+        return null;
       })
-      .catch((error: unknown) => setFailure(toFailure(error)));
+      .catch((error: unknown) => toFailure(error));
   }, []);
 
   const openRow = useCallback(
@@ -49,12 +61,20 @@ export default function App() {
     [navigate],
   );
   const returnToSession = useCallback(() => navigate(commands.returnToSession()), [navigate]);
-  const returnToHome = useCallback(() => navigate(commands.returnToHome()), [navigate]);
+  const returnToHome = useCallback(() => {
+    navigate(commands.returnToHome()).then((refused) => {
+      if (refused !== null) {
+        setFailure(refused);
+      }
+    });
+  }, [navigate]);
 
   const { isShowingHome, session } =
-    shown === null ? { isShowingHome: true, session: null } : screens(shown);
+    shown === null ? { isShowingHome: true, session: null } : currentScreen(shown);
   // Only a Session opened from a row has a Home behind it to go back to.
   const canGoBack = !isShowingHome && session !== null && session.row_identity !== null;
+  // A window the command line opened straight into a Session has no Home at all.
+  const hasHome = shown !== null && (isShowingHome || canGoBack);
 
   // Cmd-[ is the only binding that goes back. Escape stays reserved for
   // dismissing composers and panels, so back never eats a dismissal.
@@ -83,12 +103,17 @@ export default function App() {
 
   return (
     <>
-      {isShowingHome && (
-        <HomeScreen
-          aliveIdentity={session?.row_identity ?? null}
-          onOpenRow={openRow}
-          onReturnToSession={returnToSession}
-        />
+      {hasHome && (
+        // Kept mounted behind the Session, so a refresh still running when a
+        // row was opened has somewhere to land and settles the screen on return.
+        <div className="app__home" hidden={!isShowingHome}>
+          <HomeScreen
+            isShowing={isShowingHome}
+            aliveIdentity={session?.row_identity ?? null}
+            onOpenRow={openRow}
+            onReturnToSession={returnToSession}
+          />
+        </div>
       )}
       {session !== null && (
         // Kept mounted while Home shows, so the file, cursor, and unsent

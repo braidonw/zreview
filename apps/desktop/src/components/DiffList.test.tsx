@@ -19,6 +19,7 @@ function rows(): RowDto[] {
 /** Every prop DiffList needs beyond the ones a test wants to vary. */
 function baseProps() {
   return {
+    isShowing: true,
     fileIndex: 0,
     drafts: makeDrafts(),
     composer: null as ComposerState,

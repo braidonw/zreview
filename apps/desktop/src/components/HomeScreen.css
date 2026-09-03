@@ -199,6 +199,7 @@
 
 /* One dense line per pull request, on the file row's scale. */
 .home__row {
+  position: relative;
   height: var(--file-row-height);
   padding: 0 12px;
   display: flex;
@@ -253,19 +254,19 @@
   font-size: var(--size-label);
 }
 
-/* Wide enough for "you reviewed this head", the longest label it carries, so
-   the mark can sit in the gap before it without any clipping to fear. */
+/* Wide enough for "you reviewed this head", the longest label it carries. */
 .home__cell--review {
   width: 172px;
-  position: relative;
-  overflow: visible;
 }
 
-/* The alive Session's row, marked where its statuses begin. Out of the text
-   flow, so every other row's columns stay aligned with it. */
+/* The alive Session's row, marked in the gap where its statuses begin.
+   Positioned against the row rather than the cell it sits in, so it is out of
+   every other row's way and no cell has to give up hiding its overflow. Its
+   horizontal place is the one it would have had in the cell, shifted back into
+   the gap; its vertical place is the middle of the row. */
 .home__alive-mark {
   position: absolute;
-  left: -9px;
+  margin-left: -9px;
   top: 50%;
   width: 6px;
   height: 6px;
