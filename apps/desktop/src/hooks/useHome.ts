@@ -1,7 +1,8 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { Channel } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
-import type { CursorMoveDto, HomeSnapshotDto, SessionFailureDto } from "../bindings";
+import { getCurrentWindow } from "@tauri-apps/api/window";
+import type { CursorMoveDto, HomeRowDto, HomeSnapshotDto, SessionFailureDto } from "../bindings";
 import { commands } from "../bindings";
 import { toFailure } from "../lib/failure";
 
@@ -19,11 +20,24 @@ function isTyping(target: EventTarget | null): boolean {
 }
 
 /** Reads Home's pull requests and exposes every action the screen can take on them. */
-export function useHome() {
+export function useHome({
+  aliveIdentity,
+  onOpenRow,
+  onReturnToSession,
+}: {
+  /** `owner/name#number` of the Session alive behind Home, if one is. */
+  aliveIdentity: string | null;
+  onOpenRow: (repository: string, number: number) => void;
+  onReturnToSession: () => void;
+}) {
   const [snapshot, setSnapshot] = useState<HomeSnapshotDto | null>(null);
   const [failure, setFailure] = useState<SessionFailureDto | null>(null);
   const hasOpened = useRef(false);
   const refreshing = useRef(false);
+  // Read by the key handler, which is attached once and must still see the
+  // list as it stands rather than as it was when it was attached.
+  const shown = useRef<HomeSnapshotDto | null>(null);
+  shown.current = snapshot;
 
   /** Takes what a command answered, so a rejection is shown rather than swallowed. */
   const apply = useCallback((call: Promise<HomeResult>) => {
@@ -73,6 +87,33 @@ export function useHome() {
     }
     hasOpened.current = true;
     refresh();
+  }, [refresh]);
+
+  // Coming back from the browser shows the current state. Nothing polls, so
+  // this and `r` are all that ever ask GitHub anything while Home is up. The
+  // listener goes with the screen, so a Session in front of Home refreshes
+  // nothing.
+  useEffect(() => {
+    let listening = true;
+    let stopListening: (() => void) | null = null;
+    getCurrentWindow()
+      .onFocusChanged(({ payload: focused }) => {
+        if (focused) {
+          refresh();
+        }
+      })
+      .then((stop) => {
+        if (listening) {
+          stopListening = stop;
+        } else {
+          stop();
+        }
+      })
+      .catch((error: unknown) => setFailure(toFailure(error)));
+    return () => {
+      listening = false;
+      stopListening?.();
+    };
   }, [refresh]);
 
   const toggleFooter = useCallback(() => {
@@ -131,8 +172,48 @@ export function useHome() {
       .catch((error: unknown) => setFailure(toFailure(error)));
   }, []);
 
-  // r refreshes, e opens or closes the Repositories footer, and j and k walk the
-  // rows, as the layout prototype bound them.
+  /** Whether this row's pull request is the one the alive Session is open on. */
+  const isAliveRow = useCallback(
+    (row: HomeRowDto) =>
+      // GitHub compares two repository names without regard to case, so a row
+      // that came back cased differently is still the alive Session's own.
+      aliveIdentity !== null && row.identity.toLowerCase() === aliveIdentity.toLowerCase(),
+    [aliveIdentity],
+  );
+
+  /**
+   * Opens `row`'s pull request, or returns to it when its Session is the one
+   * alive behind Home.
+   *
+   * Returning never reloads, which is what keeps a half-finished review whole.
+   */
+  const openRow = useCallback(
+    (row: HomeRowDto) => {
+      if (isAliveRow(row)) {
+        onReturnToSession();
+        return;
+      }
+      onOpenRow(row.repository, row.number);
+    },
+    [isAliveRow, onOpenRow, onReturnToSession],
+  );
+
+  const openCursorRow = useCallback(() => {
+    const listed = shown.current;
+    if (listed === null) {
+      return;
+    }
+    const row = listed.groups
+      .flatMap((group) => group.rows)
+      .find((candidate) => candidate.index === listed.cursor);
+    if (row === undefined) {
+      return;
+    }
+    openRow(row);
+  }, [openRow]);
+
+  // r refreshes, e opens or closes the Repositories footer, j and k walk the
+  // rows, and Enter opens the one under the cursor.
   useEffect(() => {
     function handleKeydown(event: KeyboardEvent) {
       if (event.metaKey || event.ctrlKey || event.altKey || event.shiftKey) {
@@ -142,6 +223,11 @@ export function useHome() {
         return;
       }
       const key = event.key.toLowerCase();
+      if (key === "enter") {
+        event.preventDefault();
+        openCursorRow();
+        return;
+      }
       if (key === "r") {
         event.preventDefault();
         refresh();
@@ -165,7 +251,15 @@ export function useHome() {
 
     window.addEventListener("keydown", handleKeydown);
     return () => window.removeEventListener("keydown", handleKeydown);
-  }, [moveCursor, refresh, toggleFooter]);
+  }, [moveCursor, openCursorRow, refresh, toggleFooter]);
 
-  return { snapshot, failure, toggleFooter, addRepositories, removeRepository };
+  return {
+    snapshot,
+    failure,
+    toggleFooter,
+    addRepositories,
+    removeRepository,
+    openRow,
+    isAliveRow,
+  };
 }

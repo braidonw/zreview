@@ -7,6 +7,7 @@ import { SessionShell } from "./SessionShell";
 /** Every prop SessionShell needs beyond the ones a test wants to vary. */
 function baseHandlers() {
   return {
+    onBack: null,
     onSelectFile: () => {},
     onRowClick: () => {},
     onOpenComposer: () => {},

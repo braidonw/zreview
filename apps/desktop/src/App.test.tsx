@@ -5,7 +5,7 @@ import type { Channel } from "@tauri-apps/api/core";
 import App from "./App";
 import { makeFile, makeFileSummary, makeRow, makeSidebar, makeSnapshot } from "./test/fixtures";
 
-const describeLaunch = vi.fn();
+const describeWindow = vi.fn();
 const openSession = vi.fn();
 const selectFile = vi.fn();
 const toggleViewed = vi.fn();
@@ -15,7 +15,7 @@ const reanchorDraft = vi.fn();
 
 vi.mock("./bindings", () => ({
   commands: {
-    describeLaunch: () => describeLaunch(),
+    describeWindow: () => describeWindow(),
     openSession: (channel: unknown) => openSession(channel),
     selectFile: (index: unknown) => selectFile(index),
     toggleViewed: () => toggleViewed(),
@@ -31,8 +31,10 @@ vi.mock("@tauri-apps/plugin-clipboard-manager", () => ({
 }));
 
 beforeEach(() => {
-  describeLaunch.mockReset();
-  describeLaunch.mockResolvedValue({ Session: { description: "the generated fixture" } });
+  describeWindow.mockReset();
+  describeWindow.mockResolvedValue({
+    Session: { session: { description: "the generated fixture", row_identity: null } },
+  });
   openSession.mockReset();
   selectFile.mockReset();
   toggleViewed.mockReset();
@@ -110,8 +112,8 @@ describe("App", () => {
   });
 
   it("shows the failure screen when the launch call rejects", async () => {
-    describeLaunch.mockReset();
-    describeLaunch.mockRejectedValue(new Error("the launch could not be described"));
+    describeWindow.mockReset();
+    describeWindow.mockRejectedValue(new Error("the launch could not be described"));
 
     render(<App />);
 

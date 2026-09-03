@@ -8,6 +8,7 @@ import "./SessionShell.css";
 
 export function SessionShell({
   state,
+  onBack,
   onSelectFile,
   onRowClick,
   onOpenComposer,
@@ -17,6 +18,8 @@ export function SessionShell({
   onReanchorDraft,
 }: {
   state: ReadyState;
+  /** Absent for a Session with no Home behind it, which offers no way back. */
+  onBack: (() => void) | null;
   onSelectFile: (index: number) => void;
   onRowClick: (index: number) => void;
   onOpenComposer: (index: number) => void;
@@ -32,6 +35,7 @@ export function SessionShell({
   return (
     <div className="session-shell">
       <FileSidebar
+        onBack={onBack}
         title={state.snapshot.title}
         subtitle={state.snapshot.subtitle}
         sidebar={state.snapshot.sidebar}

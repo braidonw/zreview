@@ -8,8 +8,13 @@ import { toFailure } from "../lib/failure";
 import { initialState, selectionRange, sessionReducer } from "./sessionReducer";
 import { useDraftQueue } from "./useDraftQueue";
 
-/** Loads the session the window was launched into and exposes every action the UI can take on it. */
-export function useSession(description: string) {
+/**
+ * Loads one session and exposes every action the UI can take on it.
+ *
+ * `isShowing` is false while Home is in front of this session, which keeps its
+ * hidden tree from answering keystrokes meant for the list.
+ */
+export function useSession(description: string, isShowing: boolean) {
   const [state, dispatch] = useReducer(sessionReducer, initialState);
   const stateRef = useRef(state);
   stateRef.current = state;
@@ -108,7 +113,7 @@ export function useSession(description: string) {
   );
 
   useEffect(() => {
-    if (state.status !== "ready") {
+    if (state.status !== "ready" || !isShowing) {
       return;
     }
 
@@ -169,7 +174,7 @@ export function useSession(description: string) {
 
     window.addEventListener("keydown", handleKeydown);
     return () => window.removeEventListener("keydown", handleKeydown);
-  }, [state.status, selectFile, toggleViewed]);
+  }, [state.status, isShowing, selectFile, toggleViewed]);
 
   return {
     state,

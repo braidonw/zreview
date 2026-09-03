@@ -10,7 +10,7 @@ import {
   makeHomeSnapshot,
 } from "./test/fixtures";
 
-const describeLaunch = vi.fn();
+const describeWindow = vi.fn();
 const refreshHome = vi.fn();
 const addRepositories = vi.fn();
 const removeRepository = vi.fn();
@@ -20,7 +20,7 @@ const moveHomeCursor = vi.fn();
 
 vi.mock("./bindings", () => ({
   commands: {
-    describeLaunch: () => describeLaunch(),
+    describeWindow: () => describeWindow(),
     refreshHome: (onProgress: unknown) => refreshHome(onProgress),
     moveHomeCursor: (moveTo: unknown) => moveHomeCursor(moveTo),
     addRepositories: (folders: unknown) => addRepositories(folders),
@@ -32,6 +32,10 @@ vi.mock("./bindings", () => ({
 const open = vi.fn();
 vi.mock("@tauri-apps/plugin-dialog", () => ({
   open: (options: unknown) => open(options),
+}));
+
+vi.mock("@tauri-apps/api/window", () => ({
+  getCurrentWindow: () => ({ onFocusChanged: () => Promise.resolve(() => {}) }),
 }));
 
 // The commands that touch the settings file answer with a result, as the bindings do.
@@ -71,8 +75,8 @@ function selectedIdentity() {
 }
 
 beforeEach(() => {
-  describeLaunch.mockReset();
-  describeLaunch.mockResolvedValue("Home");
+  describeWindow.mockReset();
+  describeWindow.mockResolvedValue({ Home: { alive: null } });
   refreshHome.mockReset();
   refreshHome.mockResolvedValue(ok(makeHomeSnapshot()));
   addRepositories.mockReset();

@@ -8,6 +8,7 @@ import { FileSidebar } from "./FileSidebar";
 /** Every prop FileSidebar needs beyond the ones a test wants to vary. */
 function baseProps() {
   return {
+    onBack: null,
     title: "t",
     subtitle: "s",
     warnings: [],

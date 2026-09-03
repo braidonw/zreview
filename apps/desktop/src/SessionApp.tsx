@@ -3,7 +3,17 @@ import { LoadingScreen } from "./components/LoadingScreen";
 import { SessionShell } from "./components/SessionShell";
 import { useSession } from "./hooks/useSession";
 
-export function SessionApp({ description }: { description: string }) {
+export function SessionApp({
+  description,
+  isShowing,
+  onBack,
+}: {
+  description: string;
+  /** False while Home is in front, which is when this Session yields the keyboard. */
+  isShowing: boolean;
+  /** Absent for a Session with no Home behind it, which offers no way back. */
+  onBack: (() => void) | null;
+}) {
   const {
     state,
     selectFile,
@@ -13,7 +23,7 @@ export function SessionApp({ description }: { description: string }) {
     composerChange,
     composerDiscard,
     reanchorDraft,
-  } = useSession(description);
+  } = useSession(description, isShowing);
 
   switch (state.status) {
     case "loading":
@@ -24,6 +34,7 @@ export function SessionApp({ description }: { description: string }) {
       return (
         <SessionShell
           state={state}
+          onBack={onBack}
           onSelectFile={selectFile}
           onRowClick={clickRow}
           onOpenComposer={openComposer}

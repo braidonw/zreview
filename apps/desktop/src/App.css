@@ -1,0 +1,5 @@
+/* The Session, in front of Home or hidden behind it. The hidden attribute is
+   what takes it off screen, so its tree is never torn down and rebuilt. */
+.app__session {
+  height: 100%;
+}

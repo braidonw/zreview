@@ -15,7 +15,36 @@
   border-bottom: 1px solid var(--border-default);
 }
 
+.file-sidebar__identity {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  min-width: 0;
+}
+
+/* The way back to Home, bound to cmd-[, beside the pull request it names. */
+.file-sidebar__back {
+  flex-shrink: 0;
+  width: 16px;
+  height: 16px;
+  padding: 0;
+  border: 0;
+  border-radius: 3px;
+  background: none;
+  font-family: var(--font-sans);
+  font-size: var(--size-body);
+  line-height: 1;
+  color: var(--text-tertiary);
+  cursor: pointer;
+}
+
+.file-sidebar__back:hover {
+  background: var(--surface-hover);
+  color: var(--text-primary);
+}
+
 .file-sidebar__label {
+  min-width: 0;
   color: var(--severity-info);
   font-size: var(--size-meta);
   overflow: hidden;
