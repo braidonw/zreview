@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { Channel } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
-import type { CursorMoveDto, HomeSnapshotDto, RefreshStateDto, SessionFailureDto } from "../bindings";
+import type { CursorMoveDto, HomeSnapshotDto, SessionFailureDto } from "../bindings";
 import { commands } from "../bindings";
 import { toFailure } from "../lib/failure";
 
@@ -18,38 +18,56 @@ function isTyping(target: EventTarget | null): boolean {
   return target.isContentEditable || target.closest("input, textarea") !== null;
 }
 
-/** Reads Home's repositories and exposes every action the screen can take on them. */
+/** Reads Home's pull requests and exposes every action the screen can take on them. */
 export function useHome() {
   const [snapshot, setSnapshot] = useState<HomeSnapshotDto | null>(null);
   const [failure, setFailure] = useState<SessionFailureDto | null>(null);
   const hasOpened = useRef(false);
+  const refreshing = useRef(false);
 
   /** Takes what a command answered, so a rejection is shown rather than swallowed. */
   const apply = useCallback((call: Promise<HomeResult>) => {
-    call
+    return call
       .then((result) => {
         if (result.status === "error") {
           setFailure(toFailure(result.error));
-          return;
+          return false;
         }
         setFailure(null);
         setSnapshot(result.data);
+        return true;
       })
-      .catch((error: unknown) => setFailure(toFailure(error)));
+      .catch((error: unknown) => {
+        setFailure(toFailure(error));
+        return false;
+      });
   }, []);
 
-  /** What the running refresh last reported, which outranks the snapshot's own stamp. */
-  const [progress, setProgress] = useState<RefreshStateDto | null>(null);
-
+  /**
+   * Refreshes, or leaves the running refresh alone.
+   *
+   * A trigger that arrives mid-refresh is ignored rather than queued, so the
+   * list a reviewer is reading is never replaced by an older answer to a
+   * question the running refresh is already asking.
+   */
   const refresh = useCallback(() => {
-    const channel = new Channel<RefreshStateDto>();
-    channel.onmessage = setProgress;
-    // The answer carries the settled stamp, so the reported one has done its job.
-    apply(commands.refreshHome(channel).finally(() => setProgress(null)));
+    if (refreshing.current) {
+      return;
+    }
+    refreshing.current = true;
+    // Every batch carries what Home shows by then, so the list fills in as it loads.
+    const channel = new Channel<HomeSnapshotDto>();
+    channel.onmessage = (shown) => {
+      setFailure(null);
+      setSnapshot(shown);
+    };
+    apply(commands.refreshHome(channel)).finally(() => {
+      refreshing.current = false;
+    });
   }, [apply]);
 
   useEffect(() => {
-    // Guarded so StrictMode's double mount effect does not read the file twice.
+    // Guarded so StrictMode's double mount effect does not refresh twice.
     if (hasOpened.current) {
       return;
     }
@@ -67,11 +85,23 @@ export function useHome() {
       .catch((error: unknown) => setFailure(toFailure(error)));
   }, []);
 
+  /** Runs `action`, then refreshes, so what the settings file now lists is listed. */
+  const thenRefresh = useCallback(
+    (action: Promise<HomeResult>) => {
+      apply(action).then((changed) => {
+        if (changed) {
+          refresh();
+        }
+      });
+    },
+    [apply, refresh],
+  );
+
   const removeRepository = useCallback(
     (path: string) => {
-      apply(commands.removeRepository(path));
+      thenRefresh(commands.removeRepository(path));
     },
-    [apply],
+    [thenRefresh],
   );
 
   /** Opens the native folder picker, then hands what was chosen to the add command. */
@@ -86,10 +116,10 @@ export function useHome() {
           return;
         }
         const folders = Array.isArray(picked) ? picked : [picked];
-        apply(commands.addRepositories(folders));
+        thenRefresh(commands.addRepositories(folders));
       })
       .catch((error: unknown) => setFailure(toFailure(error)));
-  }, [apply]);
+  }, [thenRefresh]);
 
   const moveCursor = useCallback((moveTo: CursorMoveDto) => {
     commands
@@ -137,16 +167,5 @@ export function useHome() {
     return () => window.removeEventListener("keydown", handleKeydown);
   }, [moveCursor, refresh, toggleFooter]);
 
-  // What the running refresh reports outranks the stamp the last one left.
-  const refreshState = progress ?? snapshot?.refresh ?? null;
-
-  return {
-    snapshot,
-    refreshState,
-    failure,
-    refresh,
-    toggleFooter,
-    addRepositories,
-    removeRepository,
-  };
+  return { snapshot, failure, toggleFooter, addRepositories, removeRepository };
 }

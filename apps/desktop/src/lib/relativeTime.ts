@@ -31,7 +31,7 @@ export function refreshedStamp(atMs: number, nowMs: number): string {
     return `Refreshed ${minutes} min ago`;
   }
   if (hours < 24) {
-    return `Refreshed ${hours} h ago`;
+    return `Refreshed ${hours} ${hours === 1 ? "hour" : "hours"} ago`;
   }
-  return `Refreshed ${days} d ago`;
+  return `Refreshed ${days} ${days === 1 ? "day" : "days"} ago`;
 }

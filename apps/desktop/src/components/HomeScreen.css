@@ -204,6 +204,7 @@
   flex-shrink: 0;
   overflow: hidden;
   white-space: nowrap;
+  text-overflow: ellipsis;
   font-family: var(--font-mono);
   font-size: var(--size-meta);
   color: var(--text-tertiary);
@@ -213,8 +214,9 @@
   width: 60px;
 }
 
+/* Wide enough for "you reviewed this head", the longest label it carries. */
 .home__cell--review {
-  width: 150px;
+  width: 172px;
 }
 
 .home__cell--checks {

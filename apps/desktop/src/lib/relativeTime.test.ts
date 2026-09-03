@@ -37,8 +37,10 @@ describe("refreshedStamp", () => {
 
   it("counts minutes, then hours, then days", () => {
     expect(refreshedStamp(now - 2 * minute, now)).toBe("Refreshed 2 min ago");
-    expect(refreshedStamp(now - 3 * hour, now)).toBe("Refreshed 3 h ago");
-    expect(refreshedStamp(now - 2 * day, now)).toBe("Refreshed 2 d ago");
+    expect(refreshedStamp(now - 1 * hour, now)).toBe("Refreshed 1 hour ago");
+    expect(refreshedStamp(now - 3 * hour, now)).toBe("Refreshed 3 hours ago");
+    expect(refreshedStamp(now - 1 * day, now)).toBe("Refreshed 1 day ago");
+    expect(refreshedStamp(now - 2 * day, now)).toBe("Refreshed 2 days ago");
   });
 
   it("reads just now for a time ahead of now", () => {

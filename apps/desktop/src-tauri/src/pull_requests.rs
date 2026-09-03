@@ -9,8 +9,8 @@ use std::path::Path;
 use app::{FetchedPullRequest, RepositoryFetch};
 use domain::SessionFailure;
 use github::{
-    GithubClient, GithubError, HomePullRequest, HomeRepository, RepositorySlug, ReviewState,
-    ReviewThread,
+    GithubClient, GithubError, HomeFetch, HomePullRequest, HomeRepository, RepositorySlug,
+    ReviewState, ReviewThread,
 };
 
 /// Confirms `gh` is installed and signed in before a refresh spends anything.
@@ -21,7 +21,7 @@ use github::{
 /// # Errors
 ///
 /// Returns what Home shows in place of its list when `gh` cannot be used.
-pub fn preflight(client: &GithubClient, clone_root: &Path) -> Result<(), SessionFailure> {
+pub(crate) fn preflight(client: &GithubClient, clone_root: &Path) -> Result<(), SessionFailure> {
     client
         .check_authentication(clone_root)
         .map_err(|error| preflight_failure(&error))
@@ -32,18 +32,26 @@ fn preflight_failure(error: &GithubError) -> SessionFailure {
         .with_optional_remediation(error.remediation())
 }
 
-/// Fetches one batch of repositories, reduced to what Home's model reads.
+/// Fetches `repositories`, handing `on_batch` each batch as it answers.
 ///
-/// A batch is what a refresh reports progress in, so it is the caller that
-/// splits the configured repositories into batches rather than the fetch.
-#[must_use]
-pub fn fetch_batch(client: &GithubClient, batch: &[RepositorySlug]) -> Vec<RepositoryFetch> {
-    let fetched = client.fetch_home_pull_requests(batch);
-    let viewer_login = fetched.viewer_login;
-    fetched
+/// Batching and the collapsing of two clones that name one repository belong to
+/// the fetch, which is the one place that knows how GitHub compares two names.
+pub(crate) fn fetch(
+    client: &GithubClient,
+    repositories: &[RepositorySlug],
+    on_batch: &dyn Fn(Vec<RepositoryFetch>),
+) {
+    let _fetched = client.fetch_home_pull_requests_with_progress(repositories, &|batch| {
+        on_batch(map_batch(batch));
+    });
+}
+
+/// Reduces one batch's answer to what Home's model reads.
+fn map_batch(batch: &HomeFetch) -> Vec<RepositoryFetch> {
+    batch
         .repositories
-        .into_iter()
-        .map(|repository| map_repository(repository, viewer_login.as_deref()))
+        .iter()
+        .map(|repository| map_repository(repository.clone(), batch.viewer_login.as_deref()))
         .collect()
 }
 
@@ -164,7 +172,7 @@ fn epoch_millis(timestamp: &str) -> Option<i64> {
     let minute = timestamp[14..16].parse::<i64>().ok()?;
     // 60 is a leap second, which GitHub can legitimately send.
     let second = timestamp[17..19].parse::<i64>().ok()?;
-    if !(1..=12).contains(&month) || !(1..=31).contains(&day) {
+    if !(1..=12).contains(&month) || day < 1 || day > days_in_month(year, month) {
         return None;
     }
     if hour > 23 || minute > 59 || second > 60 {
@@ -172,6 +180,22 @@ fn epoch_millis(timestamp: &str) -> Option<i64> {
     }
     let days = days_from_civil(year, month, day);
     Some((days * 86_400 + hour * 3_600 + minute * 60 + second) * 1_000)
+}
+
+/// How many days that month of that year holds.
+const fn days_in_month(year: i64, month: u32) -> u32 {
+    match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if is_leap_year(year) => 29,
+        2 => 28,
+        // The caller has already refused every month outside the year.
+        _ => 0,
+    }
+}
+
+const fn is_leap_year(year: i64) -> bool {
+    year % 4 == 0 && (year % 100 != 0 || year % 400 == 0)
 }
 
 /// Days between the civil date and 1970-01-01, by Howard Hinnant's algorithm.
@@ -377,6 +401,11 @@ mod tests {
             "2026-09-01T12:34:56+01:00",
             "2026-13-01T12:34:56Z",
             "2026-09-32T12:34:56Z",
+            "2026-00-01T12:34:56Z",
+            "2026-09-00T12:34:56Z",
+            "2026-02-31T12:34:56Z",
+            "2026-02-29T12:34:56Z",
+            "2026-04-31T12:34:56Z",
             "2026-09-01T24:34:56Z",
             "2026-09-01T12:61:56Z",
             "2026-09-01T12:34:61Z",
@@ -393,6 +422,38 @@ mod tests {
                 refused.contains("update time"),
                 "{timestamp} refused with {refused}",
             );
+        }
+    }
+
+    /// A leap second is a real second GitHub can legitimately send.
+    #[test]
+    fn a_leap_second_is_read_rather_than_refused() {
+        assert_eq!(
+            epoch_millis("2016-12-31T23:59:60Z"),
+            Some(1_483_228_800_000),
+            "the leap second reads as the instant that follows it",
+        );
+    }
+
+    #[test]
+    fn the_last_day_of_every_month_is_read() {
+        let last_days = [
+            ("2026-01-31T00:00:00Z", true),
+            ("2026-02-28T00:00:00Z", true),
+            ("2024-02-29T00:00:00Z", true),
+            ("2000-02-29T00:00:00Z", true),
+            ("1900-02-29T00:00:00Z", false),
+            ("2026-03-31T00:00:00Z", true),
+            ("2026-04-30T00:00:00Z", true),
+            ("2026-04-31T00:00:00Z", false),
+            ("2026-06-31T00:00:00Z", false),
+            ("2026-09-31T00:00:00Z", false),
+            ("2026-11-31T00:00:00Z", false),
+            ("2026-12-31T00:00:00Z", true),
+        ];
+
+        for (timestamp, readable) in last_days {
+            assert_eq!(epoch_millis(timestamp).is_some(), readable, "{timestamp}");
         }
     }
 
@@ -537,12 +598,21 @@ mod tests {
         ]}
     }}"#;
 
+    /// Everything a batch answered, gathered from the reports as they land.
+    fn fetch_all(client: &GithubClient, repositories: &[RepositorySlug]) -> Vec<RepositoryFetch> {
+        let gathered = std::cell::RefCell::new(Vec::new());
+        fetch(client, repositories, &|batch| {
+            gathered.borrow_mut().extend(batch);
+        });
+        gathered.into_inner()
+    }
+
     #[test]
     fn a_fetched_batch_comes_back_as_one_entry_per_repository_with_its_rows() {
         let gh = FakeGh::new();
         gh.answer_graphql(RECORDED_SEARCH);
 
-        let fetched = fetch_batch(&gh.client(), &[RepositorySlug::new("acme", "widgets")]);
+        let fetched = fetch_all(&gh.client(), &[RepositorySlug::new("acme", "widgets")]);
 
         assert_eq!(fetched.len(), 1);
         assert_eq!(fetched[0].slug, "acme/widgets");
@@ -561,7 +631,7 @@ mod tests {
     fn a_batch_gh_could_not_answer_fails_every_repository_in_it() {
         let gh = FakeGh::new();
 
-        let fetched = fetch_batch(
+        let fetched = fetch_all(
             &gh.client(),
             &[
                 RepositorySlug::new("acme", "widgets"),

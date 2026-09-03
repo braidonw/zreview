@@ -25,10 +25,7 @@ use crate::{
 /// GitHub documents a 256 character ceiling on a search query and at most five
 /// boolean operators, and eight `repo:` terms is what fits under the advanced
 /// syntax the query plan was measured against.
-///
-/// Public because a caller that reports progress per batch has to ask for one
-/// batch at a time, and a batch is this many repositories.
-pub const REPOSITORIES_PER_BATCH: usize = 8;
+const REPOSITORIES_PER_BATCH: usize = 8;
 
 /// GitHub serves at most 1,000 search results, which is twenty pages of fifty.
 /// Anything past that is a runaway rather than a long list.
@@ -40,6 +37,13 @@ const MAX_THREAD_PAGES: usize = 20;
 
 /// How long one `gh api graphql` call may take before it is killed.
 pub const DEFAULT_GRAPHQL_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// How long `gh auth status` may take before it is killed.
+///
+/// Shorter than a fetch because it asks nothing of the network, and it runs
+/// while the settings actions are held, so a `gh` waiting on a keychain prompt
+/// must not be able to freeze Home behind it.
+pub const DEFAULT_AUTHENTICATION_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// How often a running `gh` is checked for having exited.
 const POLL_INTERVAL: Duration = Duration::from_millis(5);
@@ -173,7 +177,23 @@ impl GithubClient {
     /// entry per distinct repository.
     #[must_use]
     pub fn fetch_home_pull_requests(&self, repositories: &[RepositorySlug]) -> HomeFetch {
-        let requested = distinct(repositories);
+        self.fetch_home_pull_requests_with_progress(repositories, &|_batch| {})
+    }
+
+    /// Fetches as [`Self::fetch_home_pull_requests`] does, handing each batch's
+    /// answer to `on_batch` as soon as it arrives.
+    ///
+    /// A caller showing progress, or filling a list in as it loads, reads each
+    /// batch here rather than waiting for the last one. Every batch is in the
+    /// returned fetch as well, so a caller with no use for progress sees no
+    /// difference.
+    #[must_use]
+    pub fn fetch_home_pull_requests_with_progress(
+        &self,
+        repositories: &[RepositorySlug],
+        on_batch: &dyn Fn(&HomeFetch),
+    ) -> HomeFetch {
+        let requested = distinct_repositories(repositories);
         let mut fetch = HomeFetch {
             viewer_login: None,
             rate_limit: None,
@@ -182,15 +202,20 @@ impl GithubClient {
 
         for batch in requested.chunks(REPOSITORIES_PER_BATCH) {
             let fetched = self.fetch_batch(batch);
+            let answered = HomeFetch {
+                viewer_login: fetched.viewer_login,
+                rate_limit: fetched.rate_limit,
+                repositories: into_repositories(batch, fetched.pull_requests),
+            };
+            on_batch(&answered);
+
             if fetch.viewer_login.is_none() {
-                fetch.viewer_login = fetched.viewer_login;
+                fetch.viewer_login = answered.viewer_login;
             }
-            if fetched.rate_limit.is_some() {
-                fetch.rate_limit = fetched.rate_limit;
+            if answered.rate_limit.is_some() {
+                fetch.rate_limit = answered.rate_limit;
             }
-            fetch
-                .repositories
-                .extend(into_repositories(batch, fetched.pull_requests));
+            fetch.repositories.extend(answered.repositories);
         }
 
         fetch
@@ -414,46 +439,59 @@ impl GithubClient {
 
     /// Spawns `gh` with stdin closed and kills it if it outlives the timeout.
     fn run_gh(&self, arguments: &[String]) -> Result<Output, GithubError> {
-        let mut child = Command::new(&self.gh_executable)
-            .args(arguments)
-            .env("GH_PROMPT_DISABLED", "1")
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .map_err(spawn_error)?;
+        let mut command = Command::new(&self.gh_executable);
+        command.args(arguments);
+        run_bounded(command, self.graphql_timeout, spawn_error)
+    }
+}
 
-        // Both pipes are drained on their own threads, so a large response
-        // cannot fill a pipe buffer and deadlock the child against this wait.
-        let stdout = drain(child.stdout.take());
-        let stderr = drain(child.stderr.take());
+/// Runs `command` with stdin closed, killing it if it outlives `timeout`.
+///
+/// Every call `gh` is asked to make is bounded here, so nothing it does, on the
+/// network or at a keychain prompt, can hold a caller for ever.
+pub(crate) fn run_bounded(
+    mut command: Command,
+    timeout: Duration,
+    on_spawn_failure: impl Fn(std::io::Error) -> GithubError,
+) -> Result<Output, GithubError> {
+    let mut child = command
+        .env("GH_PROMPT_DISABLED", "1")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(&on_spawn_failure)?;
 
-        let deadline = Instant::now() + self.graphql_timeout;
-        loop {
-            match child.try_wait() {
-                Ok(Some(status)) => {
-                    // A process gh started can outlive it holding these pipes, so
-                    // reading them is bounded by the same deadline as the wait.
-                    return Ok(Output {
-                        status,
-                        stdout: stdout.collect(deadline, self.graphql_timeout)?,
-                        stderr: stderr.collect(deadline, self.graphql_timeout)?,
-                    });
-                }
-                Ok(None) => {}
-                Err(source) => return Err(spawn_error(source)),
-            }
-            if Instant::now() >= deadline {
-                // The readers are left to unwind on their own. Joining them here
-                // would wait on any grandchild still holding the pipe open.
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(GithubError::Timeout {
-                    timeout_ms: timeout_ms(self.graphql_timeout),
+    // Both pipes are drained on their own threads, so a large response
+    // cannot fill a pipe buffer and deadlock the child against this wait.
+    let stdout = drain(child.stdout.take());
+    let stderr = drain(child.stderr.take());
+
+    let deadline = Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                // A process gh started can outlive it holding these pipes, so
+                // reading them is bounded by the same deadline as the wait.
+                return Ok(Output {
+                    status,
+                    stdout: stdout.collect(deadline, timeout)?,
+                    stderr: stderr.collect(deadline, timeout)?,
                 });
             }
-            std::thread::sleep(POLL_INTERVAL);
+            Ok(None) => {}
+            Err(source) => return Err(on_spawn_failure(source)),
         }
+        if Instant::now() >= deadline {
+            // The readers are left to unwind on their own. Joining them here
+            // would wait on any grandchild still holding the pipe open.
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(GithubError::Timeout {
+                timeout_ms: timeout_ms(timeout),
+            });
+        }
+        std::thread::sleep(POLL_INTERVAL);
     }
 }
 
@@ -796,7 +834,11 @@ fn strip_cursors(rows: Vec<CollectedRow>) -> Vec<HomePullRequest> {
 }
 
 /// Keeps the first occurrence of each repository, comparing the way GitHub does.
-fn distinct(repositories: &[RepositorySlug]) -> Vec<RepositorySlug> {
+///
+/// Public because a caller has to be able to say how many repositories a fetch
+/// will answer for before it starts, and that is this many.
+#[must_use]
+pub fn distinct_repositories(repositories: &[RepositorySlug]) -> Vec<RepositorySlug> {
     let mut seen = Vec::new();
     let mut kept = Vec::new();
     for repository in repositories {
@@ -1294,6 +1336,60 @@ mod tests {
         );
     }
 
+    /// A caller that fills a list in as it loads reads each batch as it lands,
+    /// so it has to be handed one the moment it is answered.
+    #[test]
+    fn every_batch_is_reported_as_it_answers_and_again_at_the_end() {
+        let fake = FakeGh::new();
+        fake.respond(EMPTY_RESPONSE).respond(EMPTY_RESPONSE);
+        let reported = std::cell::RefCell::new(Vec::new());
+
+        let fetch = GithubClient::new(fake.path()).fetch_home_pull_requests_with_progress(
+            &slugs(1..=9),
+            &|batch| {
+                reported.borrow_mut().push(
+                    batch
+                        .repositories
+                        .iter()
+                        .map(|repository| repository.repository.full_name())
+                        .collect::<Vec<_>>(),
+                );
+            },
+        );
+
+        let reported = reported.into_inner();
+        assert_eq!(reported.len(), 2, "one report per batch");
+        assert_eq!(reported[0].len(), 8);
+        assert_eq!(reported[1], ["acme/repo-9"]);
+        assert_eq!(fetch.repositories.len(), 9);
+    }
+
+    /// Two clones of one repository that spell it differently are one fetch, so
+    /// a caller counting repositories off never waits on a ninth that is really
+    /// the first again.
+    #[test]
+    fn repositories_that_differ_only_in_case_are_fetched_once() {
+        let fake = FakeGh::new();
+        fake.respond(EMPTY_RESPONSE);
+
+        let fetch = GithubClient::new(fake.path()).fetch_home_pull_requests(&[
+            RepositorySlug::new("acme", "widgets"),
+            RepositorySlug::new("Acme", "Widgets"),
+        ]);
+
+        assert_eq!(fake.calls(), 1);
+        assert_eq!(fetch.repositories.len(), 1);
+        assert_eq!(
+            super::distinct_repositories(&[
+                RepositorySlug::new("acme", "widgets"),
+                RepositorySlug::new("Acme", "Widgets"),
+            ])
+            .len(),
+            1,
+            "a caller asking how many will answer gets the same count",
+        );
+    }
+
     #[test]
     fn an_alias_with_more_results_is_paged_by_cursor_until_exhausted() {
         let fake = FakeGh::new();
@@ -1685,6 +1781,31 @@ mod tests {
 
     /// A refresh that hangs would leave Home refreshing forever, so the call is
     /// killed rather than waited on.
+    /// The preflight runs while Home's settings actions are held, so a `gh`
+    /// waiting on a keychain prompt must not be able to freeze them behind it.
+    #[test]
+    fn an_authentication_check_that_outlives_its_timeout_is_killed_and_reported() {
+        let fake = FakeGh::new();
+        fake.hang(10);
+        let clone = TempDir::new().unwrap();
+
+        let started = Instant::now();
+        let error = GithubClient::new(fake.path())
+            .with_authentication_timeout(Duration::from_millis(150))
+            .check_authentication(clone.path())
+            .expect_err("a gh that never answers cannot say it is signed in");
+        let elapsed = started.elapsed();
+
+        assert!(
+            matches!(error, GithubError::Timeout { timeout_ms: 150 }),
+            "unexpected error: {error}",
+        );
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "the check waited {elapsed:?} on a gh it should have killed",
+        );
+    }
+
     #[test]
     fn a_call_that_outlives_its_timeout_is_killed_and_reported() {
         let fake = FakeGh::new();

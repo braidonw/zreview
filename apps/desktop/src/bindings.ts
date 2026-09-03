@@ -15,9 +15,10 @@ export const commands = {
 	/**
 	 *  Re-reads the settings file, then fetches what every clone it lists has open.
 	 * 
-	 *  Runs when Home opens and on `r`, reporting how far it has got on
-	 *  `on_progress` as each batch of repositories lands. A trigger that arrives
-	 *  mid-refresh starts nothing and answers with what is already on screen.
+	 *  Runs when Home opens, on `r`, and after an Add or a Remove. Everything Home
+	 *  shows goes to `on_progress` as each batch of repositories lands, so the list
+	 *  fills in as it loads. A trigger that arrives mid-refresh starts nothing and
+	 *  answers with what is already on screen.
 	 * 
 	 *  A settings file that cannot be read, or a `gh` that cannot be used, comes
 	 *  back inside the snapshot rather than as a command error, because the header
@@ -27,14 +28,17 @@ export const commands = {
 	 * 
 	 *  Returns a failure when the task doing the fetching does not finish.
 	 */
-	refreshHome: (onProgress: Channel<RefreshStateDto>) => typedError<HomeSnapshotDto, SessionFailureDto>(__TAURI_INVOKE("refresh_home", { onProgress })),
+	refreshHome: (onProgress: Channel<HomeSnapshotDto>) => typedError<HomeSnapshotDto, SessionFailureDto>(__TAURI_INVOKE("refresh_home", { onProgress })),
 	/**  Moves the cursor one row through the list, across the groups. */
 	moveHomeCursor: (moveTo: CursorMoveDto) => __TAURI_INVOKE<HomeSnapshotDto>("move_home_cursor", { moveTo }),
 	/**
-	 *  Adds the folders the reviewer picked, writing the file once and refreshing.
+	 *  Adds the folders the reviewer picked, writing the file once and reading it
+	 *  back.
 	 * 
 	 *  A folder that is not a clone of a GitHub repository is refused with its
-	 *  reason while the rest proceed, and one already listed is ignored.
+	 *  reason while the rest proceed, and one already listed is ignored. The pull
+	 *  requests of a repository just added arrive with the refresh the caller runs
+	 *  next, not with this.
 	 * 
 	 *  # Errors
 	 * 
@@ -42,7 +46,10 @@ export const commands = {
 	 */
 	addRepositories: (folders: string[]) => typedError<HomeSnapshotDto, SessionFailureDto>(__TAURI_INVOKE("add_repositories", { folders })),
 	/**
-	 *  Drops one configured clone, writing the file and refreshing.
+	 *  Drops one configured clone, writing the file and reading it back.
+	 * 
+	 *  The list is left as it stands otherwise. It is the refresh the caller runs
+	 *  next that asks GitHub about what remains.
 	 * 
 	 *  # Errors
 	 * 

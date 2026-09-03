@@ -55,6 +55,21 @@ function configured() {
   });
 }
 
+/** Every listed row's identity, in the order the ledger renders them. */
+function identities() {
+  return screen
+    .getAllByRole("listitem")
+    .map((row) => row.querySelector(".home__cell--identity")?.textContent);
+}
+
+/** The identity of the row the cursor is on. */
+function selectedIdentity() {
+  const selected = screen
+    .getAllByRole("listitem")
+    .find((row) => row.getAttribute("aria-selected") === "true");
+  return selected?.querySelector(".home__cell--identity")?.textContent;
+}
+
 beforeEach(() => {
   describeLaunch.mockReset();
   describeLaunch.mockResolvedValue("Home");
@@ -171,16 +186,17 @@ describe("Home", () => {
   it("passes the picked folders to the add command and shows what it refused", async () => {
     const user = userEvent.setup();
     open.mockResolvedValue(["/Developer/notes", "/Developer/billing"]);
-    addRepositories.mockResolvedValue(
-      ok(
-        makeHomeSnapshot({
-          count_line: "0 pull requests across 1 repository",
-          repositories: [makeHomeRepository({ path: "/Developer/billing", slug: "acme/billing" })],
-          footer_summary: "1 repository",
-          refusals: [{ path: "/Developer/notes", reason: "not a Git repository" }],
-        }),
-      ),
-    );
+    const added = makeHomeSnapshot({
+      count_line: "0 pull requests across 1 repository",
+      repositories: [makeHomeRepository({ path: "/Developer/billing", slug: "acme/billing" })],
+      footer_summary: "1 repository",
+      refusals: [{ path: "/Developer/notes", reason: "not a Git repository" }],
+    });
+    addRepositories.mockImplementation(() => {
+      // The refresh that follows an Add reads the file the Add just wrote.
+      refreshHome.mockResolvedValue(ok(added));
+      return Promise.resolve(ok(added));
+    });
 
     render(<App />);
     await waitFor(() => expect(screen.getByText("No repositories yet")).toBeTruthy());
@@ -215,17 +231,18 @@ describe("Home", () => {
   it("removes the repository the Remove beside it names", async () => {
     const user = userEvent.setup();
     refreshHome.mockResolvedValue(ok({ ...configured(), footer_expanded: true }));
-    removeRepository.mockImplementation((path: string) =>
-      Promise.resolve(
-        ok({
-          ...configured(),
-          footer_expanded: true,
-          repositories: configured().repositories.filter(
-            (repository) => repository.path !== path,
-          ),
-        }),
-      ),
-    );
+    removeRepository.mockImplementation((path: string) => {
+      const left = {
+        ...configured(),
+        footer_expanded: true,
+        repositories: configured().repositories.filter(
+          (repository) => repository.path !== path,
+        ),
+      };
+      // The refresh that follows a Remove reads the file the Remove just wrote.
+      refreshHome.mockResolvedValue(ok(left));
+      return Promise.resolve(ok(left));
+    });
 
     render(<App />);
     await waitFor(() => expect(screen.getByText("braidonw/zreview")).toBeTruthy());
@@ -282,8 +299,7 @@ describe("Home", () => {
     render(<App />);
 
     await waitFor(() => expect(screen.getByText("Retry webhook deliveries")).toBeTruthy());
-    const rows = screen.getAllByRole("listitem");
-    expect(rows.map((row) => row.getAttribute("data-identity"))).toEqual([
+    expect(identities()).toEqual([
       "acme/widgets#412",
       "acme/widgets#398",
       "braidonw/zreview#77",
@@ -296,16 +312,31 @@ describe("Home", () => {
     expect(screen.getByText("Nothing waiting on others.")).toBeTruthy();
   });
 
-  it("leaves an aligned gap where a row has no status", async () => {
-    refreshHome.mockResolvedValue(ok(listed()));
+  it("shows a row's age and leaves an empty author cell where GitHub has none", async () => {
+    refreshHome.mockResolvedValue(
+      ok({
+        ...listed(),
+        groups: makeHomeGroups([
+          [
+            makeHomeRow({
+              index: 0,
+              identity: "acme/widgets#412",
+              author: null,
+              updated_at_ms: Date.now() - 150 * 60_000,
+            }),
+          ],
+          [],
+          [],
+        ]),
+      }),
+    );
 
     render(<App />);
 
-    await waitFor(() => expect(screen.getByText("Retry webhook deliveries")).toBeTruthy());
-    // Every row carries the same columns whether or not they say anything.
-    for (const row of screen.getAllByRole("listitem")) {
-      expect(row.querySelectorAll(".home__cell").length).toBe(6);
-    }
+    await waitFor(() => expect(screen.getByText("acme/widgets#412")).toBeTruthy());
+    expect(screen.getByText("2h")).toBeTruthy();
+    const row = screen.getAllByRole("listitem")[0];
+    expect(row.querySelector(".home__cell--author")?.textContent).toBe("");
   });
 
   it("shows the stamp counting off the repositories while a refresh runs", async () => {
@@ -325,6 +356,16 @@ describe("Home", () => {
 
     await waitFor(() => expect(screen.getByText("Refreshed 2 min ago")).toBeTruthy());
     expect(screen.getByText("r")).toBeTruthy();
+  });
+
+  it("counts the stamp in hours and days once it is older than that", async () => {
+    refreshHome.mockResolvedValue(
+      ok({ ...listed(), refresh: { Refreshed: { at_ms: Date.now() - 90 * 60_000 } } }),
+    );
+
+    render(<App />);
+
+    await waitFor(() => expect(screen.getByText("Refreshed 1 hour ago")).toBeTruthy());
   });
 
   it("shows the stamp as a failure when nothing loaded", async () => {
@@ -353,24 +394,32 @@ describe("Home", () => {
 
     render(<App />);
     await waitFor(() => expect(screen.getByText("Retry webhook deliveries")).toBeTruthy());
+    expect(selectedIdentity()).toBe("acme/widgets#412");
 
     await user.keyboard("j");
 
-    await waitFor(() => expect(moveHomeCursor).toHaveBeenCalledWith("Down"));
-    await waitFor(() =>
-      expect(
-        screen.getAllByRole("listitem")[1].getAttribute("data-cursor"),
-      ).toBe("true"),
-    );
+    await waitFor(() => expect(selectedIdentity()).toBe("acme/widgets#398"));
 
     await user.keyboard("k");
 
-    await waitFor(() => expect(moveHomeCursor).toHaveBeenCalledWith("Up"));
-    await waitFor(() =>
-      expect(
-        screen.getAllByRole("listitem")[0].getAttribute("data-cursor"),
-      ).toBe("true"),
-    );
+    await waitFor(() => expect(selectedIdentity()).toBe("acme/widgets#412"));
+  });
+
+  it("scrolls the row the cursor moved onto into view", async () => {
+    const user = userEvent.setup();
+    const scrollIntoView = vi.fn();
+    Element.prototype.scrollIntoView = scrollIntoView;
+    refreshHome.mockResolvedValue(ok(listed()));
+    moveHomeCursor.mockResolvedValue({ ...listed(), cursor: 2 });
+
+    render(<App />);
+    await waitFor(() => expect(screen.getByText("Retry webhook deliveries")).toBeTruthy());
+    scrollIntoView.mockClear();
+
+    await user.keyboard("j");
+
+    await waitFor(() => expect(scrollIntoView).toHaveBeenCalled());
+    expect(scrollIntoView).toHaveBeenCalledWith(expect.objectContaining({ block: "nearest" }));
   });
 
   it("shows a failed repository above the list with a Remove beside it", async () => {
@@ -401,15 +450,25 @@ describe("Home", () => {
 
   it("removes the repository the failed line's Remove names", async () => {
     const user = userEvent.setup();
-    refreshHome.mockResolvedValue(
-      ok({
-        ...listed(),
-        failed_repositories: [
-          { path: "/Developer/billing", slug: "acme/billing", reason: "GitHub refused" },
-        ],
-      }),
-    );
-    removeRepository.mockResolvedValue(ok(listed()));
+    const failing = {
+      ...listed(),
+      failed_repositories: [
+        { path: "/Developer/billing", slug: "acme/billing", reason: "GitHub refused" },
+        { path: "/Developer/tokens", slug: "acme/design-tokens", reason: "GitHub refused" },
+      ],
+    };
+    refreshHome.mockResolvedValue(ok(failing));
+    // Only the repository the click named goes, so what is left says which it was.
+    removeRepository.mockImplementation((path: string) => {
+      const left = {
+        ...failing,
+        failed_repositories: failing.failed_repositories.filter(
+          (repository) => repository.path !== path,
+        ),
+      };
+      refreshHome.mockResolvedValue(ok(left));
+      return Promise.resolve(ok(left));
+    });
 
     render(<App />);
     await waitFor(() => expect(screen.getByText(/acme\/billing/)).toBeTruthy());
@@ -417,7 +476,92 @@ describe("Home", () => {
     const line = screen.getByText(/acme\/billing/).closest(".home__failed-repository");
     await user.click(within(line as HTMLElement).getByRole("button", { name: "Remove" }));
 
-    await waitFor(() => expect(removeRepository).toHaveBeenCalledWith("/Developer/billing"));
+    await waitFor(() => expect(screen.queryByText(/acme\/billing/)).toBeNull());
+    expect(screen.getByText(/acme\/design-tokens/)).toBeTruthy();
+  });
+
+  it("refreshes after a repository is added, so its rows arrive without r", async () => {
+    const user = userEvent.setup();
+    open.mockResolvedValue(["/Developer/widgets"]);
+    addRepositories.mockResolvedValue(
+      ok(
+        makeHomeSnapshot({
+          count_line: "0 pull requests across 1 repository",
+          repositories: [makeHomeRepository()],
+          footer_summary: "1 repository",
+        }),
+      ),
+    );
+
+    render(<App />);
+    await waitFor(() => expect(screen.getByText("No repositories yet")).toBeTruthy());
+    refreshHome.mockClear();
+    refreshHome.mockResolvedValue(ok(listed()));
+
+    await user.click(screen.getByRole("button", { name: "Add repository..." }));
+
+    await waitFor(() => expect(screen.getByText("Retry webhook deliveries")).toBeTruthy());
+    expect(refreshHome).toHaveBeenCalled();
+  });
+
+  it("refreshes after a repository is removed", async () => {
+    const user = userEvent.setup();
+    refreshHome.mockResolvedValue(ok({ ...configured(), footer_expanded: true }));
+    removeRepository.mockResolvedValue(ok(makeHomeSnapshot()));
+
+    render(<App />);
+    await waitFor(() => expect(screen.getByText("braidonw/zreview")).toBeTruthy());
+    refreshHome.mockClear();
+
+    await user.click(screen.getAllByRole("button", { name: "Remove" })[0]);
+
+    await waitFor(() => expect(refreshHome).toHaveBeenCalled());
+  });
+
+  it("shows a write failure on the empty state as well as above a list", async () => {
+    refreshHome.mockResolvedValue(
+      ok(
+        makeHomeSnapshot({
+          write_failure: {
+            summary: "Home could not save your settings",
+            detail: null,
+            remediation: "Check that ~/.config/zreview/settings.toml is writable.",
+          },
+        }),
+      ),
+    );
+
+    render(<App />);
+
+    await waitFor(() => expect(screen.getByText("No repositories yet")).toBeTruthy());
+    expect(screen.getByText("Home could not save your settings")).toBeTruthy();
+  });
+
+  it("leaves the rows and the stamp alone when r arrives mid-refresh", async () => {
+    const user = userEvent.setup();
+    let settle: ((snapshot: unknown) => void) | null = null;
+    let calls = 0;
+    refreshHome.mockImplementation((onProgress: { onmessage: (shown: unknown) => void }) => {
+      calls += 1;
+      return new Promise((resolve) => {
+        onProgress.onmessage({ ...listed(), refresh: { Refreshing: { done: 1, total: 3 } } });
+        settle = resolve;
+      });
+    });
+
+    render(<App />);
+    await waitFor(() => expect(screen.getByText("Refreshing 1 of 3")).toBeTruthy());
+    expect(identities()).toHaveLength(3);
+
+    await user.keyboard("r");
+
+    // The trigger that arrived mid-refresh started nothing.
+    expect(calls).toBe(1);
+    expect(screen.getByText("Refreshing 1 of 3")).toBeTruthy();
+    expect(identities()).toHaveLength(3);
+
+    act(() => settle?.(ok(listed())));
+    await waitFor(() => expect(screen.getByText("Refreshed 2 min ago")).toBeTruthy());
   });
 
   it("stamps the progress the refresh channel reports, then the time it settled", async () => {
@@ -434,16 +578,24 @@ describe("Home", () => {
     await waitFor(() => expect(progress).not.toBeNull());
 
     // The header goes up on the first report, so the window is never blank.
-    act(() => progress?.({ Refreshing: { done: 0, total: 0 } }));
+    act(() =>
+      progress?.({
+        ...makeHomeSnapshot(),
+        refresh: { Refreshing: { done: 0, total: 0 } },
+      }),
+    );
     await waitFor(() => expect(screen.getByText("Refreshing")).toBeTruthy());
 
-    act(() => progress?.({ Refreshing: { done: 1, total: 3 } }));
+    // The rows of the repositories that have answered arrive with their batch.
+    act(() =>
+      progress?.({ ...listed(), refresh: { Refreshing: { done: 1, total: 3 } } }),
+    );
     await waitFor(() => expect(screen.getByText("Refreshing 1 of 3")).toBeTruthy());
+    expect(screen.getByText("Retry webhook deliveries")).toBeTruthy();
 
     act(() => settle?.(ok(listed())));
 
     await waitFor(() => expect(screen.getByText("Refreshed 2 min ago")).toBeTruthy());
-    expect(screen.getByText("Retry webhook deliveries")).toBeTruthy();
   });
 
   it("refreshes on r, showing what the settings file now holds", async () => {

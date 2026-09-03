@@ -14,9 +14,9 @@ use thiserror::Error;
 mod home;
 
 pub use home::{
-    DEFAULT_GRAPHQL_TIMEOUT, HomeFetch, HomePullRequest, HomeRepository, HomeSearch,
-    OpinionatedReview, REPOSITORIES_PER_BATCH, RateLimit, ReviewDecision, ReviewState,
-    ReviewThread, StatusCheckState,
+    DEFAULT_AUTHENTICATION_TIMEOUT, DEFAULT_GRAPHQL_TIMEOUT, HomeFetch, HomePullRequest,
+    HomeRepository, HomeSearch, OpinionatedReview, RateLimit, ReviewDecision, ReviewState,
+    ReviewThread, StatusCheckState, distinct_repositories,
 };
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -290,6 +290,7 @@ impl GithubError {
 pub struct GithubClient {
     gh_executable: PathBuf,
     graphql_timeout: Duration,
+    authentication_timeout: Duration,
 }
 
 impl Default for GithubClient {
@@ -304,6 +305,7 @@ impl GithubClient {
         Self {
             gh_executable: executable.into(),
             graphql_timeout: DEFAULT_GRAPHQL_TIMEOUT,
+            authentication_timeout: DEFAULT_AUTHENTICATION_TIMEOUT,
         }
     }
 
@@ -311,6 +313,13 @@ impl GithubClient {
     #[must_use]
     pub const fn with_graphql_timeout(mut self, timeout: Duration) -> Self {
         self.graphql_timeout = timeout;
+        self
+    }
+
+    /// Sets how long the authentication check may run before `gh` is killed.
+    #[must_use]
+    pub const fn with_authentication_timeout(mut self, timeout: Duration) -> Self {
+        self.authentication_timeout = timeout;
         self
     }
 
@@ -379,15 +388,15 @@ impl GithubClient {
     ///
     /// # Errors
     ///
-    /// Returns [`GithubError::GhMissing`] when the CLI is not installed and
-    /// [`GithubError::Unauthenticated`] when it is not logged in.
+    /// Returns [`GithubError::GhMissing`] when the CLI is not installed,
+    /// [`GithubError::Unauthenticated`] when it is not logged in, and
+    /// [`GithubError::Timeout`] when `gh` does not answer in time.
     pub fn check_authentication(&self, repository: &Path) -> Result<(), GithubError> {
-        let output = Command::new(&self.gh_executable)
-            .current_dir(repository)
-            .args(["auth", "status"])
-            .env("GH_PROMPT_DISABLED", "1")
-            .output()
-            .map_err(|source| execution_error(repository, source))?;
+        let mut command = Command::new(&self.gh_executable);
+        command.current_dir(repository).args(["auth", "status"]);
+        let output = home::run_bounded(command, self.authentication_timeout, |source| {
+            execution_error(repository, source)
+        })?;
 
         if output.status.success() {
             return Ok(());

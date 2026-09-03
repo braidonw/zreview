@@ -1,4 +1,5 @@
-import type { HomeRowDto, HomeSnapshotDto, RefreshStateDto } from "../bindings";
+import { useEffect, useRef } from "react";
+import type { HomeRowDto, HomeSnapshotDto, RefreshStateDto, SessionFailureDto } from "../bindings";
 import { useHome } from "../hooks/useHome";
 import { useNow } from "../hooks/useNow";
 import { refreshedStamp, shortAge } from "../lib/relativeTime";
@@ -23,25 +24,19 @@ function stampText(refresh: RefreshStateDto, nowMs: number): string | null {
 
 /** The screen ZReview opens on when no pull request has been named. */
 export function HomeScreen() {
-  const { snapshot, refreshState, failure, toggleFooter, addRepositories, removeRepository } =
-    useHome();
+  const { snapshot, failure, toggleFooter, addRepositories, removeRepository } = useHome();
   const nowMs = useNow();
 
   // A command that never answered leaves nothing worth trusting on screen.
   if (failure !== null) {
     return <FailureScreen failure={failure} />;
   }
-  const stamp = refreshState === null ? null : stampText(refreshState, nowMs);
-  // Nothing is drawn until the first refresh answers, so no empty state flashes
-  // in front of a list. The header goes up as soon as the refresh says it has
-  // started, so the window is never blank while GitHub is being asked.
+  // Nothing is drawn until the refresh says it has started, which it does before
+  // it asks GitHub anything, so the window is blank for no longer than that.
   if (snapshot === null) {
-    return stamp === null ? null : (
-      <div className="home">
-        <Header countLine={null} stamp={stamp} />
-      </div>
-    );
+    return null;
   }
+  const stamp = stampText(snapshot.refresh, nowMs);
 
   return (
     <div className="home">
@@ -126,6 +121,7 @@ function HomeBody({
   if (snapshot.repositories.length === 0) {
     return (
       <div className="home__body home__body--empty">
+        <WriteFailure failure={snapshot.write_failure} />
         <h2 className="home__empty-heading">No repositories yet</h2>
         <p className="home__empty-copy">
           Add a local clone and Home lists the pull requests that want you.
@@ -138,14 +134,7 @@ function HomeBody({
   }
   return (
     <div className="home__body home__body--list">
-      {snapshot.write_failure !== null && (
-        <div className="home__write-failure">
-          <span>{snapshot.write_failure.summary}</span>
-          {snapshot.write_failure.remediation !== null && (
-            <span className="home__write-remediation">{snapshot.write_failure.remediation}</span>
-          )}
-        </div>
-      )}
+      <WriteFailure failure={snapshot.write_failure} />
       {snapshot.failed_repositories.map((repository) => (
         <div className="home__failed-repository" key={repository.path}>
           <span className="home__failed-detail">
@@ -176,13 +165,36 @@ function HomeBody({
   );
 }
 
+/** Why the last write did not reach the settings file, wherever the list is. */
+function WriteFailure({ failure }: { failure: SessionFailureDto | null }) {
+  if (failure === null) {
+    return null;
+  }
+  return (
+    <div className="home__write-failure">
+      <span>{failure.summary}</span>
+      {failure.remediation !== null && (
+        <span className="home__write-remediation">{failure.remediation}</span>
+      )}
+    </div>
+  );
+}
+
 /** One pull request on one line, its columns aligned whether or not they speak. */
 function Row({ row, cursor, nowMs }: { row: HomeRowDto; cursor: boolean; nowMs: number }) {
+  const line = useRef<HTMLLIElement>(null);
+
+  useEffect(() => {
+    if (cursor) {
+      line.current?.scrollIntoView({ block: "nearest" });
+    }
+  }, [cursor]);
+
   return (
     <li
+      ref={line}
       className={`home__row${cursor ? " home__row--cursor" : ""}`}
-      data-identity={row.identity}
-      data-cursor={cursor ? "true" : "false"}
+      aria-selected={cursor}
     >
       <span className="home__row-title">{row.title}</span>
       <span className="home__cell home__cell--drafts" />

@@ -46,21 +46,22 @@ pub fn specta_builder() -> tauri_specta::Builder<tauri::Wry> {
 fn refresh_home_on_model(
     home: &ManagedHome,
     settings_path: &Path,
-    report: &dyn Fn(app::RefreshState),
+    report: &dyn Fn(dto::HomeSnapshotDto),
 ) {
     let Some(_ordered) = try_lock(&home.settings_action) else {
         return;
     };
-    if !lock(&home.model).begin_refresh() {
-        return;
-    }
-    report_refresh(home, report);
+    lock(&home.model).begin_refresh();
+    // Every way out from here says how the refresh went, except a panic, which
+    // would otherwise leave the stamp counting repositories off for ever.
+    let _abandoned = AbandonedRefresh { home };
+    report_home(home, report);
 
     read_into_model(home, settings_path);
-    // Only the settings file can have failed by here, the last refresh's
-    // preflight failure having gone with the trigger that started this one.
+    // Only the settings file can have failed by here, whatever stopped the last
+    // refresh having gone with the trigger that started this one.
     if lock(&home.model).failure().is_some() {
-        report_refresh(home, report);
+        report_home(home, report);
         return;
     }
     let (slugs, preflight_in) = to_fetch(&lock(&home.model));
@@ -68,46 +69,59 @@ fn refresh_home_on_model(
         && let Err(failure) = pull_requests::preflight(&home.client, &clone)
     {
         lock(&home.model).preflight_failed(failure);
-        report_refresh(home, report);
+        report_home(home, report);
         return;
     }
 
     lock(&home.model).fetching(slugs.len());
-    report_refresh(home, report);
-    for batch in slugs.chunks(github::REPOSITORIES_PER_BATCH) {
-        let fetched = pull_requests::fetch_batch(&home.client, batch);
-        lock(&home.model).batch_fetched(fetched);
-        report_refresh(home, report);
-    }
+    report_home(home, report);
+    pull_requests::fetch(&home.client, &slugs, &|batch| {
+        lock(&home.model).batch_fetched(batch);
+        report_home(home, report);
+    });
     lock(&home.model).finish_refresh(now_ms());
-    report_refresh(home, report);
+    report_home(home, report);
 }
 
-fn report_refresh(home: &ManagedHome, report: &dyn Fn(app::RefreshState)) {
-    let state = lock(&home.model).refresh_state();
-    report(state);
+/// Ends a refresh that stopped without finishing.
+///
+/// A panic anywhere in a refresh would otherwise leave the stamp saying it is
+/// still counting repositories off, with nothing left running to finish it.
+struct AbandonedRefresh<'a> {
+    home: &'a ManagedHome,
+}
+
+impl Drop for AbandonedRefresh<'_> {
+    fn drop(&mut self) {
+        // A refresh that reached its own end has already said how it went.
+        lock(&self.home.model).refresh_abandoned();
+    }
+}
+
+/// Hands the reporter everything Home now shows, so a list fills in as it loads.
+fn report_home(home: &ManagedHome, report: &dyn Fn(dto::HomeSnapshotDto)) {
+    let shown = dto::project_home(&lock(&home.model));
+    report(shown);
 }
 
 /// The repositories a refresh will ask about, and the clone to preflight in.
 ///
-/// One entry per distinct repository, so two checkouts of one project are
-/// fetched once and counted once.
+/// Duplicates are collapsed by the fetch itself, which is the one place that
+/// knows how GitHub compares two names, so the count here is the count it will
+/// answer for.
 fn to_fetch(home: &app::HomeModel) -> (Vec<github::RepositorySlug>, Option<PathBuf>) {
-    let mut slugs: Vec<github::RepositorySlug> = Vec::new();
+    let mut slugs = Vec::new();
     let mut preflight_in = None;
     for entry in home.repositories() {
         let Some(slug) = entry.slug() else {
             continue;
         };
         preflight_in.get_or_insert_with(|| entry.path.clone());
-        if slugs.iter().any(|listed| listed.full_name() == slug) {
-            continue;
-        }
         slugs.push(
             github::parse_full_name(slug).expect("a slug the github crate formatted parses back"),
         );
     }
-    (slugs, preflight_in)
+    (github::distinct_repositories(&slugs), preflight_in)
 }
 
 /// Now, as the epoch milliseconds the stamp is worked out from.
@@ -435,9 +449,10 @@ pub async fn open_session(
 
 /// Re-reads the settings file, then fetches what every clone it lists has open.
 ///
-/// Runs when Home opens and on `r`, reporting how far it has got on
-/// `on_progress` as each batch of repositories lands. A trigger that arrives
-/// mid-refresh starts nothing and answers with what is already on screen.
+/// Runs when Home opens, on `r`, and after an Add or a Remove. Everything Home
+/// shows goes to `on_progress` as each batch of repositories lands, so the list
+/// fills in as it loads. A trigger that arrives mid-refresh starts nothing and
+/// answers with what is already on screen.
 ///
 /// A settings file that cannot be read, or a `gh` that cannot be used, comes
 /// back inside the snapshot rather than as a command error, because the header
@@ -451,13 +466,13 @@ pub async fn open_session(
 #[allow(clippy::needless_pass_by_value)]
 pub async fn refresh_home(
     state: tauri::State<'_, AppRoot>,
-    on_progress: Channel<dto::RefreshStateDto>,
+    on_progress: Channel<dto::HomeSnapshotDto>,
 ) -> Result<dto::HomeSnapshotDto, dto::SessionFailureDto> {
     let home = state.home.clone();
     off_the_ui_thread(move || {
         on_settings_file(&home, |home, settings_path| {
-            refresh_home_on_model(home, settings_path, &|state| {
-                let _ = on_progress.send(state.into());
+            refresh_home_on_model(home, settings_path, &|shown| {
+                let _ = on_progress.send(shown);
             });
         })
     })
@@ -475,10 +490,13 @@ pub fn move_home_cursor(
     move_home_cursor_on_model(&state.home, move_to)
 }
 
-/// Adds the folders the reviewer picked, writing the file once and refreshing.
+/// Adds the folders the reviewer picked, writing the file once and reading it
+/// back.
 ///
 /// A folder that is not a clone of a GitHub repository is refused with its
-/// reason while the rest proceed, and one already listed is ignored.
+/// reason while the rest proceed, and one already listed is ignored. The pull
+/// requests of a repository just added arrive with the refresh the caller runs
+/// next, not with this.
 ///
 /// # Errors
 ///
@@ -500,7 +518,10 @@ pub async fn add_repositories(
     .await
 }
 
-/// Drops one configured clone, writing the file and refreshing.
+/// Drops one configured clone, writing the file and reading it back.
+///
+/// The list is left as it stands otherwise. It is the refresh the caller runs
+/// next that asks GitHub about what remains.
 ///
 /// # Errors
 ///
@@ -1053,6 +1074,15 @@ mod tests {
         assert!(shown.failed_repositories.is_empty());
     }
 
+    /// Everything a refresh reported, in the order it said it.
+    fn reported_by(home: &ManagedHome, settings_path: &Path) -> Vec<dto::HomeSnapshotDto> {
+        let reported = Mutex::new(Vec::new());
+        refresh_home_on_model(home, settings_path, &|shown| {
+            reported.lock().unwrap().push(shown);
+        });
+        reported.into_inner().unwrap()
+    }
+
     #[test]
     fn a_refresh_counts_off_the_repositories_and_ends_with_the_time_it_settled() {
         let gh = FakeGh::new();
@@ -1061,25 +1091,49 @@ mod tests {
         let directory = TempDir::new().unwrap();
         let settings_path = settings_listing(&directory, &[&clone]);
         let home = home_with(&gh);
-        let reported = Mutex::new(Vec::new());
 
-        refresh_home_on_model(&home, &settings_path, &|progress| {
-            reported.lock().unwrap().push(progress);
-        });
+        let reported = reported_by(&home, &settings_path);
 
-        let reported = reported.lock().unwrap().clone();
+        let states = reported
+            .iter()
+            .map(|shown| shown.refresh.clone())
+            .collect::<Vec<_>>();
         assert_eq!(
-            reported.first(),
-            Some(&app::RefreshState::Refreshing { done: 0, total: 0 }),
+            states.first(),
+            Some(&dto::RefreshStateDto::Refreshing { done: 0, total: 0 }),
             "the total is unknown until the settings file has been read",
         );
         assert!(
-            reported.contains(&app::RefreshState::Refreshing { done: 1, total: 1 }),
-            "every repository is counted off: {reported:?}",
+            states.contains(&dto::RefreshStateDto::Refreshing { done: 1, total: 1 }),
+            "every repository is counted off: {states:?}",
         );
         assert!(
-            matches!(reported.last(), Some(app::RefreshState::Refreshed { .. })),
-            "the last thing reported is the settled stamp: {reported:?}",
+            matches!(states.last(), Some(dto::RefreshStateDto::Refreshed { .. })),
+            "the last thing reported is the settled stamp: {states:?}",
+        );
+    }
+
+    /// A reviewer watching a slow organisation sees the rest of the list before
+    /// it answers, so every batch carries what Home shows by then.
+    #[test]
+    fn a_refresh_reports_the_rows_it_has_as_each_batch_lands() {
+        let gh = FakeGh::new();
+        gh.answer_graphql(&recorded_search("acme/widgets"));
+        let clone = clone_of("acme/widgets");
+        let directory = TempDir::new().unwrap();
+        let settings_path = settings_listing(&directory, &[&clone]);
+        let home = home_with(&gh);
+
+        let reported = reported_by(&home, &settings_path);
+
+        let counted = reported
+            .iter()
+            .map(|shown| shown.groups[0].rows.len())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            counted,
+            [0, 0, 2, 2],
+            "the rows arrive with the batch that fetched them",
         );
     }
 
@@ -1088,21 +1142,80 @@ mod tests {
     #[test]
     fn a_refresh_that_arrives_while_the_settings_guard_is_held_starts_nothing() {
         let gh = FakeGh::new();
+        gh.answer_graphql(&recorded_search("acme/widgets"));
         let clone = clone_of("acme/widgets");
         let directory = TempDir::new().unwrap();
         let settings_path = settings_listing(&directory, &[&clone]);
         let home = home_with(&gh);
+        refresh(&home, &settings_path);
+        let settled = snapshot(&home);
+
         let held = lock(&home.settings_action);
+        let ignored = on_settings_file(&home, |home, settings_path| {
+            refresh(home, settings_path);
+        });
+        drop(held);
+
+        assert_eq!(ignored.refresh, settled.refresh, "the stamp is left alone");
+        assert_eq!(
+            ignored.groups[0].rows.len(),
+            2,
+            "the rows on screen are still on screen",
+        );
+        assert_eq!(ignored.count_line, settled.count_line);
+    }
+
+    /// A refresh that stopped part way must not leave a stamp counting off for
+    /// ever, with nothing left running to finish it.
+    #[test]
+    fn a_refresh_that_panicked_ends_as_failed_rather_than_running_for_ever() {
+        let gh = FakeGh::new();
+        gh.answer_graphql(&recorded_search("acme/widgets"));
+        let clone = clone_of("acme/widgets");
+        let directory = TempDir::new().unwrap();
+        let settings_path = settings_listing(&directory, &[&clone]);
+        let home = home_with(&gh);
+        let reports = std::sync::atomic::AtomicUsize::new(0);
+
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            refresh_home_on_model(&home, &settings_path, &|_shown| {
+                assert!(
+                    reports.fetch_add(1, Ordering::AcqRel) < 2,
+                    "the refresh gave up here"
+                );
+            });
+        }));
+
+        assert!(panicked.is_err(), "the refresh was stopped by a panic");
+        let shown = snapshot(&home);
+        assert_eq!(shown.refresh, dto::RefreshStateDto::Failed);
+        assert_eq!(
+            shown.failure.expect("an abandoned refresh says so").summary,
+            "Home could not finish the refresh",
+        );
+    }
+
+    /// The next trigger has to be able to start, whatever became of the last.
+    #[test]
+    fn a_refresh_after_one_that_panicked_still_runs() {
+        let gh = FakeGh::new();
+        gh.answer_graphql(&recorded_search("acme/widgets"));
+        let clone = clone_of("acme/widgets");
+        let directory = TempDir::new().unwrap();
+        let settings_path = settings_listing(&directory, &[&clone]);
+        let home = home_with(&gh);
+        let _panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            refresh_home_on_model(&home, &settings_path, &|_shown| panic!("gave up"));
+        }));
 
         refresh(&home, &settings_path);
 
-        assert_eq!(
-            lock(&home.model).refresh_state(),
-            app::RefreshState::NeverRefreshed,
-            "nothing was started while the guard was held",
-        );
-        assert!(lock(&home.model).repositories().is_empty());
-        drop(held);
+        let shown = snapshot(&home);
+        assert!(matches!(
+            shown.refresh,
+            dto::RefreshStateDto::Refreshed { .. }
+        ));
+        assert_eq!(shown.groups[0].rows.len(), 2);
     }
 
     #[test]
@@ -1190,7 +1303,7 @@ mod tests {
 
         assert_eq!(
             move_home_cursor_on_model(&home, dto::CursorMoveDto::Down).cursor,
-            1
+            1,
         );
         assert_eq!(
             move_home_cursor_on_model(&home, dto::CursorMoveDto::Up).cursor,
@@ -1206,7 +1319,7 @@ mod tests {
         let home = home_model();
 
         refresh(&home, &settings_path);
-        assert!(lock(&home.model).repositories().is_empty());
+        assert!(snapshot(&home).repositories.is_empty());
 
         std::fs::write(
             &settings_path,
@@ -1218,9 +1331,9 @@ mod tests {
         .unwrap();
         refresh(&home, &settings_path);
 
-        let guard = lock(&home.model);
-        assert_eq!(guard.repositories().len(), 1, "a hand edit is picked up");
-        assert_eq!(guard.repositories()[0].slug(), Some("acme/widgets"));
+        let shown = snapshot(&home);
+        assert_eq!(shown.repositories.len(), 1, "a hand edit is picked up");
+        assert_eq!(shown.repositories[0].slug.as_deref(), Some("acme/widgets"));
     }
 
     #[test]
@@ -1234,8 +1347,8 @@ mod tests {
 
         assert_eq!(listed(&settings_path).len(), 1);
         assert_eq!(
-            lock(&home.model).repositories()[0].slug(),
-            Some("acme/widgets")
+            snapshot(&home).repositories[0].slug.as_deref(),
+            Some("acme/widgets"),
         );
     }
 
@@ -1252,9 +1365,9 @@ mod tests {
             !settings_path.exists(),
             "nothing was accepted, so the file is never touched",
         );
-        let guard = lock(&home.model);
-        assert_eq!(guard.refusals().len(), 1);
-        assert_eq!(guard.refusals()[0].reason, "not a Git repository");
+        let shown = snapshot(&home);
+        assert_eq!(shown.refusals.len(), 1);
+        assert_eq!(shown.refusals[0].reason, "not a Git repository");
     }
 
     #[test]
@@ -1269,14 +1382,14 @@ mod tests {
             &settings_path,
             &[first.path().to_path_buf(), second.path().to_path_buf()],
         );
-        let listed_first = lock(&home.model).repositories()[0].path.clone();
+        let listed_first = PathBuf::from(&snapshot(&home).repositories[0].path);
 
         remove_repository_on_model(&home, &settings_path, &listed_first);
 
         assert_eq!(listed(&settings_path).len(), 1);
         assert_eq!(
-            lock(&home.model).repositories()[0].slug(),
-            Some("acme/billing")
+            snapshot(&home).repositories[0].slug.as_deref(),
+            Some("acme/billing"),
         );
     }
 
@@ -1372,10 +1485,10 @@ mod tests {
             &settings_path,
             &[first.path().to_path_buf(), second.path().to_path_buf()],
         );
-        let paths = lock(&home.model)
-            .repositories()
+        let paths = snapshot(&home)
+            .repositories
             .iter()
-            .map(|entry| entry.path.clone())
+            .map(|entry| PathBuf::from(&entry.path))
             .collect::<Vec<_>>();
         assert_eq!(paths.len(), 2);
 
