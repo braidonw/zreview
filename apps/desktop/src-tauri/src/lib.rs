@@ -114,11 +114,13 @@ impl Window {
     ///
     /// The Session already alive on this pull request is shown again rather
     /// than loaded a second time, which is what makes coming back instant. Any
-    /// other Session is dropped, silently, because Drafts already persist.
-    pub(crate) fn open(&mut self, pull_request: PullRequestId, clone_root: PathBuf) {
+    /// other Session is dropped, silently, because Drafts already persist. A
+    /// window with no Home refuses the row and keeps what it holds.
+    pub(crate) fn open(&mut self, pull_request: PullRequestId, clone_root: PathBuf) -> Opened {
         let number = pull_request.number;
-        match self.slot.open(pull_request) {
-            Opened::Returned => {}
+        let opened = self.slot.open(pull_request);
+        match opened {
+            Opened::Returned | Opened::Refused => {}
             Opened::Loading => {
                 self.session = Some(ManagedSession::new(
                     SessionRequest::PullRequest {
@@ -129,16 +131,20 @@ impl Window {
                 ));
             }
         }
+        opened
     }
 }
 
 /// Everything the window holds, shared with every command.
 ///
 /// Home and at most one Session, which Home opens a row into and comes back
-/// from, leaving it alive behind Home.
+/// from, leaving it alive behind Home. Cloned into whatever thread a Home
+/// action runs on, so a refresh reporting from off the UI thread can still say
+/// which row the alive Session was opened from.
+#[derive(Clone)]
 pub(crate) struct AppRoot {
     pub(crate) home: ManagedHome,
-    pub(crate) window: Mutex<Window>,
+    pub(crate) window: Arc<Mutex<Window>>,
 }
 
 /// Builds the window and runs the application until it closes.
@@ -154,7 +160,7 @@ pub fn run(launch: Launch) {
     };
     let root = AppRoot {
         home: ManagedHome::new(GithubClient::default()),
-        window: Mutex::new(window),
+        window: Arc::new(Mutex::new(window)),
     };
     let specta_builder = commands::specta_builder();
 

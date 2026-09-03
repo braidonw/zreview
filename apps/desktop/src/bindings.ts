@@ -253,6 +253,11 @@ export type HomeRowDto = {
 	check_status: RowStatusDto | null,
 	/**  "1 draft" or "N drafts", absent for a blank cell. */
 	drafts_label: string | null,
+	/**
+	 *  Whether the Session alive behind Home is open on this row's pull
+	 *  request, which is what the row's accent mark says.
+	 */
+	is_alive: boolean,
 };
 
 /**  Everything Home renders, from its header to its footer. */

@@ -4,6 +4,7 @@
 //! `&SessionFailure`) and returns a value, which is what keeps them testable
 //! without a running app.
 
+use app::PullRequestId;
 use domain::{
     DiffFile, DiffLineKind, DiffSide, EmptyDiffReason, FileStatus, ReviewSession, SessionFailure,
     SessionSource,
@@ -292,6 +293,9 @@ pub struct HomeRowDto {
     pub check_status: Option<RowStatusDto>,
     /// "1 draft" or "N drafts", absent for a blank cell.
     pub drafts_label: Option<String>,
+    /// Whether the Session alive behind Home is open on this row's pull
+    /// request, which is what the row's accent mark says.
+    pub is_alive: bool,
 }
 
 /// One of Home's three groups, always rendered whether or not it has rows.
@@ -395,8 +399,11 @@ pub struct HomeSnapshotDto {
 }
 
 /// Everything Home shows, from the model that decided it.
+///
+/// `alive` is the pull request the Session behind Home is open on, when one is,
+/// so the row listing it comes back marked.
 #[must_use]
-pub fn project_home(home: &app::HomeModel) -> HomeSnapshotDto {
+pub fn project_home(home: &app::HomeModel, alive: Option<&PullRequestId>) -> HomeSnapshotDto {
     // Walked in the model's own order, so a row's index is where the cursor
     // finds it rather than something counted twice and hoped to agree.
     let mut index = 0_u32;
@@ -405,7 +412,7 @@ pub fn project_home(home: &app::HomeModel) -> HomeSnapshotDto {
         let rows = home
             .rows_in(group)
             .map(|row| {
-                let projected = project_home_row(row, index);
+                let projected = project_home_row(row, index, alive);
                 index += 1;
                 projected
             })
@@ -457,9 +464,10 @@ pub fn project_home(home: &app::HomeModel) -> HomeSnapshotDto {
     }
 }
 
-fn project_home_row(row: &app::HomeRow, index: u32) -> HomeRowDto {
+fn project_home_row(row: &app::HomeRow, index: u32, alive: Option<&PullRequestId>) -> HomeRowDto {
     HomeRowDto {
         index,
+        is_alive: alive.is_some_and(|pull_request| row.is_on(pull_request)),
         title: row.title.clone(),
         url: row.url.clone(),
         repository: row.repository.clone(),
@@ -875,7 +883,7 @@ mod tests {
 
     #[test]
     fn home_projects_the_three_groups_in_order_with_their_empty_copy() {
-        let snapshot = project_home(&app::HomeModel::new());
+        let snapshot = project_home(&app::HomeModel::new(), None);
 
         let titles = snapshot
             .groups
@@ -889,7 +897,7 @@ mod tests {
 
     #[test]
     fn home_projects_each_repository_with_its_slug_or_its_reason() {
-        let snapshot = project_home(&home_with_one_failed_repository());
+        let snapshot = project_home(&home_with_one_failed_repository(), None);
 
         assert_eq!(snapshot.repositories[0].path, "/Developer/zreview");
         assert_eq!(
@@ -916,7 +924,7 @@ mod tests {
             "Home could not read your settings",
         )));
 
-        let snapshot = project_home(&home);
+        let snapshot = project_home(&home, None);
 
         assert_eq!(
             snapshot

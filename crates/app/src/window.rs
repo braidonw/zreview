@@ -10,14 +10,16 @@ pub struct PullRequestId {
 
 impl PullRequestId {
     /// `owner/name#number`, which is how a row and the header slot name it.
-    #[must_use]
-    pub fn identity(&self) -> String {
+    ///
+    /// The one place that format is written, so a row and the Session opened
+    /// from it can never name the same pull request differently.
+    pub(crate) fn identity(&self) -> String {
         format!("{}#{}", self.repository, self.number)
     }
 
     /// Whether both name one pull request, which GitHub decides without regard
     /// to case, so nothing here may either.
-    fn is_same_pull_request(&self, other: &Self) -> bool {
+    pub(crate) fn is_same_pull_request(&self, other: &Self) -> bool {
         self.number == other.number && self.repository.eq_ignore_ascii_case(&other.repository)
     }
 }
@@ -32,24 +34,22 @@ pub enum OpenSession {
 }
 
 impl OpenSession {
-    /// `owner/name#number` of the row this Session was opened from, absent for
-    /// one the command line opened on something Home never listed.
-    ///
-    /// Its presence is what says there is a Home behind this Session.
+    /// The pull request this Session is open on, absent for one the command
+    /// line opened on something Home never listed.
     #[must_use]
-    pub fn row_identity(&self) -> Option<String> {
+    pub const fn pull_request(&self) -> Option<&PullRequestId> {
         match self {
-            Self::FromRow(pull_request) => Some(pull_request.identity()),
+            Self::FromRow(pull_request) => Some(pull_request),
             Self::FromCommandLine => None,
         }
     }
 
-    /// Whether this Session is open on `pull_request`.
-    fn is_on(&self, pull_request: &PullRequestId) -> bool {
-        match self {
-            Self::FromRow(open) => open.is_same_pull_request(pull_request),
-            Self::FromCommandLine => false,
-        }
+    /// `owner/name#number` of the row this Session was opened from.
+    ///
+    /// Its presence is what says there is a Home behind this Session.
+    #[must_use]
+    pub fn row_identity(&self) -> Option<String> {
+        self.pull_request().map(PullRequestId::identity)
     }
 }
 
@@ -69,6 +69,9 @@ pub enum Opened {
     Returned,
     /// Nothing alive was this pull request's, so one is to be loaded.
     Loading,
+    /// This window has no Home to open a row from, so nothing was opened. Only
+    /// the command line opens such a window, and it never lists a row.
+    Refused,
 }
 
 /// Which screen the window shows, and the one Session it holds.
@@ -114,16 +117,18 @@ impl SessionSlot {
     ///
     /// The Session already alive on this pull request is shown again rather
     /// than loaded a second time. Any other is dropped, silently, because
-    /// Drafts already persist.
+    /// Drafts already persist. A window with no Home refuses the row instead,
+    /// rather than growing a Home it never had.
     pub fn open(&mut self, pull_request: PullRequestId) -> Opened {
-        self.showing = Showing::Session;
-        if self
-            .session
-            .as_ref()
-            .is_some_and(|session| session.is_on(&pull_request))
-        {
-            return Opened::Returned;
+        match &self.session {
+            Some(OpenSession::FromCommandLine) => return Opened::Refused,
+            Some(OpenSession::FromRow(open)) if open.is_same_pull_request(&pull_request) => {
+                self.showing = Showing::Session;
+                return Opened::Returned;
+            }
+            Some(OpenSession::FromRow(_)) | None => {}
         }
+        self.showing = Showing::Session;
         self.session = Some(OpenSession::FromRow(pull_request));
         Opened::Loading
     }
@@ -267,6 +272,18 @@ mod tests {
         assert!(!slot.return_to_session());
 
         assert_eq!(slot.showing(), Showing::Home);
+    }
+
+    /// Only Home lists a row, and a window the command line opened never shows
+    /// one, so a row arriving here is a mistake rather than a navigation.
+    #[test]
+    fn a_window_the_command_line_opened_refuses_to_open_a_row() {
+        let mut slot = SessionSlot::command_line();
+
+        assert_eq!(slot.open(pull_request(412)), Opened::Refused);
+
+        assert_eq!(slot.session(), Some(&OpenSession::FromCommandLine));
+        assert_eq!(slot.showing(), Showing::Session);
     }
 
     #[test]
