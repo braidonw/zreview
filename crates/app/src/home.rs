@@ -231,7 +231,7 @@ pub struct HomeRow {
     /// Unsent Drafts on this pull request, regardless of which head they were
     /// written against. Absent means none, and a store failure blanks it too,
     /// so neither reads as a zero.
-    pub drafts: Option<usize>,
+    pub draft_count: Option<usize>,
 }
 
 impl HomeRow {
@@ -242,15 +242,29 @@ impl HomeRow {
     }
 
     /// The scope this row's Drafts are stored under.
+    ///
+    /// `repository` always carries `owner/name` in one field here, unlike
+    /// [`domain::SessionSource`], which keeps them apart; splitting it back is
+    /// cheaper than a second field that would only ever be joined right back
+    /// together for the identity column.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `repository` has no `/`, which nothing that fetches a row
+    /// ever produces.
     #[must_use]
     pub fn draft_scope(&self) -> String {
-        domain::github_draft_scope(&self.repository, self.number)
+        let (owner, name) = self
+            .repository
+            .split_once('/')
+            .expect("a repository is always spelled owner/name");
+        domain::github_draft_scope(owner, name, self.number)
     }
 
     /// "1 draft" or "N drafts", the words the badge shows, absent for a blank cell.
     #[must_use]
     pub fn drafts_label(&self) -> Option<String> {
-        self.drafts.map(|count| {
+        self.draft_count.map(|count| {
             if count == 1 {
                 "1 draft".to_owned()
             } else {
@@ -401,6 +415,18 @@ impl HomeModel {
     /// and nothing from anywhere else.
     pub fn batch_fetched(&mut self, batch: Vec<RepositoryFetch>) {
         for fetch in batch {
+            // The store read only lands once a refresh finishes, so a row this
+            // repository already had a count for keeps it, rather than blinking
+            // out for however long the rest of the refresh takes.
+            let carried_counts = self
+                .rows
+                .iter()
+                .filter(|row| same_slug(&row.repository, &fetch.slug))
+                .filter_map(|row| {
+                    row.draft_count
+                        .map(|count| (draft_scope_key(&row.draft_scope()), count))
+                })
+                .collect::<HashMap<_, _>>();
             self.rows
                 .retain(|row| !same_slug(&row.repository, &fetch.slug));
             self.fetch_failures
@@ -408,8 +434,14 @@ impl HomeModel {
             match fetch.outcome {
                 Ok(pull_requests) => {
                     self.loaded_repositories += 1;
-                    self.rows
-                        .extend(one_row_each(pull_requests).into_iter().map(into_row));
+                    let fresh_rows = one_row_each(pull_requests).into_iter().map(|pull_request| {
+                        let mut row = into_row(pull_request);
+                        row.draft_count = carried_counts
+                            .get(&draft_scope_key(&row.draft_scope()))
+                            .copied();
+                        row
+                    });
+                    self.rows.extend(fresh_rows);
                 }
                 Err(reason) => {
                     self.failed_repositories += 1;
@@ -599,13 +631,13 @@ impl HomeModel {
         match result {
             Ok(counts) => {
                 for row in &mut self.rows {
-                    row.drafts = counts.get(&row.draft_scope()).copied();
+                    row.draft_count = counts.get(&draft_scope_key(&row.draft_scope())).copied();
                 }
                 self.drafts_failure = None;
             }
             Err(failure) => {
                 for row in &mut self.rows {
-                    row.drafts = None;
+                    row.draft_count = None;
                 }
                 self.drafts_failure = Some(failure);
             }
@@ -792,6 +824,16 @@ fn same_slug(left: &str, right: &str) -> bool {
     left.eq_ignore_ascii_case(right)
 }
 
+/// Normalizes a Drafts scope for a case-insensitive lookup.
+///
+/// A Session writes a scope with whatever casing the remote URL carried, while
+/// a fetched row carries GitHub's own casing, so the two can disagree on a
+/// repository [`same_slug`] would call equal. The store already lowercases its
+/// own keys; this lowercases a row's side of the same lookup.
+fn draft_scope_key(scope: &str) -> String {
+    scope.to_ascii_lowercase()
+}
+
 /// Keeps one row per pull request, preferring what the authored search said.
 ///
 /// A pull request the reviewer wrote and is also asked to review comes back
@@ -874,7 +916,7 @@ fn into_row(fetched: FetchedPullRequest) -> HomeRow {
         url: fetched.url,
         author_login: fetched.author_login,
         updated_at_ms: fetched.updated_at_ms,
-        drafts: None,
+        draft_count: None,
     }
 }
 
@@ -2228,7 +2270,7 @@ mod tests {
             3,
         )])));
 
-        assert_eq!(only_row(&home).drafts, Some(3));
+        assert_eq!(only_row(&home).draft_count, Some(3));
     }
 
     #[test]
@@ -2237,7 +2279,33 @@ mod tests {
 
         home.drafts_read(Ok(HashMap::new()));
 
-        assert_eq!(only_row(&home).drafts, None);
+        assert_eq!(only_row(&home).draft_count, None);
+    }
+
+    /// A Session writes its scope with whatever casing the remote URL carried,
+    /// while a fetched row carries GitHub's own casing. The store already
+    /// lowercases its keys; this is the model's own side of the same
+    /// case-insensitive lookup.
+    #[test]
+    fn a_row_finds_its_drafts_despite_a_differently_cased_repository() {
+        let mixed_case = FetchedPullRequest {
+            repository: "Acme/Widgets".to_owned(),
+            ..fetched(HomeSearch::ReviewRequested, 412, 100)
+        };
+        let mut home = HomeModel::new();
+        home.refreshed(Ok(vec![valid("/Developer/widgets", "Acme/Widgets")]));
+        home.batch_fetched(vec![RepositoryFetch {
+            slug: "Acme/Widgets".to_owned(),
+            outcome: Ok(vec![mixed_case]),
+        }]);
+        assert_eq!(only_row(&home).repository, "Acme/Widgets");
+
+        home.drafts_read(Ok(HashMap::from([(
+            "github:acme/widgets#412".to_owned(),
+            2,
+        )])));
+
+        assert_eq!(only_row(&home).draft_count, Some(2));
     }
 
     #[test]
@@ -2253,7 +2321,7 @@ mod tests {
 
         home.drafts_read(Err(SessionFailure::new("Drafts could not be read")));
 
-        assert!(home.rows().iter().all(|row| row.drafts.is_none()));
+        assert!(home.rows().iter().all(|row| row.draft_count.is_none()));
         assert_eq!(
             home.drafts_failure()
                 .expect("the failure should show")
@@ -2273,7 +2341,7 @@ mod tests {
         )])));
 
         assert!(home.drafts_failure().is_none());
-        assert_eq!(only_row(&home).drafts, Some(1));
+        assert_eq!(only_row(&home).draft_count, Some(1));
     }
 
     #[test]
@@ -2294,5 +2362,49 @@ mod tests {
 
         home.drafts_read(Ok(HashMap::new()));
         assert_eq!(only_row(&home).drafts_label(), None);
+    }
+
+    /// The store read only lands once a refresh finishes, but a progressive
+    /// refresh replaces a repository's rows batch by batch. A row's badge must
+    /// not blink out just because its repository answered again before the
+    /// store was asked.
+    #[test]
+    fn a_batch_that_replaces_a_repositorys_rows_carries_over_its_known_draft_count() {
+        let mut home = listing(vec![fetched(HomeSearch::ReviewRequested, 412, 100)]);
+        home.drafts_read(Ok(HashMap::from([(
+            "github:acme/widgets#412".to_owned(),
+            2,
+        )])));
+        assert_eq!(only_row(&home).draft_count, Some(2));
+
+        home.batch_fetched(vec![loaded(vec![fetched(
+            HomeSearch::ReviewRequested,
+            412,
+            200,
+        )])]);
+
+        assert_eq!(
+            only_row(&home).draft_count,
+            Some(2),
+            "the badge should not blink out mid-refresh",
+        );
+    }
+
+    /// A pull request new to this batch has no count to carry over.
+    #[test]
+    fn a_row_new_to_a_batch_has_no_carried_over_draft_count() {
+        let mut home = listing(vec![fetched(HomeSearch::ReviewRequested, 412, 100)]);
+        home.drafts_read(Ok(HashMap::from([(
+            "github:acme/widgets#412".to_owned(),
+            2,
+        )])));
+
+        home.batch_fetched(vec![loaded(vec![fetched(
+            HomeSearch::ReviewRequested,
+            999,
+            200,
+        )])]);
+
+        assert_eq!(only_row(&home).draft_count, None);
     }
 }
