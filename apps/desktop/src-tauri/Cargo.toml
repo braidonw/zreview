@@ -19,6 +19,7 @@ tauri-build = { version = "=2.6.3", features = [] }
 app.workspace = true
 domain.workspace = true
 github.workspace = true
+review.workspace = true
 session.workspace = true
 settings.workspace = true
 store.workspace = true

@@ -141,6 +141,117 @@ export const commands = {
 	 *  `(path, side, line)`, or `row` cannot carry a comment.
 	 */
 	reanchorDraft: (fileIndex: number, path: string, side: DiffSideDto, line: number, row: number) => typedError<DraftsDto, SessionFailureDto>(__TAURI_INVOKE("reanchor_draft", { fileIndex, path, side, line, row })),
+	/**
+	 *  The Session's review panel, asked for once the session is ready.
+	 * 
+	 *  `null` means this snapshot cannot be reviewed at all, which is the generated
+	 *  fixture, and the Session shows no panel.
+	 * 
+	 *  # Errors
+	 * 
+	 *  Returns a failure when no session is open.
+	 */
+	reviewPanel: () => typedError<{
+	/**
+	 *  How many times the panel has changed, so a snapshot that was read before
+	 *  a change can be told from one that carries it.
+	 */
+	revision: number,
+	/**  "Review" before there is anything to act on, otherwise the finding count. */
+	heading: string,
+	guidance: GuidanceDto,
+	run: ReviewRunDto,
+	note: PanelNoteDto | null,
+	footer: PanelFooterDto | null,
+} | null, SessionFailureDto>(__TAURI_INVOKE("review_panel")),
+	/**
+	 *  Runs a review against the Claude coding agent at the repository root, on a
+	 *  background thread, reporting the panel to `on_progress` as the backend speaks.
+	 * 
+	 *  A trigger that arrives while a run is in flight starts nothing and answers with
+	 *  the panel already on screen. The model is taken out of the window as its own
+	 *  handle, so a Session dropped or a window closed mid-run leaves the background
+	 *  work finishing into a model nobody reads rather than panicking.
+	 * 
+	 *  # Errors
+	 * 
+	 *  Returns a failure when no session is open, or when the task doing the review
+	 *  does not finish.
+	 */
+	runReview: (onProgress: Channel<ReviewPanelDto>) => typedError<{
+	/**
+	 *  How many times the panel has changed, so a snapshot that was read before
+	 *  a change can be told from one that carries it.
+	 */
+	revision: number,
+	/**  "Review" before there is anything to act on, otherwise the finding count. */
+	heading: string,
+	guidance: GuidanceDto,
+	run: ReviewRunDto,
+	note: PanelNoteDto | null,
+	footer: PanelFooterDto | null,
+} | null, SessionFailureDto>(__TAURI_INVOKE("run_review", { onProgress })),
+	/**
+	 *  Asks the running review to stop. It ends at the backend's next step.
+	 * 
+	 *  # Errors
+	 * 
+	 *  Returns a failure when no session is open.
+	 */
+	cancelReview: () => typedError<{
+	/**
+	 *  How many times the panel has changed, so a snapshot that was read before
+	 *  a change can be told from one that carries it.
+	 */
+	revision: number,
+	/**  "Review" before there is anything to act on, otherwise the finding count. */
+	heading: string,
+	guidance: GuidanceDto,
+	run: ReviewRunDto,
+	note: PanelNoteDto | null,
+	footer: PanelFooterDto | null,
+} | null, SessionFailureDto>(__TAURI_INVOKE("cancel_review")),
+	/**
+	 *  Opens or closes the guidance section.
+	 * 
+	 *  # Errors
+	 * 
+	 *  Returns a failure when no session is open.
+	 */
+	toggleGuidancePanel: () => typedError<{
+	/**
+	 *  How many times the panel has changed, so a snapshot that was read before
+	 *  a change can be told from one that carries it.
+	 */
+	revision: number,
+	/**  "Review" before there is anything to act on, otherwise the finding count. */
+	heading: string,
+	guidance: GuidanceDto,
+	run: ReviewRunDto,
+	note: PanelNoteDto | null,
+	footer: PanelFooterDto | null,
+} | null, SessionFailureDto>(__TAURI_INVOKE("toggle_guidance_panel")),
+	/**
+	 *  Turns one guidance file on or off for the next run.
+	 * 
+	 *  # Errors
+	 * 
+	 *  Returns a failure when no session is open, or when `path` names no guidance
+	 *  file the session discovered.
+	 */
+	toggleGuidance: (path: string) => typedError<{
+	/**
+	 *  How many times the panel has changed, so a snapshot that was read before
+	 *  a change can be told from one that carries it.
+	 */
+	revision: number,
+	/**  "Review" before there is anything to act on, otherwise the finding count. */
+	heading: string,
+	guidance: GuidanceDto,
+	run: ReviewRunDto,
+	note: PanelNoteDto | null,
+	footer: PanelFooterDto | null,
+} | null, SessionFailureDto>(__TAURI_INVOKE("toggle_guidance", { path })),
 };
 
 /* Types */
@@ -212,6 +323,36 @@ export type FileSummaryDto = {
 	deletions: number,
 	viewed: boolean,
 	thread_count: number,
+};
+
+/**  The guidance section at the top of the panel. */
+export type GuidanceDto = 
+/**
+ *  Discovery ran and found nothing. Saying so is not the same as showing
+ *  nothing. A reviewer needs to tell "this repository states no conventions"
+ *  from "guidance was never looked for".
+ */
+{ kind: "NothingFound"; note: string } | { kind: "Discovered"; 
+/**  The one line that stays on screen whether or not the section is open. */
+summary: string; expanded: boolean; entries: GuidanceEntryDto[]; skipped: GuidanceSkipDto[]; 
+/**  What configuration keeps out of the review, when it keeps anything out. */
+excluded: string | null };
+
+/**  One guidance file discovery found, as the panel draws its row. */
+export type GuidanceEntryDto = {
+	/**  Repository-relative path, which is also how a finding cites it. */
+	path: string,
+	/**  What it applies to, already rendered, e.g. "whole repository". */
+	scope: string,
+	kilobytes: number,
+	/**  Whether the next run will send it. */
+	included: boolean,
+};
+
+/**  Something discovery found and will not use, and why. */
+export type GuidanceSkipDto = {
+	path: string,
+	reason: string,
 };
 
 /**  One of Home's three groups, always rendered whether or not it has rows. */
@@ -308,6 +449,27 @@ export type OpenSessionDto = {
 	row_identity: string | null,
 };
 
+/**  The caveats under the panel: what was refused, and what was never looked at. */
+export type PanelFooterDto = {
+	/**  Claims that did not survive checking against the diff. */
+	refused: string | null,
+	/**  Present when a completed run did not see the whole change. */
+	not_reviewed: string | null,
+	/**  The files that run did not see, named under the count that describes them. */
+	unreviewed: string[],
+};
+
+/**
+ *  What the panel says when there is no finding to show.
+ * 
+ *  Every run state has one. An empty panel with no explanation is the failure
+ *  this projection exists to avoid.
+ */
+export type PanelNoteDto = {
+	heading: string,
+	detail: string | null,
+};
+
 /**  How current the list is, which the header stamp reads. */
 export type RefreshStateDto = 
 /**  There is no stamp at all until the first refresh starts. */
@@ -325,6 +487,31 @@ export type RefusalDto = {
 	path: string,
 	reason: string,
 };
+
+/**
+ *  The Session's right-hand panel: what a review is held to, and how far the run
+ *  that populates it has got.
+ */
+export type ReviewPanelDto = {
+	/**
+	 *  How many times the panel has changed, so a snapshot that was read before
+	 *  a change can be told from one that carries it.
+	 */
+	revision: number,
+	/**  "Review" before there is anything to act on, otherwise the finding count. */
+	heading: string,
+	guidance: GuidanceDto,
+	run: ReviewRunDto,
+	note: PanelNoteDto | null,
+	footer: PanelFooterDto | null,
+};
+
+/**  How far the current review run has got. */
+export type ReviewRunDto = { state: "Idle" } | { state: "Running"; 
+/**  The backend's most recent progress line. */
+detail: string } | { state: "Complete"; accepted: number; rejected: number; 
+/**  Claims suppressed because the reviewer dismissed them before. */
+suppressed: number } | { state: "Failed"; summary: string; remediation: string | null };
 
 export type RowDto = {
 	kind: DiffLineKindDto,

@@ -14,6 +14,7 @@ import {
   makeHomeSnapshot,
   makeRow,
   makeSidebar,
+  makePanel,
   makeSnapshot,
 } from "./test/fixtures";
 
@@ -32,6 +33,8 @@ const toggleViewed = vi.fn();
 const editDraft = vi.fn();
 const discardDraft = vi.fn();
 const reanchorDraft = vi.fn();
+const reviewPanel = vi.fn();
+const runReview = vi.fn();
 
 vi.mock("./bindings", () => ({
   commands: {
@@ -50,6 +53,8 @@ vi.mock("./bindings", () => ({
     editDraft: (...args: unknown[]) => editDraft(...args),
     discardDraft: (...args: unknown[]) => discardDraft(...args),
     reanchorDraft: (...args: unknown[]) => reanchorDraft(...args),
+    reviewPanel: () => reviewPanel(),
+    runReview: (channel: unknown) => runReview(channel),
   },
 }));
 
@@ -171,6 +176,9 @@ beforeEach(() => {
   editDraft.mockReset();
   discardDraft.mockReset();
   reanchorDraft.mockReset();
+  reviewPanel.mockReset();
+  reviewPanel.mockResolvedValue({ status: "ok", data: null });
+  runReview.mockReset();
 });
 
 /** Home, listed and settled, with the cursor on its first row. */
@@ -288,6 +296,27 @@ describe("coming back", () => {
 });
 
 describe("the Session kept alive behind Home", () => {
+  /// A Session behind Home has no screen, so its bindings must not answer
+  /// keystrokes meant for the list.
+  it("starts no review on cmd-shift-R once Home is in front of the Session", async () => {
+    reviewPanel.mockResolvedValue(ok(makePanel()));
+    runReview.mockResolvedValue(ok(makePanel({ revision: 2, heading: "1 finding" })));
+    await openTheCursorRow();
+
+    // In front, the Session answers the binding and the run settles.
+    fireEvent.keyDown(window, { key: "r", metaKey: true, shiftKey: true });
+    await waitFor(() => expect(screen.getByText("1 finding")).toBeTruthy());
+    expect(runReview).toHaveBeenCalledOnce();
+
+    fireEvent.keyDown(window, { key: "[", metaKey: true });
+    await waitFor(() =>
+      expect(document.querySelector(".app__session")?.hasAttribute("hidden")).toBe(true),
+    );
+    fireEvent.keyDown(window, { key: "r", metaKey: true, shiftKey: true });
+
+    expect(runReview).toHaveBeenCalledOnce();
+  });
+
   it("keeps its tree mounted and hidden, with its file, cursor, and composer intact", async () => {
     const user = userEvent.setup();
     selectFile.mockResolvedValue(

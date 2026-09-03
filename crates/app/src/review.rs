@@ -90,6 +90,17 @@ pub struct ReviewModel {
     /// Open before the first run, because PLAN wants what will be sent seen before
     /// it is sent; collapsed afterwards, when the findings are what matters.
     pub(crate) guidance_expanded: bool,
+    /// How many times anything the review panel shows has changed.
+    ///
+    /// A front end learns about this model through whole-panel snapshots, from
+    /// several commands running at once. One that read the model before a change
+    /// can be delivered after a snapshot that carries it, which would put a
+    /// finished run back on screen as a running one. This is how the receiver
+    /// tells which of two snapshots is older.
+    ///
+    /// Saturating rather than wrapping, so it can never go backwards. Reaching the
+    /// ceiling would take billions of changes in one sitting.
+    revision: u32,
 }
 
 impl ReviewModel {
@@ -99,7 +110,18 @@ impl ReviewModel {
             run: ReviewRunState::Idle,
             selected_finding: None,
             guidance_expanded: true,
+            revision: 0,
         }
+    }
+
+    #[must_use]
+    pub const fn revision(&self) -> u32 {
+        self.revision
+    }
+
+    /// Records that something the panel shows has changed.
+    pub(crate) fn touch(&mut self) {
+        self.revision = self.revision.saturating_add(1);
     }
 
     #[must_use]

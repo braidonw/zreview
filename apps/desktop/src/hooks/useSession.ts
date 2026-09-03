@@ -1,12 +1,17 @@
 import { useCallback, useEffect, useReducer, useRef } from "react";
 import { Channel } from "@tauri-apps/api/core";
 import { writeText } from "@tauri-apps/plugin-clipboard-manager";
-import type { DiffSideDto } from "../bindings";
+import type { DiffSideDto, ReviewPanelDto } from "../bindings";
 import { commands } from "../bindings";
 import { clamp } from "../lib/clamp";
 import { toFailure } from "../lib/failure";
 import { initialState, selectionRange, sessionReducer } from "./sessionReducer";
 import { useDraftQueue } from "./useDraftQueue";
+
+/** What a command answering with the review panel hands back. */
+type PanelResult =
+  | { status: "ok"; data: ReviewPanelDto | null }
+  | { status: "error"; error: unknown };
 
 /**
  * Loads one session and exposes every action the UI can take on it.
@@ -20,6 +25,9 @@ export function useSession(description: string, isShowing: boolean) {
   stateRef.current = state;
   const hasOpened = useRef(false);
   const draftQueue = useDraftQueue(dispatch);
+  // Held here rather than read off the panel, because a second trigger can arrive
+  // before the first run's own "Running" panel has come back over the channel.
+  const isRunning = useRef(false);
 
   useEffect(() => {
     if (hasOpened.current) {
@@ -39,12 +47,16 @@ export function useSession(description: string, isShowing: boolean) {
           return;
         }
         const snapshot = opened.data;
-        commands.selectFile(0).then((selected) => {
+        Promise.all([commands.selectFile(0), commands.reviewPanel()]).then(([selected, panel]) => {
           if (selected.status === "error") {
             dispatch({ type: "failed", failure: toFailure(selected.error) });
             return;
           }
-          dispatch({ type: "ready", snapshot, file: selected.data });
+          if (panel.status === "error") {
+            dispatch({ type: "failed", failure: toFailure(panel.error) });
+            return;
+          }
+          dispatch({ type: "ready", snapshot, file: selected.data, panel: panel.data });
         });
       })
       .catch((error: unknown) => {
@@ -71,6 +83,83 @@ export function useSession(description: string, isShowing: boolean) {
       dispatch({ type: "sidebar", sidebar: toggled.data });
     });
   }, []);
+
+  /**
+   * Starts a review, unless one is already in flight.
+   *
+   * The run holds the session in the backend for as long as the coding agent
+   * takes, so the panel arrives in pieces: the running state and every progress
+   * line over the channel, the outcome when the promise settles.
+   */
+  const runReview = useCallback(() => {
+    if (isRunning.current) {
+      return;
+    }
+    isRunning.current = true;
+
+    try {
+      const channel = new Channel<ReviewPanelDto>();
+      channel.onmessage = (panel) => dispatch({ type: "panel", panel });
+
+      commands
+        .runReview(channel)
+        .then((finished) => {
+          if (finished.status === "error") {
+            dispatch({ type: "panelNotice", notice: toFailure(finished.error).summary });
+            return;
+          }
+          dispatch({ type: "panel", panel: finished.data });
+        })
+        .catch((error: unknown) => {
+          dispatch({ type: "panelNotice", notice: toFailure(error).summary });
+        })
+        .finally(() => {
+          isRunning.current = false;
+        });
+    } catch (error: unknown) {
+      // A throw before the promise exists would otherwise leave the flag set and
+      // no review startable for the rest of the sitting.
+      isRunning.current = false;
+      dispatch({ type: "panelNotice", notice: toFailure(error).summary });
+    }
+  }, []);
+
+  /**
+   * Runs one of the panel's own commands, showing a refusal inside the panel.
+   *
+   * These are about the review, not the sitting. Replacing the Session with a
+   * failure screen would throw away the diff and whatever is unsent in the
+   * composer, over a toggle that did not take.
+   */
+  const onPanel = useCallback(
+    (call: Promise<PanelResult>) => {
+      call
+        .then((answered) => {
+          if (answered.status === "error") {
+            dispatch({ type: "panelNotice", notice: toFailure(answered.error).summary });
+            return;
+          }
+          dispatch({ type: "panel", panel: answered.data });
+        })
+        .catch((error: unknown) => {
+          dispatch({ type: "panelNotice", notice: toFailure(error).summary });
+        });
+    },
+    [],
+  );
+
+  /** Asks the running review to stop. It ends at the backend's next step. */
+  const cancelReview = useCallback(() => onPanel(commands.cancelReview()), [onPanel]);
+
+  const toggleGuidanceSection = useCallback(
+    () => onPanel(commands.toggleGuidancePanel()),
+    [onPanel],
+  );
+
+  const toggleGuidanceFile = useCallback(
+    (path: string) => onPanel(commands.toggleGuidance(path)),
+    [onPanel],
+  );
 
   const clickRow = useCallback((index: number) => dispatch({ type: "click", index }), []);
 
@@ -146,6 +235,11 @@ export function useSession(description: string, isShowing: boolean) {
         toggleViewed();
         return;
       }
+      if (event.metaKey && event.shiftKey && key === "r") {
+        event.preventDefault();
+        runReview();
+        return;
+      }
       if (event.metaKey && !event.shiftKey && key === "c") {
         event.preventDefault();
         const [start, end] = selectionRange(current);
@@ -174,7 +268,7 @@ export function useSession(description: string, isShowing: boolean) {
 
     window.addEventListener("keydown", handleKeydown);
     return () => window.removeEventListener("keydown", handleKeydown);
-  }, [state.status, isShowing, selectFile, toggleViewed]);
+  }, [state.status, isShowing, selectFile, toggleViewed, runReview]);
 
   return {
     state,
@@ -185,5 +279,9 @@ export function useSession(description: string, isShowing: boolean) {
     composerChange,
     composerDiscard,
     reanchorDraft,
+    runReview,
+    cancelReview,
+    toggleGuidanceSection,
+    toggleGuidanceFile,
   };
 }

@@ -4,6 +4,7 @@ import { composerPrefill, selectionRange } from "../hooks/sessionReducer";
 import { DiffList } from "./DiffList";
 import { EmptyDiffPane } from "./EmptyDiffPane";
 import { FileSidebar } from "./FileSidebar";
+import { ReviewPanel } from "./ReviewPanel";
 import "./SessionShell.css";
 
 export function SessionShell({
@@ -17,6 +18,10 @@ export function SessionShell({
   onComposerClose,
   onComposerDiscard,
   onReanchorDraft,
+  onRunReview,
+  onCancelReview,
+  onToggleGuidanceSection,
+  onToggleGuidanceFile,
 }: {
   state: ReadyState;
   /** False while Home is in front, which is when this Session has no screen. */
@@ -30,6 +35,10 @@ export function SessionShell({
   onComposerClose: () => void;
   onComposerDiscard: () => void;
   onReanchorDraft: (path: string, side: DiffSideDto, line: number, row: number) => void;
+  onRunReview: () => void;
+  onCancelReview: () => void;
+  onToggleGuidanceSection: () => void;
+  onToggleGuidanceFile: (path: string) => void;
 }) {
   const [selectionStart, selectionEnd] = selectionRange(state);
   const { empty_reason: emptyReason, rows } = state.file;
@@ -71,6 +80,16 @@ export function SessionShell({
           onComposerChange={onComposerChange}
           onComposerClose={onComposerClose}
           onComposerDiscard={onComposerDiscard}
+        />
+      )}
+      {state.panel !== null && (
+        <ReviewPanel
+          panel={state.panel}
+          notice={state.panelNotice}
+          onRunReview={onRunReview}
+          onCancelReview={onCancelReview}
+          onToggleGuidanceSection={onToggleGuidanceSection}
+          onToggleGuidanceFile={onToggleGuidanceFile}
         />
       )}
     </div>

@@ -23,6 +23,10 @@ export function SessionApp({
     composerChange,
     composerDiscard,
     reanchorDraft,
+    runReview,
+    cancelReview,
+    toggleGuidanceSection,
+    toggleGuidanceFile,
   } = useSession(description, isShowing);
 
   switch (state.status) {
@@ -43,6 +47,10 @@ export function SessionApp({
           onComposerClose={closeComposer}
           onComposerDiscard={composerDiscard}
           onReanchorDraft={reanchorDraft}
+          onRunReview={runReview}
+          onCancelReview={cancelReview}
+          onToggleGuidanceSection={toggleGuidanceSection}
+          onToggleGuidanceFile={toggleGuidanceFile}
         />
       );
   }

@@ -3,15 +3,21 @@ import type {
   DraftsDto,
   FileDetailDto,
   FileSummaryDto,
+  GuidanceDto,
+  GuidanceEntryDto,
   HomeGroupDto,
   HomeRepositoryDto,
   HomeRowDto,
   HomeSnapshotDto,
+  ReviewPanelDto,
   RowDto,
   SessionSnapshotDto,
   SidebarDto,
   StaleDraftDto,
 } from "../bindings";
+
+/** The guidance section once discovery has found something. */
+type DiscoveredGuidance = Extract<GuidanceDto, { kind: "Discovered" }>;
 
 export function makeRow(overrides: Partial<RowDto> = {}): RowDto {
   return {
@@ -97,6 +103,43 @@ export function makeSnapshot(overrides: Partial<SessionSnapshotDto> = {}): Sessi
     subtitle: "Diff virtualization demo",
     sidebar: makeSidebar(),
     warnings: [],
+    ...overrides,
+  };
+}
+
+export function makeGuidanceEntry(overrides: Partial<GuidanceEntryDto> = {}): GuidanceEntryDto {
+  return {
+    path: "AGENTS.md",
+    scope: "whole repository",
+    kilobytes: 2,
+    included: true,
+    ...overrides,
+  };
+}
+
+export function makeGuidance(overrides: Partial<DiscoveredGuidance> = {}): GuidanceDto {
+  return {
+    kind: "Discovered",
+    summary: "1 guidance file · 2 KB",
+    expanded: true,
+    entries: [makeGuidanceEntry()],
+    skipped: [],
+    excluded: null,
+    ...overrides,
+  };
+}
+
+export function makePanel(overrides: Partial<ReviewPanelDto> = {}): ReviewPanelDto {
+  return {
+    revision: 1,
+    heading: "Review",
+    guidance: makeGuidance(),
+    run: { state: "Idle" },
+    note: {
+      heading: "No review has been run.",
+      detail: "Press Review to check this change against the repository's guidance.",
+    },
+    footer: null,
     ...overrides,
   };
 }
