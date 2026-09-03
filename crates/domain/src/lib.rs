@@ -315,6 +315,16 @@ pub enum SessionSource {
     },
 }
 
+/// The scope Drafts are stored under for a GitHub pull request, given its
+/// repository as `owner/name` and its number.
+///
+/// Shared by [`SessionSource::draft_scope`] and by Home's Drafts count, so a
+/// Session and Home's badge agree on what a scope is spelled as.
+#[must_use]
+pub fn github_draft_scope(repository: &str, number: u64) -> String {
+    format!("github:{repository}#{number}")
+}
+
 impl SessionSource {
     /// The commit every anchor, finding, and draft in this session is keyed to.
     #[must_use]
@@ -360,7 +370,10 @@ impl SessionSource {
                 repository,
                 number,
                 ..
-            } => Some(format!("github:{owner}/{repository}#{number}")),
+            } => Some(github_draft_scope(
+                &format!("{owner}/{repository}"),
+                *number,
+            )),
         }
     }
 }
@@ -1461,6 +1474,15 @@ mod tests {
 
         // Nothing to persist for a generated fixture.
         assert!(SessionSource::Demo.draft_scope().is_none());
+    }
+
+    /// The same shape Home's Drafts count is read by.
+    #[test]
+    fn github_draft_scope_matches_a_pull_requests_own_draft_scope() {
+        assert_eq!(
+            github_draft_scope("acme/widgets", 42),
+            "github:acme/widgets#42",
+        );
     }
 
     #[test]
