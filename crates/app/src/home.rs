@@ -12,6 +12,8 @@ use std::{
 
 use domain::SessionFailure;
 
+use crate::window::PullRequestId;
+
 /// What resolving one clone found.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum RepositoryOutcome {
@@ -235,10 +237,26 @@ pub struct HomeRow {
 }
 
 impl HomeRow {
+    /// Which pull request this row lists.
+    #[must_use]
+    pub fn pull_request(&self) -> PullRequestId {
+        PullRequestId {
+            repository: self.repository.clone(),
+            number: self.number,
+        }
+    }
+
     /// `owner/name#number`, which is how a row names its pull request.
     #[must_use]
     pub fn identity(&self) -> String {
-        format!("{}#{}", self.repository, self.number)
+        self.pull_request().identity()
+    }
+
+    /// Whether this row lists `pull_request`, which is how the row of the
+    /// Session alive behind Home is found.
+    #[must_use]
+    pub fn is_on(&self, pull_request: &PullRequestId) -> bool {
+        self.pull_request().is_same_pull_request(pull_request)
     }
 
     /// The scope this row's Drafts are stored under.
@@ -945,6 +963,42 @@ mod tests {
                 reason: reason.to_owned(),
             },
         }
+    }
+
+    /// The row a listed pull request becomes, for asking what it names.
+    fn row(repository: &str, number: u64) -> HomeRow {
+        HomeRow {
+            group: HomeGroup::ToReview,
+            repository: repository.to_owned(),
+            number,
+            title: "Retry webhook deliveries".to_owned(),
+            url: String::new(),
+            author_login: None,
+            updated_at_ms: 0,
+            review_status: None,
+            check_status: None,
+            draft_count: None,
+        }
+    }
+
+    /// GitHub compares two repository names without regard to case, so a row
+    /// that came back cased differently still names the same pull request.
+    #[test]
+    fn a_row_cased_differently_is_still_on_the_same_pull_request() {
+        let listed = row("ACME/Widgets", 412);
+
+        assert!(listed.is_on(&PullRequestId {
+            repository: "acme/widgets".to_owned(),
+            number: 412,
+        }));
+        assert!(!listed.is_on(&PullRequestId {
+            repository: "acme/widgets".to_owned(),
+            number: 398,
+        }));
+        assert!(!listed.is_on(&PullRequestId {
+            repository: "acme/billing".to_owned(),
+            number: 412,
+        }));
     }
 
     /// One fetched pull request, with nothing standing between it and its group.

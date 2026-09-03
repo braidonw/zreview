@@ -17,6 +17,7 @@ mod handoff;
 mod home;
 mod review;
 mod session;
+mod window;
 
 pub use handoff::Handoff;
 pub use home::{
@@ -26,6 +27,7 @@ pub use home::{
 };
 pub use review::{FindingDisposition, ReviewModel, ReviewRunState};
 pub use session::{PendingSend, SessionModel, SessionPhase, SubmissionState};
+pub use window::{OpenSession, Opened, PullRequestId, SessionSlot, Showing};
 
 /// Takes a model's lock, recovering from poisoning. The guarded state stays
 /// consistent, and refusing to use it would be worse than the panic that

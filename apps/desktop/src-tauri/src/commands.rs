@@ -3,29 +3,34 @@
 use std::{
     path::{Path, PathBuf},
     sync::{
-        Mutex,
+        Arc, Mutex,
         atomic::{AtomicBool, Ordering},
     },
 };
 
-use app::{SessionPhase, SettingsWrite, lock, try_lock};
+use app::{
+    Opened, PullRequestId, RepositoryOutcome, SessionPhase, SettingsWrite, Showing, lock, try_lock,
+};
 use domain::DiffSide;
 use session::{ReviewStorage, SessionRequest};
 use tauri::ipc::Channel;
 use tauri_specta::collect_commands;
 
-use crate::{AppRoot, ManagedHome, ManagedSession, drafts, dto, pull_requests, repositories};
+use crate::{AppRoot, ManagedHome, Window, drafts, dto, pull_requests, repositories};
 
 /// The specta builder, shared between the invoke handler and the bindings export.
 #[must_use]
 pub fn specta_builder() -> tauri_specta::Builder<tauri::Wry> {
     tauri_specta::Builder::<tauri::Wry>::new().commands(collect_commands![
-        describe_launch,
+        describe_window,
         refresh_home,
         move_home_cursor,
         add_repositories,
         remove_repository,
         toggle_repositories_footer,
+        open_row,
+        return_to_home,
+        return_to_session,
         open_session,
         select_file,
         toggle_viewed,
@@ -48,11 +53,12 @@ pub fn specta_builder() -> tauri_specta::Builder<tauri::Wry> {
 /// Takes the reporter as a plain callback so it can be tested without a Tauri
 /// channel, as `run_load` does.
 fn refresh_home_on_model(
-    home: &ManagedHome,
+    root: &AppRoot,
     settings_path: &Path,
     database_path: &Path,
     report: &dyn Fn(dto::HomeSnapshotDto),
 ) {
+    let home = &root.home;
     let Some(_ordered) = try_lock(&home.settings_action) else {
         return;
     };
@@ -60,13 +66,13 @@ fn refresh_home_on_model(
     // Every way out from here says how the refresh went, except a panic, which
     // would otherwise leave the stamp counting repositories off for ever.
     let _abandoned = AbandonedRefresh { home };
-    report_home(home, report);
+    report_home(root, report);
 
     read_into_model(home, settings_path);
     // Only the settings file can have failed by here, whatever stopped the last
     // refresh having gone with the trigger that started this one.
     if lock(&home.model).failure().is_some() {
-        report_home(home, report);
+        report_home(root, report);
         return;
     }
     let (slugs, preflight_in) = to_fetch(&lock(&home.model));
@@ -74,22 +80,22 @@ fn refresh_home_on_model(
         && let Err(failure) = pull_requests::preflight(&home.client, &clone)
     {
         lock(&home.model).preflight_failed(failure);
-        report_home(home, report);
+        report_home(root, report);
         return;
     }
 
     lock(&home.model).fetching(slugs.len());
-    report_home(home, report);
+    report_home(root, report);
     pull_requests::fetch(&home.client, &slugs, &|batch| {
         lock(&home.model).batch_fetched(batch);
-        report_home(home, report);
+        report_home(root, report);
     });
     // Evaluated before the lock is taken, so the store open and query never
     // hold the model mutex against every other command waiting on it.
     let drafts_result = drafts::read(database_path);
     lock(&home.model).drafts_read(drafts_result);
     lock(&home.model).finish_refresh(now_ms());
-    report_home(home, report);
+    report_home(root, report);
 }
 
 /// Ends a refresh that stopped without finishing.
@@ -108,9 +114,25 @@ impl Drop for AbandonedRefresh<'_> {
 }
 
 /// Hands the reporter everything Home now shows, so a list fills in as it loads.
-fn report_home(home: &ManagedHome, report: &dyn Fn(dto::HomeSnapshotDto)) {
-    let shown = dto::project_home(&lock(&home.model));
-    report(shown);
+fn report_home(root: &AppRoot, report: &dyn Fn(dto::HomeSnapshotDto)) {
+    report(shown_home(root));
+}
+
+/// Everything Home now shows, with the row of the Session behind it marked.
+fn shown_home(root: &AppRoot) -> dto::HomeSnapshotDto {
+    // Read out and released before Home's own lock is taken, so the two are
+    // never held at once and so can never be taken in two orders.
+    let alive = alive_pull_request(root);
+    dto::project_home(&lock(&root.home.model), alive.as_ref())
+}
+
+/// The pull request the Session behind Home is open on, when one is.
+fn alive_pull_request(root: &AppRoot) -> Option<PullRequestId> {
+    lock(&root.window)
+        .slot
+        .session()
+        .and_then(app::OpenSession::pull_request)
+        .cloned()
 }
 
 /// The repositories a refresh will ask about, and the clone to preflight in.
@@ -146,16 +168,12 @@ fn now_ms() -> i64 {
     i64::try_from(since_epoch.as_millis()).expect("the system clock is set before the year 292M")
 }
 
-fn move_home_cursor_on_model(
-    home: &ManagedHome,
-    move_to: dto::CursorMoveDto,
-) -> dto::HomeSnapshotDto {
-    let mut guard = lock(&home.model);
+fn move_home_cursor_on_model(root: &AppRoot, move_to: dto::CursorMoveDto) -> dto::HomeSnapshotDto {
     match move_to {
-        dto::CursorMoveDto::Down => guard.move_cursor_down(),
-        dto::CursorMoveDto::Up => guard.move_cursor_up(),
+        dto::CursorMoveDto::Down => lock(&root.home.model).move_cursor_down(),
+        dto::CursorMoveDto::Up => lock(&root.home.model).move_cursor_up(),
     }
-    dto::project_home(&guard)
+    shown_home(root)
 }
 
 /// Adds the folders a reviewer picked, then leaves Home showing the file.
@@ -196,15 +214,12 @@ fn write_then_read(home: &ManagedHome, settings_path: &Path, write: Option<Setti
 ///
 /// A machine with no home directory has nowhere to keep the file, which is a
 /// whole-Home failure rather than something an action can work around.
-fn on_settings_file(
-    home: &ManagedHome,
-    action: impl FnOnce(&ManagedHome, &Path),
-) -> dto::HomeSnapshotDto {
+fn on_settings_file(root: &AppRoot, action: impl FnOnce(&AppRoot, &Path)) -> dto::HomeSnapshotDto {
     match repositories::settings_path() {
-        Ok(path) => action(home, &path),
-        Err(failure) => lock(&home.model).refreshed(Err(failure)),
+        Ok(path) => action(root, &path),
+        Err(failure) => lock(&root.home.model).refreshed(Err(failure)),
     }
-    dto::project_home(&lock(&home.model))
+    shown_home(root)
 }
 
 /// Runs Home's file and Git work away from the UI thread.
@@ -221,6 +236,14 @@ async fn off_the_ui_thread(
         })
 }
 
+/// Held for the whole of one Session load, so no two ever run at once.
+///
+/// Opening a different row drops the Session that was loading, but not the load
+/// itself, which runs on until it finishes. A load runs Git and `gh` against a
+/// clone, and the load that replaces it usually reaches the same clone, so the
+/// new one waits here rather than fetching over the old one.
+static SESSION_LOAD: Mutex<()> = Mutex::new(());
+
 /// Loads `request` into `model`, reporting each stage's label to `report`.
 ///
 /// Takes the reporter as a plain callback so it can be tested without a Tauri channel.
@@ -230,6 +253,7 @@ fn run_load(
     storage: &ReviewStorage,
     report: &dyn Fn(&str),
 ) {
+    let _ordered = lock(&SESSION_LOAD);
     let result = session::load(request, storage, &|stage| {
         let _ = lock(model).set_stage(stage.label());
         report(stage.label());
@@ -433,20 +457,31 @@ pub async fn open_session(
     state: tauri::State<'_, AppRoot>,
     on_stage: Channel<String>,
 ) -> Result<dto::SessionSnapshotDto, dto::SessionFailureDto> {
-    let session = session(&state)?;
-    let model = std::sync::Arc::clone(&session.model);
-    let load_started = std::sync::Arc::clone(&session.load_started);
-    let request = session.request.clone();
-    let storage = session.storage.clone();
+    // Taken out whole, so nothing holds the window's lock across the load, and
+    // a Session replaced part way through still reports its own result.
+    let (model, load_started, request, storage) = {
+        let window = lock(&state.window);
+        let session = window
+            .session
+            .as_ref()
+            .ok_or_else(|| dto::command_failure("no session is open"))?;
+        (
+            Arc::clone(&session.model),
+            Arc::clone(&session.load_started),
+            session.request.clone(),
+            session.storage.clone(),
+        )
+    };
+    let loading = Arc::clone(&model);
     tauri::async_runtime::spawn_blocking(move || {
-        load_if_pending(&model, &load_started, &request, &storage, &|stage| {
+        load_if_pending(&loading, &load_started, &request, &storage, &|stage| {
             let _ = on_stage.send(stage.to_owned());
         });
     })
     .await
     .expect("the load task should not panic");
 
-    let guard = lock(&session.model);
+    let guard = lock(&model);
     match guard.phase() {
         SessionPhase::Ready(review) => Ok(dto::project_snapshot(review.session())),
         SessionPhase::Failed(failure) => Err(failure.into()),
@@ -477,12 +512,12 @@ pub async fn refresh_home(
     state: tauri::State<'_, AppRoot>,
     on_progress: Channel<dto::HomeSnapshotDto>,
 ) -> Result<dto::HomeSnapshotDto, dto::SessionFailureDto> {
-    let home = state.home.clone();
+    let root = state.inner().clone();
     off_the_ui_thread(move || {
-        on_settings_file(&home, |home, settings_path| {
+        on_settings_file(&root, |root, settings_path| {
             let database_path = store::default_database_path()
                 .expect("HOME is set, since the settings path just resolved from it");
-            refresh_home_on_model(home, settings_path, &database_path, &|shown| {
+            refresh_home_on_model(root, settings_path, &database_path, &|shown| {
                 let _ = on_progress.send(shown);
             });
         })
@@ -498,7 +533,7 @@ pub fn move_home_cursor(
     state: tauri::State<'_, AppRoot>,
     move_to: dto::CursorMoveDto,
 ) -> dto::HomeSnapshotDto {
-    move_home_cursor_on_model(&state.home, move_to)
+    move_home_cursor_on_model(&state, move_to)
 }
 
 /// Adds the folders the reviewer picked, writing the file once and reading it
@@ -519,11 +554,11 @@ pub async fn add_repositories(
     state: tauri::State<'_, AppRoot>,
     folders: Vec<String>,
 ) -> Result<dto::HomeSnapshotDto, dto::SessionFailureDto> {
-    let home = state.home.clone();
+    let root = state.inner().clone();
     let folders = folders.into_iter().map(PathBuf::from).collect::<Vec<_>>();
     off_the_ui_thread(move || {
-        on_settings_file(&home, |home, path| {
-            add_repositories_on_model(home, path, &folders);
+        on_settings_file(&root, |root, path| {
+            add_repositories_on_model(&root.home, path, &folders);
         })
     })
     .await
@@ -544,11 +579,11 @@ pub async fn remove_repository(
     state: tauri::State<'_, AppRoot>,
     path: String,
 ) -> Result<dto::HomeSnapshotDto, dto::SessionFailureDto> {
-    let home = state.home.clone();
+    let root = state.inner().clone();
     let path = PathBuf::from(path);
     off_the_ui_thread(move || {
-        on_settings_file(&home, |home, settings_path| {
-            remove_repository_on_model(home, settings_path, &path);
+        on_settings_file(&root, |root, settings_path| {
+            remove_repository_on_model(&root.home, settings_path, &path);
         })
     })
     .await
@@ -560,40 +595,159 @@ pub async fn remove_repository(
 #[allow(clippy::needless_pass_by_value)]
 pub fn toggle_repositories_footer(state: tauri::State<'_, AppRoot>) -> dto::HomeSnapshotDto {
     lock(&state.home.model).toggle_footer();
-    dto::project_home(&lock(&state.home.model))
+    shown_home(&state)
 }
 
-/// Which screen the binary was launched into, asked once before anything is
-/// rendered.
+/// Which screen the window shows, and the Session it is holding.
 ///
-/// A Session carries its request's own description, which is all the loading
+/// Asked once before anything is rendered, and again after every navigation. A
+/// Session carries its request's own description, which is all the loading
 /// screen can say before the load reaches the pull request itself.
 #[tauri::command]
 #[specta::specta]
 #[allow(clippy::needless_pass_by_value)]
-pub fn describe_launch(state: tauri::State<'_, AppRoot>) -> dto::LaunchDto {
-    describe_launch_on_root(&state)
+pub fn describe_window(state: tauri::State<'_, AppRoot>) -> dto::WindowDto {
+    describe(&lock(&state.window))
 }
 
-fn describe_launch_on_root(root: &AppRoot) -> dto::LaunchDto {
-    match &root.session {
-        Some(session) => dto::LaunchDto::Session {
-            description: session.request.description(),
+/// What the window shows now, from a window already locked.
+fn describe(window: &Window) -> dto::WindowDto {
+    let session = window.session.as_ref().map(|session| dto::OpenSessionDto {
+        description: session.request.description(),
+        row_identity: window
+            .slot
+            .session()
+            .and_then(app::OpenSession::row_identity),
+    });
+    match window.slot.showing() {
+        Showing::Home => dto::WindowDto::Home { alive: session },
+        Showing::Session => dto::WindowDto::Session {
+            session: session.expect("a window showing a Session is holding one"),
         },
-        None => dto::LaunchDto::Home,
     }
 }
 
-/// The Session behind the commands that need one.
+/// Opens the pull request a Home row names, replacing whatever Session was
+/// alive.
 ///
-/// Absent on a Home launch, where the frontend never calls them, so a call that
-/// arrives anyway is answered rather than assumed away.
-fn session<'a>(
-    state: &'a tauri::State<'_, AppRoot>,
-) -> Result<&'a ManagedSession, dto::SessionFailureDto> {
-    state
+/// # Errors
+///
+/// Returns a failure when no configured clone resolves to `repository`, which
+/// leaves the Session that was alive exactly as it was.
+#[tauri::command]
+#[specta::specta]
+#[allow(clippy::needless_pass_by_value)]
+pub fn open_row(
+    state: tauri::State<'_, AppRoot>,
+    repository: String,
+    number: u32,
+) -> Result<dto::WindowDto, dto::SessionFailureDto> {
+    open_row_on_root(&state, &repository, u64::from(number))
+}
+
+fn open_row_on_root(
+    root: &AppRoot,
+    repository: &str,
+    number: u64,
+) -> Result<dto::WindowDto, dto::SessionFailureDto> {
+    // Looked up before the window is touched, so a row that cannot be opened
+    // costs the reviewer nothing of the Session they were reading.
+    let clone_root = configured_clone(&root.home, repository)?;
+    let mut window = lock(&root.window);
+    let pull_request = PullRequestId {
+        repository: repository.to_owned(),
+        number,
+    };
+    match window.open(pull_request, clone_root) {
+        Opened::Returned | Opened::Loading => Ok(describe(&window)),
+        Opened::Refused => Err(dto::command_failure(
+            "this window has no Home to open a row from",
+        )),
+    }
+}
+
+/// The clone to open a row's pull request out of.
+///
+/// The first in settings order whose remote names `repository`, because two
+/// checkouts of one repository reach the same pull request either way.
+fn configured_clone(
+    home: &ManagedHome,
+    repository: &str,
+) -> Result<PathBuf, dto::SessionFailureDto> {
+    lock(&home.model)
+        .repositories()
+        .iter()
+        .find_map(|entry| match &entry.outcome {
+            RepositoryOutcome::Valid { root, slug } => {
+                slug.eq_ignore_ascii_case(repository).then(|| root.clone())
+            }
+            RepositoryOutcome::Failed { .. } => None,
+        })
+        .ok_or_else(|| {
+            dto::command_failure(format!("Home has no configured clone of {repository}"))
+        })
+}
+
+/// Shows Home again, leaving the Session alive behind it.
+///
+/// # Errors
+///
+/// Returns a failure for a Session the command line opened, which has no Home
+/// behind it to go back to.
+#[tauri::command]
+#[specta::specta]
+#[allow(clippy::needless_pass_by_value)]
+pub fn return_to_home(
+    state: tauri::State<'_, AppRoot>,
+) -> Result<dto::WindowDto, dto::SessionFailureDto> {
+    return_to_home_on_root(&state)
+}
+
+fn return_to_home_on_root(root: &AppRoot) -> Result<dto::WindowDto, dto::SessionFailureDto> {
+    let mut window = lock(&root.window);
+    if !window.slot.back_to_home() {
+        return Err(dto::command_failure(
+            "this session has no Home to go back to",
+        ));
+    }
+    Ok(describe(&window))
+}
+
+/// Shows the Session alive behind Home again, exactly as it was left.
+///
+/// # Errors
+///
+/// Returns a failure when no Session is alive, which the header slot's own
+/// absence already keeps a reviewer from asking for.
+#[tauri::command]
+#[specta::specta]
+#[allow(clippy::needless_pass_by_value)]
+pub fn return_to_session(
+    state: tauri::State<'_, AppRoot>,
+) -> Result<dto::WindowDto, dto::SessionFailureDto> {
+    return_to_session_on_root(&state)
+}
+
+fn return_to_session_on_root(root: &AppRoot) -> Result<dto::WindowDto, dto::SessionFailureDto> {
+    let mut window = lock(&root.window);
+    if !window.slot.return_to_session() {
+        return Err(dto::command_failure("no session is open"));
+    }
+    Ok(describe(&window))
+}
+
+/// The model of the Session this window holds, for the commands that need one.
+///
+/// Absent before a row has been opened, where the frontend never calls them, so
+/// a call that arrives anyway is answered rather than assumed away. Handed out
+/// as its own handle so no command holds the window's lock while it works.
+fn session_model(
+    state: &tauri::State<'_, AppRoot>,
+) -> Result<Arc<Mutex<app::SessionModel>>, dto::SessionFailureDto> {
+    lock(&state.window)
         .session
         .as_ref()
+        .map(|session| Arc::clone(&session.model))
         .ok_or_else(|| dto::command_failure("no session is open"))
 }
 
@@ -609,7 +763,8 @@ pub async fn select_file(
     state: tauri::State<'_, AppRoot>,
     index: u32,
 ) -> Result<dto::FileDetailDto, dto::SessionFailureDto> {
-    select_file_on_model(&session(&state)?.model, index as usize)
+    let model = session_model(&state)?;
+    select_file_on_model(&model, index as usize)
 }
 
 /// Marks the selected file viewed, or unmarks it, and returns the fresh sidebar.
@@ -623,7 +778,8 @@ pub async fn select_file(
 pub fn toggle_viewed(
     state: tauri::State<'_, AppRoot>,
 ) -> Result<dto::SidebarDto, dto::SessionFailureDto> {
-    toggle_viewed_on_model(&session(&state)?.model)
+    let model = session_model(&state)?;
+    toggle_viewed_on_model(&model)
 }
 
 /// Edits the draft over rows `start..=end` of `file_index`. Persists the new
@@ -645,8 +801,9 @@ pub fn edit_draft(
     end: u32,
     body: String,
 ) -> Result<dto::DraftEditOutcomeDto, dto::SessionFailureDto> {
+    let model = session_model(&state)?;
     edit_draft_on_model(
-        &session(&state)?.model,
+        &model,
         file_index as usize,
         start as usize,
         end as usize,
@@ -667,7 +824,8 @@ pub fn discard_draft(
     file_index: u32,
     row: u32,
 ) -> Result<dto::DraftsDto, dto::SessionFailureDto> {
-    discard_draft_on_model(&session(&state)?.model, file_index as usize, row as usize)
+    let model = session_model(&state)?;
+    discard_draft_on_model(&model, file_index as usize, row as usize)
 }
 
 /// Moves a stale draft, named by the position it was written against, onto
@@ -688,8 +846,9 @@ pub fn reanchor_draft(
     line: u32,
     row: u32,
 ) -> Result<dto::DraftsDto, dto::SessionFailureDto> {
+    let model = session_model(&state)?;
     reanchor_draft_on_model(
-        &session(&state)?.model,
+        &model,
         file_index as usize,
         &path,
         side.into(),
@@ -809,6 +968,42 @@ mod tests {
 
         assert_eq!(*stages.lock().unwrap(), vec!["Starting".to_owned()]);
         assert!(matches!(lock(&model).phase(), SessionPhase::Ready(_)));
+    }
+
+    /// A Session dropped mid-load leaves its loader running, and the load that
+    /// replaces it reaches the same clone. Two `git fetch` runs in one clone
+    /// with nothing between them is what the guard exists to stop.
+    #[test]
+    fn two_session_loads_run_one_after_the_other() {
+        let running = std::sync::atomic::AtomicUsize::new(0);
+        let overlapped = AtomicBool::new(false);
+
+        thread::scope(|scope| {
+            for _ in 0..2 {
+                let running = &running;
+                let overlapped = &overlapped;
+                scope.spawn(move || {
+                    let model = Mutex::new(app::SessionModel::loading("test"));
+                    run_load(
+                        &model,
+                        &SessionRequest::Demo,
+                        &ReviewStorage::Disabled,
+                        &|_stage| {
+                            if running.fetch_add(1, Ordering::AcqRel) > 0 {
+                                overlapped.store(true, Ordering::Release);
+                            }
+                            thread::sleep(std::time::Duration::from_millis(25));
+                            running.fetch_sub(1, Ordering::AcqRel);
+                        },
+                    );
+                });
+            }
+        });
+
+        assert!(
+            !overlapped.load(Ordering::Acquire),
+            "two loads were in flight at once",
+        );
     }
 
     #[test]
@@ -944,34 +1139,389 @@ mod tests {
             base: "main".to_owned(),
             head: "feature".to_owned(),
         };
-        let root = AppRoot {
-            home: ManagedHome::new(github::GithubClient::default()),
-            session: Some(ManagedSession {
-                model: Arc::new(Mutex::new(app::SessionModel::loading(
-                    request.description(),
-                ))),
-                request: request.clone(),
-                storage: ReviewStorage::Disabled,
-                load_started: Arc::new(AtomicBool::new(false)),
-            }),
-        };
+        let root = command_line_root(request.clone());
 
         assert_eq!(
-            describe_launch_on_root(&root),
-            dto::LaunchDto::Session {
-                description: request.description(),
+            describe(&lock(&root.window)),
+            dto::WindowDto::Session {
+                session: dto::OpenSessionDto {
+                    description: request.description(),
+                    row_identity: None,
+                },
             },
         );
     }
 
     #[test]
     fn a_launch_with_no_session_is_described_as_home() {
-        let root = AppRoot {
-            home: ManagedHome::new(github::GithubClient::default()),
-            session: None,
-        };
+        let root = home_root(ManagedHome::new(github::GithubClient::default()));
 
-        assert_eq!(describe_launch_on_root(&root), dto::LaunchDto::Home);
+        assert_eq!(
+            describe(&lock(&root.window)),
+            dto::WindowDto::Home { alive: None },
+        );
+    }
+
+    /// A window opened on Home, listing whatever `home` was configured with.
+    fn home_root(home: ManagedHome) -> AppRoot {
+        AppRoot {
+            home,
+            window: Arc::new(Mutex::new(Window::home())),
+        }
+    }
+
+    /// A window the command line opened straight into `request`'s Session.
+    fn command_line_root(request: SessionRequest) -> AppRoot {
+        AppRoot {
+            home: ManagedHome::new(github::GithubClient::default()),
+            window: Arc::new(Mutex::new(Window::command_line(
+                request,
+                ReviewStorage::Disabled,
+            ))),
+        }
+    }
+
+    /// A window on Home with `clone` configured, ready to open a row from it.
+    ///
+    /// Configured through Add rather than a refresh, because opening a row asks
+    /// nothing of GitHub. The load itself is deferred until `open_session`.
+    fn home_root_listing(clone: &TempDir, settings_path: &Path) -> AppRoot {
+        let home = home_model();
+        add_repositories_on_model(&home, settings_path, &[clone.path().to_path_buf()]);
+        home_root(home)
+    }
+
+    /// Writes `stage` on the Session the window holds.
+    ///
+    /// A Session kept alive keeps whatever it had reached; one loaded in its
+    /// place starts over, which is how a test tells the two apart without
+    /// running a load.
+    fn mark_session(root: &AppRoot, stage: &str) {
+        let window = lock(&root.window);
+        let session = window.session.as_ref().expect("a session is open");
+        assert!(
+            lock(&session.model).set_stage(stage),
+            "the mark should take"
+        );
+    }
+
+    /// How far the Session the window holds has got.
+    fn session_stage(root: &AppRoot) -> String {
+        let window = lock(&root.window);
+        let session = window.session.as_ref().expect("a session is open");
+        let guard = lock(&session.model);
+        match guard.phase() {
+            SessionPhase::Loading { stage, .. } => stage.clone(),
+            SessionPhase::Ready(_) | SessionPhase::Failed(_) => {
+                panic!("a row's load is deferred until open_session")
+            }
+        }
+    }
+
+    /// What the window is holding, as the request it was opened with.
+    fn open_request(root: &AppRoot) -> SessionRequest {
+        lock(&root.window)
+            .session
+            .as_ref()
+            .expect("a session is open")
+            .request
+            .clone()
+    }
+
+    #[test]
+    fn opening_a_row_opens_its_pull_request_out_of_the_clone_it_is_configured_in() {
+        let clone = clone_of("acme/widgets");
+        let directory = TempDir::new().unwrap();
+        let settings_path = directory.path().join("settings.toml");
+        let root = home_root_listing(&clone, &settings_path);
+
+        let shown = open_row_on_root(&root, "acme/widgets", 412).expect("the clone is configured");
+
+        assert_eq!(
+            shown,
+            dto::WindowDto::Session {
+                session: dto::OpenSessionDto {
+                    description: "pull request #412".to_owned(),
+                    row_identity: Some("acme/widgets#412".to_owned()),
+                },
+            },
+        );
+        assert_eq!(
+            open_request(&root),
+            SessionRequest::PullRequest {
+                repository: clone.path().canonicalize().unwrap(),
+                selector: github::PullRequestSelector::Number(412),
+            },
+        );
+        assert_eq!(
+            lock(&root.window)
+                .session
+                .as_ref()
+                .expect("a session is open")
+                .storage,
+            ReviewStorage::Default,
+            "a row's drafts are kept, so it opens on the default storage",
+        );
+    }
+
+    /// The whole point of keeping one Session alive. Coming back to it costs no
+    /// load at all.
+    #[test]
+    fn opening_the_row_already_alive_shows_the_same_session_again() {
+        let clone = clone_of("acme/widgets");
+        let directory = TempDir::new().unwrap();
+        let settings_path = directory.path().join("settings.toml");
+        let root = home_root_listing(&clone, &settings_path);
+        open_row_on_root(&root, "acme/widgets", 412).expect("the clone is configured");
+        mark_session(&root, "half way through");
+        return_to_home_on_root(&root).expect("there is a Home behind it");
+
+        open_row_on_root(&root, "acme/widgets", 412).expect("the clone is configured");
+
+        assert_eq!(session_stage(&root), "half way through");
+    }
+
+    #[test]
+    fn opening_another_row_replaces_the_session_that_was_alive() {
+        let clone = clone_of("acme/widgets");
+        let directory = TempDir::new().unwrap();
+        let settings_path = directory.path().join("settings.toml");
+        let root = home_root_listing(&clone, &settings_path);
+        open_row_on_root(&root, "acme/widgets", 412).expect("the clone is configured");
+        mark_session(&root, "half way through");
+
+        open_row_on_root(&root, "acme/widgets", 398).expect("the clone is configured");
+
+        assert_eq!(
+            session_stage(&root),
+            "Starting",
+            "the Session that was alive was dropped, not carried over",
+        );
+        assert_eq!(
+            open_request(&root),
+            SessionRequest::PullRequest {
+                repository: clone.path().canonicalize().unwrap(),
+                selector: github::PullRequestSelector::Number(398),
+            },
+        );
+    }
+
+    #[test]
+    fn going_back_shows_home_and_reports_the_session_still_alive_behind_it() {
+        let clone = clone_of("acme/widgets");
+        let directory = TempDir::new().unwrap();
+        let settings_path = directory.path().join("settings.toml");
+        let root = home_root_listing(&clone, &settings_path);
+        open_row_on_root(&root, "acme/widgets", 412).expect("the clone is configured");
+        mark_session(&root, "half way through");
+
+        let shown = return_to_home_on_root(&root).expect("there is a Home behind it");
+
+        assert_eq!(
+            shown,
+            dto::WindowDto::Home {
+                alive: Some(dto::OpenSessionDto {
+                    description: "pull request #412".to_owned(),
+                    row_identity: Some("acme/widgets#412".to_owned()),
+                }),
+            },
+        );
+        assert_eq!(
+            session_stage(&root),
+            "half way through",
+            "back is not a close",
+        );
+        assert_eq!(describe(&lock(&root.window)), shown);
+    }
+
+    /// The header slot is the way back to a Session whose pull request has no
+    /// row in the list at all.
+    #[test]
+    fn the_header_slot_shows_the_session_alive_behind_home_again() {
+        let clone = clone_of("acme/widgets");
+        let directory = TempDir::new().unwrap();
+        let settings_path = directory.path().join("settings.toml");
+        let root = home_root_listing(&clone, &settings_path);
+        let opened = open_row_on_root(&root, "acme/widgets", 412).expect("the clone is configured");
+        return_to_home_on_root(&root).expect("there is a Home behind it");
+
+        let shown = return_to_session_on_root(&root).expect("a session is alive");
+
+        assert_eq!(shown, opened);
+    }
+
+    #[test]
+    fn returning_to_a_session_before_any_row_was_opened_says_there_is_none() {
+        let root = home_root(home_model());
+
+        let refused = return_to_session_on_root(&root).expect_err("no session is alive");
+
+        assert_eq!(refused.summary, "no session is open");
+    }
+
+    /// Only Home lists a row, and a window the command line opened never shows
+    /// one, so a row arriving here is answered rather than acted on.
+    #[test]
+    fn a_window_the_command_line_opened_refuses_to_open_a_row() {
+        let clone = clone_of("acme/widgets");
+        let directory = TempDir::new().unwrap();
+        let settings_path = directory.path().join("settings.toml");
+        let root = command_line_root(SessionRequest::Demo);
+        add_repositories_on_model(&root.home, &settings_path, &[clone.path().to_path_buf()]);
+
+        let refused =
+            open_row_on_root(&root, "acme/widgets", 412).expect_err("there is no Home here");
+
+        assert_eq!(
+            refused.summary,
+            "this window has no Home to open a row from"
+        );
+        assert_eq!(
+            describe(&lock(&root.window)),
+            dto::WindowDto::Session {
+                session: dto::OpenSessionDto {
+                    description: SessionRequest::Demo.description(),
+                    row_identity: None,
+                },
+            },
+            "the Session it was opened with is still the one it holds",
+        );
+    }
+
+    /// Two checkouts of one repository reach the same pull request, so the row
+    /// opens out of whichever the reviewer configured first.
+    #[test]
+    fn a_row_opens_out_of_the_first_clone_of_its_repository_in_settings_order() {
+        let first = clone_of("acme/widgets");
+        let second = clone_of("acme/widgets");
+        let directory = TempDir::new().unwrap();
+        let settings_path = directory.path().join("settings.toml");
+        let home = home_model();
+        add_repositories_on_model(
+            &home,
+            &settings_path,
+            &[first.path().to_path_buf(), second.path().to_path_buf()],
+        );
+        let root = home_root(home);
+
+        open_row_on_root(&root, "acme/widgets", 412).expect("both clones are configured");
+
+        assert_eq!(
+            open_request(&root),
+            SessionRequest::PullRequest {
+                repository: first.path().canonicalize().unwrap(),
+                selector: github::PullRequestSelector::Number(412),
+            },
+        );
+    }
+
+    /// GitHub compares two repository names without regard to case, so a row
+    /// that came back cased differently still finds its clone.
+    #[test]
+    fn a_row_cased_differently_from_its_clone_still_opens() {
+        let clone = clone_of("ACME/Widgets");
+        let directory = TempDir::new().unwrap();
+        let settings_path = directory.path().join("settings.toml");
+        let root = home_root_listing(&clone, &settings_path);
+
+        open_row_on_root(&root, "acme/widgets", 412).expect("the clone is configured");
+
+        assert_eq!(
+            open_request(&root),
+            SessionRequest::PullRequest {
+                repository: clone.path().canonicalize().unwrap(),
+                selector: github::PullRequestSelector::Number(412),
+            },
+        );
+    }
+
+    /// The mark is the only thing on a row that says which Session is alive, so
+    /// it is decided where two repository names are compared properly.
+    #[test]
+    fn the_row_of_the_alive_session_comes_back_marked_however_it_is_cased() {
+        let gh = FakeGh::new();
+        gh.answer_graphql(&recorded_search("acme/widgets"));
+        let clone = clone_of("acme/widgets");
+        let directory = TempDir::new().unwrap();
+        let settings_path = settings_listing(&directory, &[&clone]);
+        let root = home_root(home_with(&gh));
+        refresh_home_on_model(
+            &root,
+            &settings_path,
+            &no_drafts_database(),
+            &|_progress| {},
+        );
+        assert!(
+            shown_home(&root).groups[0]
+                .rows
+                .iter()
+                .all(|row| !row.is_alive),
+            "nothing is alive before a row is opened",
+        );
+
+        open_row_on_root(&root, "ACME/Widgets", 412).expect("the clone is configured");
+        return_to_home_on_root(&root).expect("there is a Home behind it");
+
+        let marked = shown_home(&root).groups[0]
+            .rows
+            .iter()
+            .filter(|row| row.is_alive)
+            .map(|row| row.identity.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(marked, ["acme/widgets#412"]);
+    }
+
+    #[test]
+    fn a_session_the_command_line_opened_has_no_home_to_go_back_to() {
+        let root = command_line_root(SessionRequest::Demo);
+
+        let refused = return_to_home_on_root(&root).expect_err("there is no Home behind it");
+
+        assert_eq!(refused.summary, "this session has no Home to go back to");
+    }
+
+    /// The row's repository can be dropped from the settings file between the
+    /// refresh that listed it and the Enter that opens it.
+    #[test]
+    fn opening_a_row_of_a_repository_no_longer_configured_says_which_one() {
+        let root = home_root(home_model());
+
+        let refused =
+            open_row_on_root(&root, "acme/widgets", 412).expect_err("nothing is configured");
+
+        assert_eq!(
+            refused.summary,
+            "Home has no configured clone of acme/widgets"
+        );
+        assert!(
+            lock(&root.window).session.is_none(),
+            "a row that could not be opened drops nothing",
+        );
+    }
+
+    /// A refusal must not cost the reviewer the Session they were reading.
+    #[test]
+    fn a_row_that_could_not_be_opened_leaves_the_session_alive() {
+        let clone = clone_of("acme/widgets");
+        let directory = TempDir::new().unwrap();
+        let settings_path = directory.path().join("settings.toml");
+        let root = home_root_listing(&clone, &settings_path);
+        open_row_on_root(&root, "acme/widgets", 412).expect("the clone is configured");
+        mark_session(&root, "half way through");
+        return_to_home_on_root(&root).expect("there is a Home behind it");
+
+        open_row_on_root(&root, "acme/billing", 7).expect_err("that clone is not configured");
+
+        assert_eq!(session_stage(&root), "half way through");
+        assert_eq!(
+            describe(&lock(&root.window)),
+            dto::WindowDto::Home {
+                alive: Some(dto::OpenSessionDto {
+                    description: "pull request #412".to_owned(),
+                    row_identity: Some("acme/widgets#412".to_owned()),
+                }),
+            },
+        );
     }
 
     /// A clone whose `origin` points at GitHub, which is what Home configures.
@@ -996,8 +1546,11 @@ mod tests {
     }
 
     /// What Home shows once an action has finished.
+    ///
+    /// Wrapped in a window of its own, because these tests exercise the list
+    /// rather than the Session that can be alive behind it.
     fn snapshot(home: &ManagedHome) -> dto::HomeSnapshotDto {
-        dto::project_home(&lock(&home.model))
+        shown_home(&home_root(home.clone()))
     }
 
     /// The repository paths the settings file now holds.
@@ -1013,7 +1566,12 @@ mod tests {
 
     /// A refresh with nothing listening to its progress.
     fn refresh(home: &ManagedHome, settings_path: &Path) {
-        refresh_home_on_model(home, settings_path, &no_drafts_database(), &|_progress| {});
+        refresh_home_on_model(
+            &home_root(home.clone()),
+            settings_path,
+            &no_drafts_database(),
+            &|_progress| {},
+        );
     }
 
     /// A settings file listing `clones`.
@@ -1094,9 +1652,14 @@ mod tests {
     /// Everything a refresh reported, in the order it said it.
     fn reported_by(home: &ManagedHome, settings_path: &Path) -> Vec<dto::HomeSnapshotDto> {
         let reported = Mutex::new(Vec::new());
-        refresh_home_on_model(home, settings_path, &no_drafts_database(), &|shown| {
-            reported.lock().unwrap().push(shown);
-        });
+        refresh_home_on_model(
+            &home_root(home.clone()),
+            settings_path,
+            &no_drafts_database(),
+            &|shown| {
+                reported.lock().unwrap().push(shown);
+            },
+        );
         reported.into_inner().unwrap()
     }
 
@@ -1168,8 +1731,8 @@ mod tests {
         let settled = snapshot(&home);
 
         let held = lock(&home.settings_action);
-        let ignored = on_settings_file(&home, |home, settings_path| {
-            refresh(home, settings_path);
+        let ignored = on_settings_file(&home_root(home.clone()), |root, settings_path| {
+            refresh(&root.home, settings_path);
         });
         drop(held);
 
@@ -1195,12 +1758,17 @@ mod tests {
         let reports = std::sync::atomic::AtomicUsize::new(0);
 
         let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            refresh_home_on_model(&home, &settings_path, &no_drafts_database(), &|_shown| {
-                assert!(
-                    reports.fetch_add(1, Ordering::AcqRel) < 2,
-                    "the refresh gave up here"
-                );
-            });
+            refresh_home_on_model(
+                &home_root(home.clone()),
+                &settings_path,
+                &no_drafts_database(),
+                &|_shown| {
+                    assert!(
+                        reports.fetch_add(1, Ordering::AcqRel) < 2,
+                        "the refresh gave up here"
+                    );
+                },
+            );
         }));
 
         assert!(panicked.is_err(), "the refresh was stopped by a panic");
@@ -1222,9 +1790,12 @@ mod tests {
         let settings_path = settings_listing(&directory, &[&clone]);
         let home = home_with(&gh);
         let _panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            refresh_home_on_model(&home, &settings_path, &no_drafts_database(), &|_shown| {
-                panic!("gave up")
-            });
+            refresh_home_on_model(
+                &home_root(home.clone()),
+                &settings_path,
+                &no_drafts_database(),
+                &|_shown| panic!("gave up"),
+            );
         }));
 
         refresh(&home, &settings_path);
@@ -1321,11 +1892,11 @@ mod tests {
         assert_eq!(snapshot(&home).cursor, 0);
 
         assert_eq!(
-            move_home_cursor_on_model(&home, dto::CursorMoveDto::Down).cursor,
+            move_home_cursor_on_model(&home_root(home.clone()), dto::CursorMoveDto::Down).cursor,
             1,
         );
         assert_eq!(
-            move_home_cursor_on_model(&home, dto::CursorMoveDto::Up).cursor,
+            move_home_cursor_on_model(&home_root(home.clone()), dto::CursorMoveDto::Up).cursor,
             0
         );
     }

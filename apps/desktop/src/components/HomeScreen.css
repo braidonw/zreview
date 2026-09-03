@@ -36,6 +36,34 @@
   color: var(--text-tertiary);
 }
 
+.home__header-right {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+/* The Session alive behind Home, and the way back into it. */
+.home__slot {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 2px 6px;
+  border: 1px solid var(--accent-base);
+  border-radius: 4px;
+  background: none;
+  cursor: pointer;
+}
+
+.home__slot:hover {
+  background: var(--surface-hover);
+}
+
+.home__slot-identity {
+  font-family: var(--font-mono);
+  font-size: var(--size-label);
+  color: var(--accent-text);
+}
+
 .home__stamp {
   display: flex;
   align-items: center;
@@ -171,6 +199,7 @@
 
 /* One dense line per pull request, on the file row's scale. */
 .home__row {
+  position: relative;
   height: var(--file-row-height);
   padding: 0 12px;
   display: flex;
@@ -178,6 +207,7 @@
   gap: 12px;
   border-radius: 4px;
   background: var(--surface-base);
+  cursor: pointer;
 }
 
 .home__row:hover {
@@ -227,6 +257,22 @@
 /* Wide enough for "you reviewed this head", the longest label it carries. */
 .home__cell--review {
   width: 172px;
+}
+
+/* The alive Session's row, marked in the gap where its statuses begin.
+   Positioned against the row rather than the cell it sits in, so it is out of
+   every other row's way and no cell has to give up hiding its overflow. Its
+   horizontal place is the one it would have had in the cell, shifted back into
+   the gap; its vertical place is the middle of the row. */
+.home__alive-mark {
+  position: absolute;
+  margin-left: -9px;
+  top: 50%;
+  width: 6px;
+  height: 6px;
+  margin-top: -3px;
+  border-radius: 50%;
+  background: var(--accent-base);
 }
 
 .home__cell--checks {

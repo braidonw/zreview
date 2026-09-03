@@ -23,8 +23,21 @@ function stampText(refresh: RefreshStateDto, nowMs: number): string | null {
 }
 
 /** The screen ZReview opens on when no pull request has been named. */
-export function HomeScreen() {
-  const { snapshot, failure, toggleFooter, addRepositories, removeRepository } = useHome();
+export function HomeScreen({
+  isShowing,
+  aliveIdentity,
+  onOpenRow,
+  onReturnToSession,
+}: {
+  /** False while a Session is in front, which is when Home goes quiet. */
+  isShowing: boolean;
+  /** `owner/name#number` of the Session alive behind Home, if one is. */
+  aliveIdentity: string | null;
+  onOpenRow: (repository: string, number: number) => Promise<SessionFailureDto | null>;
+  onReturnToSession: () => Promise<SessionFailureDto | null>;
+}) {
+  const { snapshot, failure, openFailure, toggleFooter, addRepositories, removeRepository, openRow } =
+    useHome({ isShowing, onOpenRow, onReturnToSession });
   const nowMs = useNow();
 
   // A command that never answered leaves nothing worth trusting on screen.
@@ -40,12 +53,19 @@ export function HomeScreen() {
 
   return (
     <div className="home">
-      <Header countLine={snapshot.count_line} stamp={stamp} />
+      <Header
+        countLine={snapshot.count_line}
+        stamp={stamp}
+        aliveIdentity={aliveIdentity}
+        onReturnToSession={onReturnToSession}
+      />
       <HomeBody
         snapshot={snapshot}
+        openFailure={openFailure}
         nowMs={nowMs}
         onAdd={addRepositories}
         onRemove={removeRepository}
+        onOpenRow={openRow}
       />
       <footer className="home__footer">
         <div className="home__footer-line">
@@ -82,19 +102,38 @@ export function HomeScreen() {
   );
 }
 
-function Header({ countLine, stamp }: { countLine: string | null; stamp: string | null }) {
+function Header({
+  countLine,
+  stamp,
+  aliveIdentity,
+  onReturnToSession,
+}: {
+  countLine: string | null;
+  stamp: string | null;
+  aliveIdentity: string | null;
+  onReturnToSession: () => void;
+}) {
   return (
     <header className="home__header">
       <div className="home__heading">
         <h1 className="home__title">Home</h1>
         {countLine !== null && <span className="home__count">{countLine}</span>}
       </div>
-      {stamp !== null && (
-        <div className="home__stamp">
-          <span className="home__stamp-text">{stamp}</span>
-          <span className="home__keycap">r</span>
-        </div>
-      )}
+      <div className="home__header-right">
+        {/* The way back to a Session whose pull request has no row at all. */}
+        {aliveIdentity !== null && (
+          <button className="home__slot" type="button" onClick={onReturnToSession}>
+            <span className="home__slot-identity">{aliveIdentity}</span>
+            <span className="home__keycap">cmd-[</span>
+          </button>
+        )}
+        {stamp !== null && (
+          <div className="home__stamp">
+            <span className="home__stamp-text">{stamp}</span>
+            <span className="home__keycap">r</span>
+          </div>
+        )}
+      </div>
     </header>
   );
 }
@@ -102,19 +141,25 @@ function Header({ countLine, stamp }: { countLine: string | null; stamp: string 
 /** The list area, which the empty state and a whole-Home failure each replace. */
 function HomeBody({
   snapshot,
+  openFailure,
   nowMs,
   onAdd,
   onRemove,
+  onOpenRow,
 }: {
   snapshot: HomeSnapshotDto;
+  /** Why the last row would not open, until the next refresh asks again. */
+  openFailure: SessionFailureDto | null;
   nowMs: number;
   onAdd: () => void;
   onRemove: (path: string) => void;
+  onOpenRow: (row: HomeRowDto) => void;
 }) {
-  if (snapshot.failure !== null) {
+  const blocked = snapshot.failure ?? openFailure;
+  if (blocked !== null) {
     return (
       <div className="home__body">
-        <FailureScreen failure={snapshot.failure} />
+        <FailureScreen failure={blocked} />
       </div>
     );
   }
@@ -156,7 +201,14 @@ function HomeBody({
           {group.count > 0 && (
             <ul className="home__rows">
               {group.rows.map((row) => (
-                <Row key={row.identity} row={row} cursor={row.index === snapshot.cursor} nowMs={nowMs} />
+                <Row
+                  key={row.identity}
+                  row={row}
+                  cursor={row.index === snapshot.cursor}
+                  alive={row.is_alive}
+                  nowMs={nowMs}
+                  onOpen={onOpenRow}
+                />
               ))}
             </ul>
           )}
@@ -188,7 +240,19 @@ function FailureLine({ failure }: { failure: SessionFailureDto | null }) {
 }
 
 /** One pull request on one line, its columns aligned whether or not they speak. */
-function Row({ row, cursor, nowMs }: { row: HomeRowDto; cursor: boolean; nowMs: number }) {
+function Row({
+  row,
+  cursor,
+  alive,
+  nowMs,
+  onOpen,
+}: {
+  row: HomeRowDto;
+  cursor: boolean;
+  alive: boolean;
+  nowMs: number;
+  onOpen: (row: HomeRowDto) => void;
+}) {
   const line = useRef<HTMLLIElement>(null);
 
   useEffect(() => {
@@ -202,6 +266,7 @@ function Row({ row, cursor, nowMs }: { row: HomeRowDto; cursor: boolean; nowMs: 
       ref={line}
       className={`home__row${cursor ? " home__row--cursor" : ""}`}
       aria-selected={cursor}
+      onClick={() => onOpen(row)}
     >
       <span className="home__row-title">{row.title}</span>
       <span className="home__cell home__cell--drafts">
@@ -210,6 +275,7 @@ function Row({ row, cursor, nowMs }: { row: HomeRowDto; cursor: boolean; nowMs: 
         )}
       </span>
       <span className="home__cell home__cell--review">
+        {alive && <span className="home__alive-mark" aria-hidden="true" />}
         {row.review_status !== null && (
           <span className={`home__status home__status--${row.review_status.tone.toLowerCase()}`}>
             {row.review_status.label}

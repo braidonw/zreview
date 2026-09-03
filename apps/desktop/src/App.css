@@ -1,0 +1,7 @@
+/* Home and the Session share one window. Whichever is behind is hidden rather
+   than unmounted, so its state, its scroll, and any work still in flight for it
+   all survive being stepped away from. */
+.app__home,
+.app__session {
+  height: 100%;
+}

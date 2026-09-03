@@ -13,6 +13,7 @@ const STATUS_GLYPH: Record<FileStatusDto, { label: string; className: string }> 
 };
 
 export function FileSidebar({
+  onBack,
   title,
   subtitle,
   sidebar,
@@ -24,6 +25,8 @@ export function FileSidebar({
   onSelect,
   onReanchorDraft,
 }: {
+  /** Absent for a Session with no Home behind it, which offers no way back. */
+  onBack: (() => void) | null;
   title: string;
   subtitle: string;
   sidebar: SidebarDto;
@@ -43,7 +46,20 @@ export function FileSidebar({
   return (
     <div className="file-sidebar">
       <div className="file-sidebar__header">
-        <div className="file-sidebar__label">{title}</div>
+        <div className="file-sidebar__identity">
+          {onBack !== null && (
+            <button
+              type="button"
+              className="file-sidebar__back"
+              aria-label="Back to Home"
+              title="Back to Home (cmd-[)"
+              onClick={onBack}
+            >
+              &#8249;
+            </button>
+          )}
+          <div className="file-sidebar__label">{title}</div>
+        </div>
         <div className="file-sidebar__title">{subtitle}</div>
         <div className="file-sidebar__meta">
           {sidebar.files.length} files &middot; {sidebar.viewed_count} viewed &middot;{" "}

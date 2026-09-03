@@ -115,12 +115,15 @@ export function makeHomeRow(overrides: Partial<HomeRowDto> = {}): HomeRowDto {
     index: 0,
     title: "Retry webhook deliveries with jittered backoff",
     url: "https://github.com/acme/widgets/pull/412",
+    repository: "acme/widgets",
+    number: 412,
     identity: "acme/widgets#412",
     author: "mlee",
     updated_at_ms: 1_788_266_096_000,
     review_status: null,
     check_status: null,
     drafts_label: null,
+    is_alive: false,
     ...overrides,
   };
 }
