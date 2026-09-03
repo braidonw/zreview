@@ -315,14 +315,13 @@ pub enum SessionSource {
     },
 }
 
-/// The scope Drafts are stored under for a GitHub pull request, given its
-/// repository as `owner/name` and its number.
+/// The scope Drafts are stored under for a GitHub pull request.
 ///
 /// Shared by [`SessionSource::draft_scope`] and by Home's Drafts count, so a
 /// Session and Home's badge agree on what a scope is spelled as.
 #[must_use]
-pub fn github_draft_scope(repository: &str, number: u64) -> String {
-    format!("github:{repository}#{number}")
+pub fn github_draft_scope(owner: &str, name: &str, number: u64) -> String {
+    format!("github:{owner}/{name}#{number}")
 }
 
 impl SessionSource {
@@ -370,10 +369,7 @@ impl SessionSource {
                 repository,
                 number,
                 ..
-            } => Some(github_draft_scope(
-                &format!("{owner}/{repository}"),
-                *number,
-            )),
+            } => Some(github_draft_scope(owner, repository, *number)),
         }
     }
 }
@@ -1480,7 +1476,7 @@ mod tests {
     #[test]
     fn github_draft_scope_matches_a_pull_requests_own_draft_scope() {
         assert_eq!(
-            github_draft_scope("acme/widgets", 42),
+            github_draft_scope("acme", "widgets", 42),
             "github:acme/widgets#42",
         );
     }
