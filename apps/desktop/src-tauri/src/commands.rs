@@ -2991,6 +2991,34 @@ mod tests {
         assert_eq!(remediation, None, "cancelling was deliberate");
     }
 
+    /// Closing the window, or opening another row, drops the Session but not the
+    /// run. The run holds the only handle to the model by then and has to finish
+    /// into it rather than panic.
+    #[test]
+    fn a_run_whose_session_was_dropped_finishes_into_a_model_nobody_reads() {
+        let repository = guided_repository();
+        let model = Arc::new(local_model(
+            &local_request(&repository),
+            &ReviewStorage::Disabled,
+        ));
+        let running = Arc::clone(&model);
+
+        let run = thread::spawn(move || {
+            run_review_on_model(
+                &running,
+                |_session| Box::new(FakeBackend::finding_free(vec!["Reading the diff"])),
+                &|_panel| {},
+            )
+        });
+        drop(model);
+
+        let panel = run.join().expect("the run must not panic");
+        assert!(matches!(
+            panel.expect("the session can be reviewed").run,
+            dto::ReviewRunDto::Complete { .. }
+        ));
+    }
+
     #[test]
     fn a_backend_failure_shows_its_summary_and_remediation() {
         let repository = guided_repository();
