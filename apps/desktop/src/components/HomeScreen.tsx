@@ -121,7 +121,7 @@ function HomeBody({
   if (snapshot.repositories.length === 0) {
     return (
       <div className="home__body home__body--empty">
-        <WriteFailure failure={snapshot.write_failure} />
+        <FailureLine failure={snapshot.write_failure} />
         <h2 className="home__empty-heading">No repositories yet</h2>
         <p className="home__empty-copy">
           Add a local clone and Home lists the pull requests that want you.
@@ -134,7 +134,8 @@ function HomeBody({
   }
   return (
     <div className="home__body home__body--list">
-      <WriteFailure failure={snapshot.write_failure} />
+      <FailureLine failure={snapshot.write_failure} />
+      <FailureLine failure={snapshot.drafts_failure} />
       {snapshot.failed_repositories.map((repository) => (
         <div className="home__failed-repository" key={repository.path}>
           <span className="home__failed-detail">
@@ -165,17 +166,23 @@ function HomeBody({
   );
 }
 
-/** Why the last write did not reach the settings file, wherever the list is. */
-function WriteFailure({ failure }: { failure: SessionFailureDto | null }) {
+/**
+ * One failure as a line above the list: summary, then remediation, then
+ * detail, whichever of the two are present. Shared by the settings write
+ * failure and the Drafts read failure, which sit in the same place and read
+ * the same way.
+ */
+function FailureLine({ failure }: { failure: SessionFailureDto | null }) {
   if (failure === null) {
     return null;
   }
   return (
-    <div className="home__write-failure">
+    <div className="home__failure-line">
       <span>{failure.summary}</span>
       {failure.remediation !== null && (
-        <span className="home__write-remediation">{failure.remediation}</span>
+        <span className="home__failure-detail">{failure.remediation}</span>
       )}
+      {failure.detail !== null && <span className="home__failure-detail">{failure.detail}</span>}
     </div>
   );
 }
@@ -197,7 +204,11 @@ function Row({ row, cursor, nowMs }: { row: HomeRowDto; cursor: boolean; nowMs: 
       aria-selected={cursor}
     >
       <span className="home__row-title">{row.title}</span>
-      <span className="home__cell home__cell--drafts" />
+      <span className="home__cell home__cell--drafts">
+        {row.drafts_label !== null && (
+          <span className="home__drafts-badge">{row.drafts_label}</span>
+        )}
+      </span>
       <span className="home__cell home__cell--review">
         {row.review_status !== null && (
           <span className={`home__status home__status--${row.review_status.tone.toLowerCase()}`}>

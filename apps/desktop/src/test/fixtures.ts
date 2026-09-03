@@ -120,6 +120,7 @@ export function makeHomeRow(overrides: Partial<HomeRowDto> = {}): HomeRowDto {
     updated_at_ms: 1_788_266_096_000,
     review_status: null,
     check_status: null,
+    drafts_label: null,
     ...overrides,
   };
 }
@@ -151,6 +152,7 @@ export function makeHomeSnapshot(overrides: Partial<HomeSnapshotDto> = {}): Home
     refusals: [],
     failure: null,
     write_failure: null,
+    drafts_failure: null,
     ...overrides,
   };
 }

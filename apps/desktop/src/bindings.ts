@@ -220,6 +220,8 @@ export type HomeRowDto = {
 	updated_at_ms: number,
 	review_status: RowStatusDto | null,
 	check_status: RowStatusDto | null,
+	/**  "1 draft" or "N drafts", absent for a blank cell. */
+	drafts_label: string | null,
 };
 
 /**  Everything Home renders, from its header to its footer. */
@@ -247,6 +249,11 @@ export type HomeSnapshotDto = {
 	 *  list, which stays because reading it still worked.
 	 */
 	write_failure: SessionFailureDto | null,
+	/**
+	 *  Why the last Drafts read failed, shown as a line above the list beside
+	 *  the failed repositories, with every row's Drafts column left blank.
+	 */
+	drafts_failure: SessionFailureDto | null,
 };
 
 /**  Which screen the binary was launched into. */

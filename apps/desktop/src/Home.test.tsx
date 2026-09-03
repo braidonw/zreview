@@ -422,6 +422,95 @@ describe("Home", () => {
     expect(scrollIntoView).toHaveBeenCalledWith(expect.objectContaining({ block: "nearest" }));
   });
 
+  it("shows the Drafts badge on a row that has one, and a blank cell on a row with none", async () => {
+    refreshHome.mockResolvedValue(
+      ok({
+        ...listed(),
+        groups: makeHomeGroups([
+          [
+            makeHomeRow({ index: 0, identity: "acme/widgets#412", drafts_label: "3 drafts" }),
+            makeHomeRow({ index: 1, identity: "acme/widgets#398", drafts_label: null }),
+          ],
+          [],
+          [],
+        ]),
+      }),
+    );
+
+    render(<App />);
+
+    await waitFor(() => expect(screen.getByText("3 drafts")).toBeTruthy());
+    const rows = screen.getAllByRole("listitem");
+    expect(rows[0].querySelector(".home__cell--drafts")?.textContent).toBe("3 drafts");
+    expect(rows[1].querySelector(".home__cell--drafts")?.textContent).toBe("");
+  });
+
+  it("blanks the Drafts column and shows the reason when a later refresh cannot read the store", async () => {
+    const user = userEvent.setup();
+    const withDrafts = {
+      ...listed(),
+      groups: makeHomeGroups([
+        [
+          makeHomeRow({ index: 0, identity: "acme/widgets#412", drafts_label: "3 drafts" }),
+          makeHomeRow({ index: 1, identity: "acme/widgets#398", drafts_label: "1 draft" }),
+        ],
+        [
+          makeHomeRow({
+            index: 2,
+            identity: "braidonw/zreview#77",
+            title: "Bound the retry ceiling",
+            author: "braidonw",
+          }),
+        ],
+        [],
+      ]),
+    };
+    refreshHome.mockResolvedValue(ok(withDrafts));
+
+    render(<App />);
+    await waitFor(() => expect(screen.getByText("3 drafts")).toBeTruthy());
+    expect(screen.getByText("1 draft")).toBeTruthy();
+
+    refreshHome.mockResolvedValue(
+      ok({
+        ...withDrafts,
+        groups: makeHomeGroups([
+          [
+            makeHomeRow({ index: 0, identity: "acme/widgets#412" }),
+            makeHomeRow({ index: 1, identity: "acme/widgets#398" }),
+          ],
+          [
+            makeHomeRow({
+              index: 2,
+              identity: "braidonw/zreview#77",
+              title: "Bound the retry ceiling",
+              author: "braidonw",
+            }),
+          ],
+          [],
+        ]),
+        drafts_failure: {
+          summary: "Drafts could not be read",
+          detail: "the review database's schema version 99 is not one this build knows",
+          remediation: null,
+        },
+      }),
+    );
+
+    await user.keyboard("r");
+
+    await waitFor(() => expect(screen.getByText(/Drafts could not be read/)).toBeTruthy());
+    expect(
+      screen.getByText(/schema version 99 is not one this build knows/),
+    ).toBeTruthy();
+    expect(screen.queryByText("3 drafts")).toBeNull();
+    expect(screen.queryByText("1 draft")).toBeNull();
+    const rows = screen.getAllByRole("listitem");
+    expect(rows.every((row) => row.querySelector(".home__cell--drafts")?.textContent === "")).toBe(
+      true,
+    );
+  });
+
   it("shows a failed repository above the list with a Remove beside it", async () => {
     refreshHome.mockResolvedValue(
       ok({

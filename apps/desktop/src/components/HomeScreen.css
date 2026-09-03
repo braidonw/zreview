@@ -93,7 +93,7 @@
   color: var(--text-secondary);
 }
 
-.home__write-failure {
+.home__failure-line {
   min-height: var(--file-row-height);
   display: flex;
   align-items: center;
@@ -103,7 +103,7 @@
   color: var(--severity-error-text);
 }
 
-.home__write-remediation {
+.home__failure-detail {
   font-size: var(--size-meta);
   color: var(--text-secondary);
 }
@@ -210,8 +210,18 @@
   color: var(--text-tertiary);
 }
 
+/* Wide enough for "12 drafts", the longest label the badge carries. */
 .home__cell--drafts {
-  width: 60px;
+  width: 80px;
+}
+
+.home__drafts-badge {
+  padding: 0 6px;
+  border-radius: 4px;
+  background: var(--accent-dim);
+  color: var(--accent-text);
+  font-family: var(--font-mono);
+  font-size: var(--size-label);
 }
 
 /* Wide enough for "you reviewed this head", the longest label it carries. */

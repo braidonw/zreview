@@ -7,6 +7,7 @@ use github::GithubClient;
 use session::{ReviewStorage, SessionRequest};
 
 mod commands;
+mod drafts;
 mod dto;
 #[cfg(test)]
 mod fake_gh;

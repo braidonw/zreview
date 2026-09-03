@@ -1733,6 +1733,7 @@ dependencies = [
  "settings",
  "specta",
  "specta-typescript",
+ "store",
  "tauri",
  "tauri-build",
  "tauri-plugin-clipboard-manager",
