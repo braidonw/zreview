@@ -11,9 +11,7 @@ use std::{
 use app::{
     Opened, PullRequestId, RepositoryOutcome, SessionPhase, SettingsWrite, Showing, lock, try_lock,
 };
-use domain::{
-    DiffSide, ReviewBackend, ReviewEventSink, ReviewProgress, ReviewSession, SessionSource,
-};
+use domain::{DiffSide, ReviewBackend, ReviewError, ReviewEventSink, ReviewProgress};
 use review::{Agent, CodingAgent};
 use session::{ReviewStorage, SessionRequest};
 use tauri::ipc::Channel;
@@ -499,7 +497,7 @@ impl ReviewEventSink for RunEvents<'_> {
 /// can be tested without a coding agent or a Tauri channel.
 fn run_review_on_model(
     model: &Mutex<app::SessionModel>,
-    make_backend: impl FnOnce(&ReviewSession) -> Box<dyn ReviewBackend>,
+    make_backend: impl FnOnce(&Path) -> Box<dyn ReviewBackend>,
     report: &(dyn Fn(dto::ReviewPanelDto) + Sync),
 ) -> Option<dto::ReviewPanelDto> {
     let mut guard = lock(model);
@@ -515,7 +513,18 @@ fn run_review_on_model(
     // rather than after the first line the backend happens to send.
     report(started);
 
-    let backend = make_backend(&session);
+    let Some(root) = session::repository_root(session.source()) else {
+        // No repository means no anchors to validate findings against, which
+        // `run_review` refuses anyway. Refusing here keeps the backend from being
+        // handed a working directory nobody chose.
+        let mut guard = lock(model);
+        guard.review_failed(
+            ReviewError::NothingToReview.to_string(),
+            ReviewError::NothingToReview.remediation(),
+        );
+        return panel_of(&guard);
+    };
+    let backend = make_backend(root);
     let events = RunEvents {
         model,
         cancel,
@@ -534,29 +543,12 @@ fn run_review_on_model(
     panel_of(&guard)
 }
 
-/// The backend a run uses: the Claude coding agent, at the repository the session
-/// was opened from, which is what the GPUI binary runs.
-fn coding_agent(session: &ReviewSession) -> Box<dyn ReviewBackend> {
-    Box::new(CodingAgent::new(
-        Agent::ClaudeCode,
-        repository_root(session),
-    ))
-}
-
-/// Where the backend runs, so relative paths in the diff resolve.
+/// The backend a run uses, which is the Claude coding agent the GPUI binary runs.
 ///
-/// A session with no repository never reaches one: `run_review` refuses it,
-/// because there would be no anchors to validate findings against.
-fn repository_root(session: &ReviewSession) -> PathBuf {
-    match session.source() {
-        SessionSource::LocalComparison {
-            repository_root, ..
-        }
-        | SessionSource::GitHubPullRequest {
-            repository_root, ..
-        } => repository_root.clone(),
-        SessionSource::Demo => PathBuf::from("."),
-    }
+/// `root` is the clone the session was opened out of, so relative paths in the
+/// diff resolve. Nothing here may invent one.
+fn coding_agent(root: &Path) -> Box<dyn ReviewBackend> {
+    Box::new(CodingAgent::new(Agent::ClaudeCode, root))
 }
 
 /// Asks the running review to stop. It ends at the backend's next step.
@@ -2703,6 +2695,30 @@ mod tests {
         );
     }
 
+    /// Every panel-returning command answers with the whole panel, and they run
+    /// at once. The revision is how the frontend tells which answer is older.
+    #[test]
+    fn a_panel_carries_a_revision_that_only_ever_grows() {
+        let repository = guided_repository();
+        let model = local_model(&local_request(&repository), &ReviewStorage::Disabled);
+        let opened = panel_of(&lock(&model)).expect("the session can be reviewed");
+
+        let toggled = toggle_guidance_on_model(&model, "AGENTS.md")
+            .expect("AGENTS.md was discovered")
+            .expect("the session can be reviewed");
+        assert!(toggled.revision > opened.revision);
+
+        let (finished, reported) = run_with(&model, &FakeBackend::finding_free(vec!["Reading"]));
+        let panel = finished.expect("the session can be reviewed");
+        assert!(panel.revision > toggled.revision);
+        // Every report on the way there is older than the outcome it ends with.
+        assert!(
+            reported
+                .iter()
+                .all(|report| report.revision < panel.revision)
+        );
+    }
+
     /// "None found" must not look like "never looked".
     #[test]
     fn a_repository_that_states_no_conventions_says_so_rather_than_showing_nothing() {
@@ -2717,6 +2733,33 @@ mod tests {
         assert_eq!(
             note,
             "No guidance files found. The review will judge the diff alone."
+        );
+    }
+
+    /// The fixture has no repository, so a run the keyboard starts on it has
+    /// nowhere to launch a backend. It has to say so rather than run one in
+    /// whatever directory the app happens to have been started from.
+    #[test]
+    fn a_run_on_a_session_with_no_repository_refuses_before_it_reaches_a_backend() {
+        let model = loaded_model();
+
+        let panel = run_review_on_model(
+            &model,
+            |_root| panic!("a session with no repository must not reach a backend"),
+            &|_panel| {},
+        );
+
+        let dto::ReviewRunDto::Failed {
+            summary,
+            remediation,
+        } = panel.expect("a started run puts a panel on screen").run
+        else {
+            panic!("the run should have been refused");
+        };
+        assert_eq!(summary, "there is nothing to review");
+        assert_eq!(
+            remediation.as_deref(),
+            Some("Nothing in this snapshot is reviewable after exclusions.")
         );
     }
 
@@ -2803,7 +2846,7 @@ mod tests {
         backend: &FakeBackend,
     ) -> (Option<dto::ReviewPanelDto>, Vec<dto::ReviewPanelDto>) {
         let reported = Mutex::new(Vec::new());
-        let finished = run_review_on_model(model, |_session| Box::new(backend.clone()), &|panel| {
+        let finished = run_review_on_model(model, |_root| Box::new(backend.clone()), &|panel| {
             reported.lock().unwrap().push(panel);
         });
         (finished, reported.into_inner().unwrap())
@@ -2842,7 +2885,6 @@ mod tests {
             accepted,
             rejected,
             suppressed,
-            unreviewed,
         } = panel.run
         else {
             panic!("the run should have completed");
@@ -2850,7 +2892,6 @@ mod tests {
         assert_eq!(accepted, 0);
         assert_eq!(rejected, 0);
         assert_eq!(suppressed, 0);
-        assert_eq!(unreviewed, vec!["vendor/lib.rs".to_owned()]);
 
         let note = panel.note.expect("a run that found nothing says so");
         assert_eq!(note.heading, "Nothing to act on.");
@@ -2863,6 +2904,7 @@ mod tests {
             footer.not_reviewed.as_deref(),
             Some("1 file(s) not reviewed")
         );
+        assert_eq!(footer.unreviewed, vec!["vendor/lib.rs".to_owned()]);
         assert_eq!(footer.refused, None);
     }
 
@@ -2934,14 +2976,14 @@ mod tests {
 
         let finished = run_review_on_model(
             &model,
-            |_session| Box::new(FakeBackend::finding_free(vec!["Reading the diff"])),
+            |_root| Box::new(FakeBackend::finding_free(vec!["Reading the diff"])),
             &|panel| {
                 if progress_line(&panel) != Some("Reading the diff") {
                     return;
                 }
                 *second.lock().unwrap() = Some(run_review_on_model(
                     &model,
-                    |_session| panic!("a second run must not start a backend"),
+                    |_root| panic!("a second run must not start a backend"),
                     &|_panel| panic!("a second run must not report progress"),
                 ));
             },
@@ -2966,7 +3008,7 @@ mod tests {
 
         let finished = run_review_on_model(
             &model,
-            |_session| {
+            |_root| {
                 Box::new(FakeBackend::finding_free(vec![
                     "Reading the diff",
                     "Writing findings",
@@ -3006,7 +3048,7 @@ mod tests {
         let run = thread::spawn(move || {
             run_review_on_model(
                 &running,
-                |_session| Box::new(FakeBackend::finding_free(vec!["Reading the diff"])),
+                |_root| Box::new(FakeBackend::finding_free(vec!["Reading the diff"])),
                 &|_panel| {},
             )
         });

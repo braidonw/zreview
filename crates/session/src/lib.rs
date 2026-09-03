@@ -148,7 +148,13 @@ fn attach_guidance(session: &mut ReviewSession) {
     session.set_guidance(review::into_selection(&discovered, &paths));
 }
 
-fn repository_root(source: &SessionSource) -> Option<&Path> {
+/// The clone a session was opened out of, when it came from one.
+///
+/// `None` for the generated fixture, which has no repository and so no anchors to
+/// validate findings against. [`run_review`] refuses such a session, and nothing
+/// that needs a working directory may quietly invent one for it.
+#[must_use]
+pub fn repository_root(source: &SessionSource) -> Option<&Path> {
     match source {
         SessionSource::Demo => None,
         SessionSource::LocalComparison {

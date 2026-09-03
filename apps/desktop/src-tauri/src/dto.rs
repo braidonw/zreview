@@ -233,7 +233,7 @@ pub struct GuidanceSkipDto {
 #[serde(tag = "kind")]
 pub enum GuidanceDto {
     /// Discovery ran and found nothing. Saying so is not the same as showing
-    /// nothing: a reviewer needs to tell "this repository states no conventions"
+    /// nothing. A reviewer needs to tell "this repository states no conventions"
     /// from "guidance was never looked for".
     NothingFound { note: String },
     Discovered {
@@ -261,8 +261,6 @@ pub enum ReviewRunDto {
         rejected: u32,
         /// Claims suppressed because the reviewer dismissed them before.
         suppressed: u32,
-        /// Files the run did not see.
-        unreviewed: Vec<String>,
     },
     Failed {
         summary: String,
@@ -287,12 +285,17 @@ pub struct PanelFooterDto {
     pub refused: Option<String>,
     /// Present when a completed run did not see the whole change.
     pub not_reviewed: Option<String>,
+    /// The files that run did not see, named under the count that describes them.
+    pub unreviewed: Vec<String>,
 }
 
 /// The Session's right-hand panel: what a review is held to, and how far the run
 /// that populates it has got.
 #[derive(Clone, Debug, Serialize, specta::Type)]
 pub struct ReviewPanelDto {
+    /// How many times the panel has changed, so a snapshot that was read before
+    /// a change can be told from one that carries it.
+    pub revision: u32,
     /// "Review" before there is anything to act on, otherwise the finding count.
     pub heading: String,
     pub guidance: GuidanceDto,
@@ -755,6 +758,7 @@ pub fn project_panel(review: &ReviewModel) -> Option<ReviewPanelDto> {
     let session = review.session();
     let run = review.run();
     Some(ReviewPanelDto {
+        revision: review.revision(),
         heading: match session.findings().len() {
             0 => "Review".to_owned(),
             1 => "1 finding".to_owned(),
@@ -828,12 +832,11 @@ fn project_run(run: &ReviewRunState) -> ReviewRunDto {
             accepted,
             rejected,
             suppressed,
-            unreviewed,
+            ..
         } => ReviewRunDto::Complete {
             accepted: as_u32(*accepted),
             rejected: as_u32(*rejected),
             suppressed: as_u32(*suppressed),
-            unreviewed: unreviewed.clone(),
         },
         ReviewRunState::Failed {
             summary,
@@ -895,6 +898,7 @@ fn project_footer(session: &ReviewSession, run: &ReviewRunState) -> Option<Panel
         return refused.map(|refused| PanelFooterDto {
             refused: Some(refused),
             not_reviewed: None,
+            unreviewed: Vec::new(),
         });
     };
     if rejected == 0 && unreviewed.is_empty() {
@@ -904,6 +908,7 @@ fn project_footer(session: &ReviewSession, run: &ReviewRunState) -> Option<Panel
         refused,
         not_reviewed: (!unreviewed.is_empty())
             .then(|| format!("{} file(s) not reviewed", unreviewed.len())),
+        unreviewed: unreviewed.clone(),
     })
 }
 

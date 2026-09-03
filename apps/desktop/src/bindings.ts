@@ -152,6 +152,11 @@ export const commands = {
 	 *  Returns a failure when no session is open.
 	 */
 	reviewPanel: () => typedError<{
+	/**
+	 *  How many times the panel has changed, so a snapshot that was read before
+	 *  a change can be told from one that carries it.
+	 */
+	revision: number,
 	/**  "Review" before there is anything to act on, otherwise the finding count. */
 	heading: string,
 	guidance: GuidanceDto,
@@ -174,6 +179,11 @@ export const commands = {
 	 *  does not finish.
 	 */
 	runReview: (onProgress: Channel<ReviewPanelDto>) => typedError<{
+	/**
+	 *  How many times the panel has changed, so a snapshot that was read before
+	 *  a change can be told from one that carries it.
+	 */
+	revision: number,
 	/**  "Review" before there is anything to act on, otherwise the finding count. */
 	heading: string,
 	guidance: GuidanceDto,
@@ -189,6 +199,11 @@ export const commands = {
 	 *  Returns a failure when no session is open.
 	 */
 	cancelReview: () => typedError<{
+	/**
+	 *  How many times the panel has changed, so a snapshot that was read before
+	 *  a change can be told from one that carries it.
+	 */
+	revision: number,
 	/**  "Review" before there is anything to act on, otherwise the finding count. */
 	heading: string,
 	guidance: GuidanceDto,
@@ -204,6 +219,11 @@ export const commands = {
 	 *  Returns a failure when no session is open.
 	 */
 	toggleGuidancePanel: () => typedError<{
+	/**
+	 *  How many times the panel has changed, so a snapshot that was read before
+	 *  a change can be told from one that carries it.
+	 */
+	revision: number,
 	/**  "Review" before there is anything to act on, otherwise the finding count. */
 	heading: string,
 	guidance: GuidanceDto,
@@ -220,6 +240,11 @@ export const commands = {
 	 *  file the session discovered.
 	 */
 	toggleGuidance: (path: string) => typedError<{
+	/**
+	 *  How many times the panel has changed, so a snapshot that was read before
+	 *  a change can be told from one that carries it.
+	 */
+	revision: number,
 	/**  "Review" before there is anything to act on, otherwise the finding count. */
 	heading: string,
 	guidance: GuidanceDto,
@@ -304,7 +329,7 @@ export type FileSummaryDto = {
 export type GuidanceDto = 
 /**
  *  Discovery ran and found nothing. Saying so is not the same as showing
- *  nothing: a reviewer needs to tell "this repository states no conventions"
+ *  nothing. A reviewer needs to tell "this repository states no conventions"
  *  from "guidance was never looked for".
  */
 { kind: "NothingFound"; note: string } | { kind: "Discovered"; 
@@ -430,6 +455,8 @@ export type PanelFooterDto = {
 	refused: string | null,
 	/**  Present when a completed run did not see the whole change. */
 	not_reviewed: string | null,
+	/**  The files that run did not see, named under the count that describes them. */
+	unreviewed: string[],
 };
 
 /**
@@ -466,6 +493,11 @@ export type RefusalDto = {
  *  that populates it has got.
  */
 export type ReviewPanelDto = {
+	/**
+	 *  How many times the panel has changed, so a snapshot that was read before
+	 *  a change can be told from one that carries it.
+	 */
+	revision: number,
 	/**  "Review" before there is anything to act on, otherwise the finding count. */
 	heading: string,
 	guidance: GuidanceDto,
@@ -479,9 +511,7 @@ export type ReviewRunDto = { state: "Idle" } | { state: "Running";
 /**  The backend's most recent progress line. */
 detail: string } | { state: "Complete"; accepted: number; rejected: number; 
 /**  Claims suppressed because the reviewer dismissed them before. */
-suppressed: number; 
-/**  Files the run did not see. */
-unreviewed: string[] } | { state: "Failed"; summary: string; remediation: string | null };
+suppressed: number } | { state: "Failed"; summary: string; remediation: string | null };
 
 export type RowDto = {
 	kind: DiffLineKindDto,
