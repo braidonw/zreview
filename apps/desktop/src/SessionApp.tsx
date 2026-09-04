@@ -27,6 +27,11 @@ export function SessionApp({
     cancelReview,
     toggleGuidanceSection,
     toggleGuidanceFile,
+    revealFinding,
+    acceptFinding,
+    dismissFinding,
+    replaceFinding,
+    keepFinding,
   } = useSession(description, isShowing);
 
   switch (state.status) {
@@ -51,6 +56,11 @@ export function SessionApp({
           onCancelReview={cancelReview}
           onToggleGuidanceSection={toggleGuidanceSection}
           onToggleGuidanceFile={toggleGuidanceFile}
+          onRevealFinding={revealFinding}
+          onAcceptFinding={acceptFinding}
+          onDismissFinding={dismissFinding}
+          onReplaceFinding={replaceFinding}
+          onKeepFinding={keepFinding}
         />
       );
   }

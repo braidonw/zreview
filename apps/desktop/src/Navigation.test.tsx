@@ -14,6 +14,7 @@ import {
   makeHomeSnapshot,
   makeRow,
   makeSidebar,
+  makeFinding,
   makePanel,
   makeSnapshot,
 } from "./test/fixtures";
@@ -35,6 +36,9 @@ const discardDraft = vi.fn();
 const reanchorDraft = vi.fn();
 const reviewPanel = vi.fn();
 const runReview = vi.fn();
+const selectNextFinding = vi.fn();
+const acceptFinding = vi.fn();
+const dismissFinding = vi.fn();
 
 vi.mock("./bindings", () => ({
   commands: {
@@ -55,6 +59,9 @@ vi.mock("./bindings", () => ({
     reanchorDraft: (...args: unknown[]) => reanchorDraft(...args),
     reviewPanel: () => reviewPanel(),
     runReview: (channel: unknown) => runReview(channel),
+    selectNextFinding: () => selectNextFinding(),
+    acceptFinding: (id: unknown) => acceptFinding(id),
+    dismissFinding: (id: unknown) => dismissFinding(id),
   },
 }));
 
@@ -177,6 +184,9 @@ beforeEach(() => {
   discardDraft.mockReset();
   reanchorDraft.mockReset();
   reviewPanel.mockReset();
+  selectNextFinding.mockReset();
+  acceptFinding.mockReset();
+  dismissFinding.mockReset();
   reviewPanel.mockResolvedValue({ status: "ok", data: null });
   runReview.mockReset();
 });
@@ -315,6 +325,28 @@ describe("the Session kept alive behind Home", () => {
     fireEvent.keyDown(window, { key: "r", metaKey: true, shiftKey: true });
 
     expect(runReview).toHaveBeenCalledOnce();
+  });
+
+  it("leaves the finding shortcuts alone once Home is in front of the Session", async () => {
+    // A selected finding, so accept and dismiss have something to act on and
+    // the assertions below can only pass because Home has the keys.
+    reviewPanel.mockResolvedValue(
+      ok(makePanel({ findings: [makeFinding({ is_selected: true })] })),
+    );
+    await openTheCursorRow();
+
+    fireEvent.keyDown(window, { key: "[", metaKey: true });
+    await waitFor(() =>
+      expect(document.querySelector(".app__session")?.hasAttribute("hidden")).toBe(true),
+    );
+
+    for (const key of ["f", "y", "d"]) {
+      fireEvent.keyDown(window, { key, metaKey: true, shiftKey: true });
+    }
+
+    expect(selectNextFinding).not.toHaveBeenCalled();
+    expect(acceptFinding).not.toHaveBeenCalled();
+    expect(dismissFinding).not.toHaveBeenCalled();
   });
 
   it("keeps its tree mounted and hidden, with its file, cursor, and composer intact", async () => {

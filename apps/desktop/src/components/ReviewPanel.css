@@ -191,6 +191,145 @@
   font-size: var(--size-label);
 }
 
+.review-panel__findings {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.review-panel__finding {
+  padding: 8px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  border-bottom: 1px solid var(--border-default);
+  cursor: pointer;
+}
+
+.review-panel__finding--selected {
+  background: var(--surface-selected);
+}
+
+.review-panel__finding-meta {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.review-panel__severity {
+  text-transform: uppercase;
+  font-size: var(--size-label);
+  font-weight: 600;
+}
+
+.review-panel__severity--error {
+  color: var(--severity-error-text);
+}
+
+.review-panel__severity--warning {
+  color: var(--severity-warning-text);
+}
+
+.review-panel__severity--info {
+  color: var(--severity-info-text);
+}
+
+.review-panel__confidence {
+  color: var(--text-secondary);
+  font-size: var(--size-label);
+}
+
+.review-panel__position {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text-secondary);
+  font-size: var(--size-label);
+}
+
+.review-panel__finding-title {
+  margin: 0;
+  color: var(--text-primary);
+}
+
+.review-panel__finding-rationale {
+  margin: 0;
+  color: var(--text-secondary);
+  font-size: var(--size-label);
+}
+
+.review-panel__finding-citations {
+  margin: 0;
+  color: var(--text-tertiary);
+  font-size: var(--size-label);
+}
+
+/* The one place a finding is marked as a model's proposal, in the hue reserved
+   for exactly that and nothing else. */
+.review-panel__finding-origin {
+  margin: 0;
+  color: var(--proposed-text);
+  font-size: var(--size-label);
+}
+
+.review-panel__finding-actions {
+  display: flex;
+  gap: 8px;
+  padding-top: 4px;
+}
+
+.review-panel__finding-actions button {
+  padding: 4px 8px;
+  border: none;
+  border-radius: 6px;
+  font-family: inherit;
+  font-size: var(--size-label);
+  cursor: pointer;
+}
+
+.review-panel__finding-accept,
+.review-panel__finding-replace {
+  background: var(--severity-success);
+  color: var(--text-on-accent);
+}
+
+.review-panel__finding-dismiss,
+.review-panel__finding-keep {
+  background: var(--surface-overlay);
+  color: var(--text-secondary);
+}
+
+.review-panel__finding-conflict {
+  padding-top: 4px;
+  color: var(--text-secondary);
+  font-size: var(--size-label);
+}
+
+.review-panel__finding-conflict p {
+  margin: 0 0 4px;
+}
+
+.review-panel__finding-conflict-intro {
+  color: var(--text-primary);
+}
+
+.review-panel__finding-conflict-text {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 4px 6px;
+  border-radius: 4px;
+  background: var(--surface-overlay);
+  white-space: pre-wrap;
+}
+
+.review-panel__finding-conflict-label {
+  color: var(--text-tertiary);
+  text-transform: uppercase;
+  font-size: 10px;
+}
+
 .review-panel__footer {
   flex-shrink: 0;
   padding: 8px 12px;

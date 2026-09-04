@@ -4,6 +4,7 @@ import {
   makeAnchoredDraft,
   makeDrafts,
   makeFile,
+  makeFinding,
   makePanel,
   makeRow,
   makeSnapshot,
@@ -13,6 +14,7 @@ import {
   composerPrefill,
   draftAtRow,
   initialState,
+  selectedFinding,
   selectionRange,
   sessionReducer,
 } from "./sessionReducer";
@@ -35,6 +37,7 @@ function readyState(rowCount: number, cursor = 0, anchor = 0): ReadyState {
     composer: null,
     panel: null,
     panelNotice: null,
+    findingConflict: null,
   };
 }
 
@@ -115,6 +118,34 @@ describe("sessionReducer", () => {
     const next = sessionReducer(refused, { type: "panel", panel: makePanel() });
 
     expect(next).toMatchObject({ panelNotice: null });
+  });
+
+  it("shows the confirmation accepting onto an occupied line asked", () => {
+    const conflict = { id: 3, existing: "mine", proposed: "Handle the failure here." };
+    const next = sessionReducer(readyState(1), { type: "findingConflict", conflict });
+    expect(next).toMatchObject({ findingConflict: conflict });
+  });
+
+  it("clears the confirmation once the reviewer resolves it", () => {
+    const conflict = { id: 3, existing: "mine", proposed: "Handle the failure here." };
+    const asked = sessionReducer(readyState(1), { type: "findingConflict", conflict });
+
+    const cleared = sessionReducer(asked, { type: "findingConflict", conflict: null });
+
+    expect(cleared).toMatchObject({ findingConflict: null });
+  });
+
+  /**
+   * A re-run can reassign the pending finding's id to a different claim, so a
+   * panel that lands while a confirmation is showing must drop it too.
+   */
+  it("clears a pending conflict when a new panel lands", () => {
+    const conflict = { id: 3, existing: "mine", proposed: "Handle the failure here." };
+    const asked = sessionReducer(readyState(1), { type: "findingConflict", conflict });
+
+    const next = sessionReducer(asked, { type: "panel", panel: makePanel() });
+
+    expect(next).toMatchObject({ findingConflict: null });
   });
 
   it("clamps the cursor at the top of the file", () => {
@@ -285,5 +316,20 @@ describe("sessionReducer", () => {
     expect(composerPrefill(readyState(10))).toBe("");
     const opened = sessionReducer(readyState(10, 2, 2), { type: "toggleComposer" }) as ReadyState;
     expect(composerPrefill(opened)).toBe("");
+  });
+
+  it("finds the panel's selected finding", () => {
+    const panel = makePanel({
+      findings: [
+        makeFinding({ id: 1, is_selected: false }),
+        makeFinding({ id: 2, is_selected: true }),
+      ],
+    });
+    expect(selectedFinding(panel)?.id).toBe(2);
+  });
+
+  it("has no selected finding on a null panel or an empty list", () => {
+    expect(selectedFinding(null)).toBeNull();
+    expect(selectedFinding(makePanel({ findings: [] }))).toBeNull();
   });
 });

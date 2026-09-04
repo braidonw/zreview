@@ -1,31 +1,52 @@
-import type { GuidanceDto, ReviewPanelDto } from "../bindings";
+import type { FindingConflict } from "../hooks/sessionReducer";
+import type { FindingDto, GuidanceDto, ReviewPanelDto, SeverityDto } from "../bindings";
 import "./ReviewPanel.css";
 
+const SEVERITY_LABEL: Record<SeverityDto, string> = {
+  Error: "error",
+  Warning: "warning",
+  Info: "info",
+};
+
 /**
- * What this review is held to, and how far the run that populates it has got.
+ * What this review is held to, the findings it proposes, and how far the run
+ * that populates it has got.
  *
  * Two things this panel is careful to show rather than hide. What was refused, so
  * a run that kept one claim out of twelve does not read as a run that found one.
  * And what was never looked at, so a review that skipped files cannot present
- * itself as having covered the change. The findings themselves are not drawn yet.
+ * itself as having covered the change.
  */
 export function ReviewPanel({
   panel,
   notice,
+  findingConflict,
   onRunReview,
   onCancelReview,
   onToggleGuidanceSection,
   onToggleGuidanceFile,
+  onRevealFinding,
+  onAcceptFinding,
+  onDismissFinding,
+  onReplaceFinding,
+  onKeepFinding,
 }: {
   panel: ReviewPanelDto;
   /** What a review command refused, until the next panel lands. */
   notice: string | null;
+  /** The confirmation accepting a finding onto an occupied line is asking. */
+  findingConflict: FindingConflict;
   onRunReview: () => void;
   onCancelReview: () => void;
   onToggleGuidanceSection: () => void;
   onToggleGuidanceFile: (path: string) => void;
+  onRevealFinding: (id: number) => void;
+  onAcceptFinding: (id: number) => void;
+  onDismissFinding: (id: number) => void;
+  onReplaceFinding: (id: number) => void;
+  onKeepFinding: () => void;
 }) {
-  const { run, note, footer } = panel;
+  const { run, note, findings, footer } = panel;
   const isRunning = run.state === "Running";
 
   return (
@@ -50,11 +71,32 @@ export function ReviewPanel({
         onToggleFile={onToggleGuidanceFile}
       />
       <div className="review-panel__body">
-        {note !== null && (
-          <div className="review-panel__note">
-            <p className="review-panel__note-heading">{note.heading}</p>
-            {note.detail !== null && <p className="review-panel__note-detail">{note.detail}</p>}
-          </div>
+        {findings.length > 0 ? (
+          <ul className="review-panel__findings">
+            {findings.map((finding) => (
+              <FindingCard
+                key={finding.id}
+                finding={finding}
+                conflict={
+                  findingConflict !== null && findingConflict.id === finding.id
+                    ? findingConflict
+                    : null
+                }
+                onReveal={() => onRevealFinding(finding.id)}
+                onAccept={() => onAcceptFinding(finding.id)}
+                onDismiss={() => onDismissFinding(finding.id)}
+                onReplace={() => onReplaceFinding(finding.id)}
+                onKeep={onKeepFinding}
+              />
+            ))}
+          </ul>
+        ) : (
+          note !== null && (
+            <div className="review-panel__note">
+              <p className="review-panel__note-heading">{note.heading}</p>
+              {note.detail !== null && <p className="review-panel__note-detail">{note.detail}</p>}
+            </div>
+          )
         )}
       </div>
       {footer !== null && (
@@ -156,5 +198,120 @@ function GuidanceSection({
         </>
       )}
     </section>
+  );
+}
+
+/**
+ * One proposal from a review backend. Nothing here is a comment until the
+ * reviewer accepts it, which is why every card carries both what the model
+ * decided and a plain Accept or Dismiss.
+ */
+function FindingCard({
+  finding,
+  conflict,
+  onReveal,
+  onAccept,
+  onDismiss,
+  onReplace,
+  onKeep,
+}: {
+  finding: FindingDto;
+  /** Present when accepting this finding found the anchor already occupied. */
+  conflict: FindingConflict;
+  onReveal: () => void;
+  onAccept: () => void;
+  onDismiss: () => void;
+  onReplace: () => void;
+  onKeep: () => void;
+}) {
+  return (
+    <li
+      className={`review-panel__finding ${
+        finding.is_selected ? "review-panel__finding--selected" : ""
+      }`}
+      aria-selected={finding.is_selected}
+      onClick={onReveal}
+    >
+      <div className="review-panel__finding-meta">
+        <span
+          className={`review-panel__severity review-panel__severity--${SEVERITY_LABEL[finding.severity]}`}
+        >
+          {SEVERITY_LABEL[finding.severity]}
+        </span>
+        <span className="review-panel__confidence">{finding.confidence_percent}%</span>
+        <span className="review-panel__position">{finding.position ?? "whole change"}</span>
+      </div>
+      <p className="review-panel__finding-title">{finding.title}</p>
+      {finding.rationale !== "" && (
+        <p className="review-panel__finding-rationale">{finding.rationale}</p>
+      )}
+      {finding.citations.length > 0 && (
+        <p className="review-panel__finding-citations">per {finding.citations.join(", ")}</p>
+      )}
+      <p className="review-panel__finding-origin">Proposed by {finding.origin}</p>
+      {conflict !== null ? (
+        <div className="review-panel__finding-conflict">
+          <p className="review-panel__finding-conflict-intro">
+            Replace your comment with this proposal?
+          </p>
+          <p className="review-panel__finding-conflict-text">
+            <span className="review-panel__finding-conflict-label">Your comment</span>
+            {conflict.existing}
+          </p>
+          <p className="review-panel__finding-conflict-text">
+            <span className="review-panel__finding-conflict-label">Proposal</span>
+            {conflict.proposed}
+          </p>
+          <div className="review-panel__finding-actions">
+            <button
+              type="button"
+              className="review-panel__finding-replace"
+              onClick={(event) => {
+                event.stopPropagation();
+                onReplace();
+              }}
+            >
+              Replace
+            </button>
+            <button
+              type="button"
+              className="review-panel__finding-keep"
+              onClick={(event) => {
+                event.stopPropagation();
+                onKeep();
+              }}
+            >
+              Keep
+            </button>
+          </div>
+        </div>
+      ) : (
+        <div className="review-panel__finding-actions">
+          {/* No summary editor yet, so a whole-change finding can only be dismissed. */}
+          {finding.position !== null && (
+            <button
+              type="button"
+              className="review-panel__finding-accept"
+              onClick={(event) => {
+                event.stopPropagation();
+                onAccept();
+              }}
+            >
+              Accept
+            </button>
+          )}
+          <button
+            type="button"
+            className="review-panel__finding-dismiss"
+            onClick={(event) => {
+              event.stopPropagation();
+              onDismiss();
+            }}
+          >
+            Dismiss
+          </button>
+        </div>
+      )}
+    </li>
   );
 }

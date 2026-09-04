@@ -20,6 +20,11 @@ function baseHandlers() {
     onCancelReview: () => {},
     onToggleGuidanceSection: () => {},
     onToggleGuidanceFile: () => {},
+    onRevealFinding: () => {},
+    onAcceptFinding: () => {},
+    onDismissFinding: () => {},
+    onReplaceFinding: () => {},
+    onKeepFinding: () => {},
   };
 }
 
@@ -34,6 +39,7 @@ function readyState(overrides: Partial<ReadyState["file"]> = {}): ReadyState {
     composer: null,
     panel: null,
     panelNotice: null,
+    findingConflict: null,
   };
 }
 

@@ -11,7 +11,10 @@ use std::{
 use app::{
     Opened, PullRequestId, RepositoryOutcome, SessionPhase, SettingsWrite, Showing, lock, try_lock,
 };
-use domain::{DiffSide, ReviewBackend, ReviewError, ReviewEventSink, ReviewProgress};
+use domain::{
+    AnchorLocation, DiffSide, FindingId, ReviewBackend, ReviewError, ReviewEventSink,
+    ReviewProgress,
+};
 use review::{Agent, CodingAgent};
 use session::{ReviewStorage, SessionRequest};
 use tauri::ipc::Channel;
@@ -43,6 +46,11 @@ pub fn specta_builder() -> tauri_specta::Builder<tauri::Wry> {
         cancel_review,
         toggle_guidance_panel,
         toggle_guidance,
+        accept_finding,
+        overwrite_finding,
+        dismiss_finding,
+        reveal_finding,
+        select_next_finding,
     ])
 }
 
@@ -580,6 +588,137 @@ fn toggle_guidance_on_model(
     Ok(panel_of(&guard))
 }
 
+/// Accepts a finding, turning it into a draft where the model allows it.
+///
+/// `None` for a session that has no panel to answer with at all.
+fn accept_finding_on_model(
+    model: &Mutex<app::SessionModel>,
+    id: u32,
+) -> Option<dto::AcceptOutcomeDto> {
+    let mut guard = lock(model);
+    let finding_id = FindingId(id);
+    // Read before the call. An occupied disposition leaves the finding pending,
+    // but its proposed text is needed for the confirmation regardless.
+    let proposed = match guard.phase() {
+        SessionPhase::Ready(review) => review
+            .session()
+            .findings()
+            .get(finding_id)
+            .map(|finding| finding.proposed_comment.clone()),
+        SessionPhase::Loading { .. } | SessionPhase::Failed(_) => None,
+    };
+    let disposition = guard.accept_finding(finding_id);
+    let occupied = occupied_texts(&guard, &disposition, proposed);
+    accept_outcome(&guard, &disposition, occupied)
+}
+
+/// Forces a finding onto its anchor, overwriting the reviewer's own draft there.
+///
+/// Reached only once the reviewer has chosen to replace what they wrote, after
+/// `accept_finding` answered with the confirmation. Refused, with an `Unknown`
+/// disposition, for any id other than the one the reviewer was actually asked
+/// about.
+fn overwrite_finding_on_model(
+    model: &Mutex<app::SessionModel>,
+    id: u32,
+) -> Option<dto::AcceptOutcomeDto> {
+    let mut guard = lock(model);
+    let disposition = guard.overwrite_finding(FindingId(id));
+    accept_outcome(&guard, &disposition, None)
+}
+
+/// The reviewer's own text, the finding's proposal, and where it sits, when
+/// accepting answered with [`app::FindingDisposition::Composer`].
+///
+/// The GPUI composer merges the two texts into one seed string to open
+/// pre-filled; the desktop panel needs them apart to ask its replace-or-keep
+/// question, so they are read straight off the session instead.
+fn occupied_texts(
+    model: &app::SessionModel,
+    disposition: &app::FindingDisposition,
+    proposed: Option<String>,
+) -> Option<(String, String, AnchorLocation)> {
+    let app::FindingDisposition::Composer { location, .. } = disposition else {
+        return None;
+    };
+    let SessionPhase::Ready(review) = model.phase() else {
+        unreachable!("a Composer disposition means the session is Ready")
+    };
+    let existing = review
+        .session()
+        .draft_at(location.file, location.row)
+        .expect("a Composer disposition means the anchor holds a draft")
+        .body
+        .clone();
+    let proposed = proposed
+        .expect("a Composer disposition means the finding still holds its proposed comment");
+    Some((existing, proposed, *location))
+}
+
+/// Bundles the panel and the selected file's drafts with a mapped disposition.
+///
+/// `None` for a session that has no panel to answer with at all.
+fn accept_outcome(
+    model: &app::SessionModel,
+    disposition: &app::FindingDisposition,
+    occupied: Option<(String, String, AnchorLocation)>,
+) -> Option<dto::AcceptOutcomeDto> {
+    let panel = panel_of(model)?;
+    let selected = match model.phase() {
+        SessionPhase::Ready(review) => review.session().selected_file_index(),
+        SessionPhase::Loading { .. } | SessionPhase::Failed(_) => {
+            unreachable!("panel_of answered, so the session is Ready")
+        }
+    };
+    Some(dto::AcceptOutcomeDto {
+        panel,
+        drafts: drafts_snapshot(model, selected),
+        disposition: dto::project_disposition(disposition, occupied),
+    })
+}
+
+/// Dismisses a finding, recording the decision so a later run suppresses the
+/// same claim.
+fn dismiss_finding_on_model(
+    model: &Mutex<app::SessionModel>,
+    id: u32,
+) -> Option<dto::ReviewPanelDto> {
+    let mut guard = lock(model);
+    guard.dismiss_finding(FindingId(id));
+    panel_of(&guard)
+}
+
+/// Selects a finding and says where the diff should scroll to show it.
+fn reveal_finding_on_model(
+    model: &Mutex<app::SessionModel>,
+    id: u32,
+) -> Option<dto::RevealOutcomeDto> {
+    let mut guard = lock(model);
+    let location = guard.reveal_finding(FindingId(id));
+    reveal_outcome(&guard, location)
+}
+
+/// Moves the selection to the finding after the one selected, wrapping to the
+/// first, and says where the diff should scroll to show it.
+fn select_next_finding_on_model(model: &Mutex<app::SessionModel>) -> Option<dto::RevealOutcomeDto> {
+    let mut guard = lock(model);
+    let next = guard.review().and_then(app::ReviewModel::next_finding);
+    let location = next.and_then(|id| guard.reveal_finding(id));
+    reveal_outcome(&guard, location)
+}
+
+/// Bundles the panel with where a reveal should scroll the diff to.
+fn reveal_outcome(
+    model: &app::SessionModel,
+    location: Option<AnchorLocation>,
+) -> Option<dto::RevealOutcomeDto> {
+    let panel = panel_of(model)?;
+    Some(dto::RevealOutcomeDto {
+        panel,
+        location: location.map(Into::into),
+    })
+}
+
 /// Loads the review session the window was opened with, reporting each stage on
 /// `on_stage` as it goes.
 ///
@@ -1086,6 +1225,93 @@ pub fn toggle_guidance(
 ) -> Result<Option<dto::ReviewPanelDto>, dto::SessionFailureDto> {
     let model = session_model(&state)?;
     toggle_guidance_on_model(&model, &path)
+}
+
+/// Accepts a finding, turning it into a draft where the model allows it.
+///
+/// Refuses to overwrite the reviewer's own draft. The disposition answers
+/// `Occupied` instead, and the panel asks whether to replace it.
+///
+/// # Errors
+///
+/// Returns a failure when no session is open.
+#[tauri::command]
+#[specta::specta]
+#[allow(clippy::needless_pass_by_value)]
+pub fn accept_finding(
+    state: tauri::State<'_, AppRoot>,
+    id: u32,
+) -> Result<Option<dto::AcceptOutcomeDto>, dto::SessionFailureDto> {
+    let model = session_model(&state)?;
+    Ok(accept_finding_on_model(&model, id))
+}
+
+/// Forces a finding onto its anchor, overwriting the reviewer's own draft there.
+///
+/// Reached only once the reviewer has chosen to replace what they wrote, after
+/// `accept_finding` answered with the confirmation.
+///
+/// # Errors
+///
+/// Returns a failure when no session is open.
+#[tauri::command]
+#[specta::specta]
+#[allow(clippy::needless_pass_by_value)]
+pub fn overwrite_finding(
+    state: tauri::State<'_, AppRoot>,
+    id: u32,
+) -> Result<Option<dto::AcceptOutcomeDto>, dto::SessionFailureDto> {
+    let model = session_model(&state)?;
+    Ok(overwrite_finding_on_model(&model, id))
+}
+
+/// Dismisses a finding, recording the decision so a later run suppresses the
+/// same claim.
+///
+/// # Errors
+///
+/// Returns a failure when no session is open.
+#[tauri::command]
+#[specta::specta]
+#[allow(clippy::needless_pass_by_value)]
+pub fn dismiss_finding(
+    state: tauri::State<'_, AppRoot>,
+    id: u32,
+) -> Result<Option<dto::ReviewPanelDto>, dto::SessionFailureDto> {
+    let model = session_model(&state)?;
+    Ok(dismiss_finding_on_model(&model, id))
+}
+
+/// Selects a finding, scrolling the diff to its anchor and selecting the row.
+///
+/// # Errors
+///
+/// Returns a failure when no session is open.
+#[tauri::command]
+#[specta::specta]
+#[allow(clippy::needless_pass_by_value)]
+pub fn reveal_finding(
+    state: tauri::State<'_, AppRoot>,
+    id: u32,
+) -> Result<Option<dto::RevealOutcomeDto>, dto::SessionFailureDto> {
+    let model = session_model(&state)?;
+    Ok(reveal_finding_on_model(&model, id))
+}
+
+/// Moves the selection to the finding after the one selected, wrapping to the
+/// first, and scrolls the diff to show it.
+///
+/// # Errors
+///
+/// Returns a failure when no session is open.
+#[tauri::command]
+#[specta::specta]
+#[allow(clippy::needless_pass_by_value)]
+pub fn select_next_finding(
+    state: tauri::State<'_, AppRoot>,
+) -> Result<Option<dto::RevealOutcomeDto>, dto::SessionFailureDto> {
+    let model = session_model(&state)?;
+    Ok(select_next_finding_on_model(&model))
 }
 
 #[cfg(test)]
@@ -3092,5 +3318,210 @@ mod tests {
             .note
             .expect("the failure is what the panel has to say");
         assert_eq!(note.heading, "claude is not installed");
+    }
+
+    /// A raw finding on `line` of feature.txt, which `temporary_repository` makes
+    /// commentable on the right side.
+    fn raw_finding_on(line: u32, title: &str) -> domain::RawFinding {
+        domain::RawFinding {
+            location: Some(domain::RawLocation {
+                path: "feature.txt".into(),
+                side: DiffSide::Right,
+                line,
+                start_line: None,
+            }),
+            severity: domain::Severity::Warning,
+            confidence: 0.9,
+            title: title.to_owned(),
+            rationale: "because".to_owned(),
+            proposed_comment: "Handle the failure here.".to_owned(),
+            guidance_sources: vec![domain::GuidanceCitation {
+                path: "AGENTS.md".into(),
+                content_hash: "hash".into(),
+            }],
+        }
+    }
+
+    /// Runs `model` against a backend reporting one hand-built finding, returning
+    /// its id from the panel the run ends with.
+    fn seed_one_finding(model: &Mutex<app::SessionModel>, line: u32, title: &str) -> u32 {
+        let backend = FakeBackend::new(Vec::new(), Ok(vec![raw_finding_on(line, title)]));
+        let (finished, _) = run_with(model, &backend);
+        finished.expect("the session can be reviewed").findings[0].id
+    }
+
+    /// The finding named `title` on a panel, or a panic saying it was not there.
+    fn finding_named<'a>(panel: &'a dto::ReviewPanelDto, title: &str) -> &'a dto::FindingDto {
+        panel
+            .findings
+            .iter()
+            .find(|finding| finding.title == title)
+            .unwrap_or_else(|| panic!("no finding named {title} on the panel"))
+    }
+
+    #[test]
+    fn accepting_a_finding_drafts_it_and_leaves_the_list() {
+        let repository = temporary_repository();
+        let model = local_model(&local_request(&repository), &ReviewStorage::Disabled);
+        let id = seed_one_finding(&model, 2, "unchecked index");
+
+        let outcome = accept_finding_on_model(&model, id).expect("the session can be reviewed");
+
+        assert!(matches!(
+            outcome.disposition,
+            dto::AcceptDispositionDto::Drafted
+        ));
+        assert!(outcome.panel.findings.is_empty(), "acted on");
+        let draft = outcome
+            .drafts
+            .anchored
+            .iter()
+            .find(|draft| draft.row == 1)
+            .expect("the finding's row has a draft");
+        assert_eq!(draft.body, "Handle the failure here.");
+        assert!(draft.is_proposed);
+    }
+
+    /// Acceptance must never overwrite; the panel is asked instead.
+    #[test]
+    fn accepting_onto_an_occupied_line_asks_before_overwriting() {
+        let repository = temporary_repository();
+        let model = local_model(&local_request(&repository), &ReviewStorage::Disabled);
+        edit_draft_on_model(&model, 0, 1, 1, "mine".to_owned()).expect("session is ready");
+        let id = seed_one_finding(&model, 2, "unchecked index");
+
+        let outcome = accept_finding_on_model(&model, id).expect("the session can be reviewed");
+
+        let dto::AcceptDispositionDto::Occupied {
+            existing,
+            proposed,
+            location,
+        } = outcome.disposition
+        else {
+            panic!(
+                "expected an occupied disposition, got {:?}",
+                outcome.disposition
+            );
+        };
+        assert_eq!(existing, "mine");
+        assert_eq!(proposed, "Handle the failure here.");
+        assert_eq!(location, dto::FindingLocationDto { file: 0, row: 1 });
+        assert_eq!(outcome.panel.findings.len(), 1, "still pending");
+    }
+
+    #[test]
+    fn replacing_an_occupied_findings_draft_overwrites_it_with_the_proposal() {
+        let repository = temporary_repository();
+        let model = local_model(&local_request(&repository), &ReviewStorage::Disabled);
+        edit_draft_on_model(&model, 0, 1, 1, "mine".to_owned()).expect("session is ready");
+        let id = seed_one_finding(&model, 2, "unchecked index");
+        accept_finding_on_model(&model, id).expect("the session can be reviewed");
+
+        let outcome = overwrite_finding_on_model(&model, id).expect("the session can be reviewed");
+
+        assert!(matches!(
+            outcome.disposition,
+            dto::AcceptDispositionDto::Drafted
+        ));
+        assert!(outcome.panel.findings.is_empty(), "acted on");
+        let draft = outcome
+            .drafts
+            .anchored
+            .iter()
+            .find(|draft| draft.row == 1)
+            .expect("the finding's row has a draft");
+        assert_eq!(draft.body, "Handle the failure here.");
+        assert!(draft.is_proposed);
+    }
+
+    #[test]
+    fn replacing_an_unknown_finding_changes_nothing() {
+        let repository = temporary_repository();
+        let model = local_model(&local_request(&repository), &ReviewStorage::Disabled);
+
+        let outcome = overwrite_finding_on_model(&model, 7).expect("the session can be reviewed");
+
+        assert!(matches!(
+            outcome.disposition,
+            dto::AcceptDispositionDto::Unknown
+        ));
+    }
+
+    #[test]
+    fn dismissing_a_finding_removes_it_and_a_second_run_suppresses_it() {
+        let repository = temporary_repository();
+        let model = local_model(&local_request(&repository), &ReviewStorage::Disabled);
+        let id = seed_one_finding(&model, 2, "unchecked index");
+
+        let panel = dismiss_finding_on_model(&model, id).expect("the session can be reviewed");
+        assert!(panel.findings.is_empty());
+
+        let backend = FakeBackend::new(Vec::new(), Ok(vec![raw_finding_on(2, "unchecked index")]));
+        let (finished, _) = run_with(&model, &backend);
+
+        let panel = finished.expect("the session can be reviewed");
+        assert!(panel.findings.is_empty(), "the claim was suppressed");
+        let dto::ReviewRunDto::Complete { suppressed, .. } = panel.run else {
+            panic!("expected a completed run, got {:?}", panel.run);
+        };
+        assert_eq!(suppressed, 1);
+    }
+
+    #[test]
+    fn revealing_a_finding_selects_it_and_says_where_to_scroll() {
+        let repository = temporary_repository();
+        let model = local_model(&local_request(&repository), &ReviewStorage::Disabled);
+        let id = seed_one_finding(&model, 2, "unchecked index");
+
+        let outcome = reveal_finding_on_model(&model, id).expect("the session can be reviewed");
+
+        assert!(outcome.panel.findings[0].is_selected);
+        assert_eq!(
+            outcome.location,
+            Some(dto::FindingLocationDto { file: 0, row: 1 })
+        );
+    }
+
+    #[test]
+    fn selecting_the_next_finding_wraps_around() {
+        let repository = temporary_repository();
+        let model = local_model(&local_request(&repository), &ReviewStorage::Disabled);
+        let backend = FakeBackend::new(
+            Vec::new(),
+            Ok(vec![
+                raw_finding_on(2, "first"),
+                raw_finding_on(4, "second"),
+            ]),
+        );
+        run_with(&model, &backend);
+
+        let moved = select_next_finding_on_model(&model).expect("the session can be reviewed");
+        assert!(finding_named(&moved.panel, "second").is_selected);
+
+        let wrapped = select_next_finding_on_model(&model).expect("the session can be reviewed");
+        assert!(finding_named(&wrapped.panel, "first").is_selected);
+    }
+
+    #[test]
+    fn the_footer_survives_a_run_that_also_found_findings() {
+        let repository = guided_repository();
+        let model = local_model(&local_request(&repository), &ReviewStorage::Disabled);
+        // A line outside the diff is refused, so the run keeps one claim and
+        // rejects another, which is the shape the criterion is about.
+        let backend = FakeBackend::new(
+            Vec::new(),
+            Ok(vec![
+                raw_finding_on(2, "unchecked index"),
+                raw_finding_on(9999, "impossible"),
+            ]),
+        );
+
+        let (finished, _) = run_with(&model, &backend);
+
+        let panel = finished.expect("the session can be reviewed");
+        assert_eq!(panel.findings.len(), 1);
+        let footer = panel.footer.expect("a partial review says it was partial");
+        assert_eq!(footer.refused, Some("1 claim(s) refused".to_owned()));
+        assert_eq!(footer.unreviewed, vec!["vendor/lib.rs".to_owned()]);
     }
 }

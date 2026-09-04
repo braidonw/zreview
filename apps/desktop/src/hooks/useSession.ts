@@ -1,17 +1,18 @@
 import { useCallback, useEffect, useReducer, useRef } from "react";
 import { Channel } from "@tauri-apps/api/core";
 import { writeText } from "@tauri-apps/plugin-clipboard-manager";
-import type { DiffSideDto, ReviewPanelDto } from "../bindings";
+import type { DiffSideDto, FindingLocationDto, ReviewPanelDto } from "../bindings";
 import { commands } from "../bindings";
 import { clamp } from "../lib/clamp";
 import { toFailure } from "../lib/failure";
-import { initialState, selectionRange, sessionReducer } from "./sessionReducer";
+import { initialState, selectedFinding, selectionRange, sessionReducer } from "./sessionReducer";
 import { useDraftQueue } from "./useDraftQueue";
 
+/** What a command answering with `T`, or `null` when nothing can be reviewed. */
+type CommandResult<T> = { status: "ok"; data: T | null } | { status: "error"; error: unknown };
+
 /** What a command answering with the review panel hands back. */
-type PanelResult =
-  | { status: "ok"; data: ReviewPanelDto | null }
-  | { status: "error"; error: unknown };
+type PanelResult = CommandResult<ReviewPanelDto>;
 
 /**
  * Loads one session and exposes every action the UI can take on it.
@@ -161,6 +162,131 @@ export function useSession(description: string, isShowing: boolean) {
     [onPanel],
   );
 
+  /**
+   * Applies a finding command's answer: a refusal becomes a panel notice, and
+   * an answer of `null` (nothing to review) is silently skipped. Only a real
+   * answer reaches `onData`, which the caller uses to update the rest of the
+   * state.
+   */
+  const applyFindingResult = useCallback(
+    <T,>(promise: Promise<CommandResult<T>>, onData: (data: T) => void) => {
+      promise.then((result) => {
+        if (result.status === "error") {
+          dispatch({ type: "panelNotice", notice: toFailure(result.error).summary });
+          return;
+        }
+        if (result.data === null) {
+          return;
+        }
+        onData(result.data);
+      });
+    },
+    [],
+  );
+
+  /**
+   * Switches to a finding's file and selects its row, if it has one.
+   *
+   * A finding about the change as a whole has nowhere to scroll to, so the panel
+   * selection is the only thing that moves.
+   */
+  const applyLocation = useCallback((location: FindingLocationDto | null) => {
+    if (location === null) {
+      return;
+    }
+    const current = stateRef.current;
+    if (current.status === "ready" && current.file.index === location.file) {
+      dispatch({ type: "click", index: location.row });
+      return;
+    }
+    commands.selectFile(location.file).then((selected) => {
+      if (selected.status === "error") {
+        dispatch({ type: "panelNotice", notice: toFailure(selected.error).summary });
+        return;
+      }
+      dispatch({ type: "file", file: selected.data });
+      dispatch({ type: "click", index: location.row });
+    });
+  }, []);
+
+  /** Selects a finding, scrolling the diff to its anchor and selecting the row. */
+  const revealFinding = useCallback(
+    (id: number) => {
+      applyFindingResult(commands.revealFinding(id), (data) => {
+        dispatch({ type: "panel", panel: data.panel });
+        applyLocation(data.location);
+      });
+    },
+    [applyFindingResult, applyLocation],
+  );
+
+  /** Moves the selection to the finding after the one selected, wrapping to the first. */
+  const selectNextFinding = useCallback(() => {
+    applyFindingResult(commands.selectNextFinding(), (data) => {
+      dispatch({ type: "panel", panel: data.panel });
+      applyLocation(data.location);
+    });
+  }, [applyFindingResult, applyLocation]);
+
+  /**
+   * Accepts a finding, turning it into a draft where the model allows it.
+   *
+   * When the anchor already holds the reviewer's own draft, neither text is
+   * written; the panel asks whether to replace it instead, first revealing the
+   * row so the reviewer can see what they are being asked about.
+   */
+  const acceptFinding = useCallback(
+    (id: number) => {
+      applyFindingResult(commands.acceptFinding(id), (data) => {
+        const { panel, drafts, disposition } = data;
+        dispatch({ type: "panel", panel });
+        dispatch({ type: "drafts", drafts });
+        if (disposition.outcome === "Occupied") {
+          applyLocation(disposition.location);
+          dispatch({
+            type: "findingConflict",
+            conflict: { id, existing: disposition.existing, proposed: disposition.proposed },
+          });
+        }
+      });
+    },
+    [applyFindingResult, applyLocation],
+  );
+
+  const dismissFinding = useCallback(
+    (id: number) => {
+      dispatch({ type: "findingConflict", conflict: null });
+      onPanel(commands.dismissFinding(id));
+    },
+    [onPanel],
+  );
+
+  /**
+   * Forces a finding onto its anchor, overwriting the reviewer's own draft
+   * there. A stale answer (the finding this was asked about no longer exists,
+   * or is no longer the one awaiting a reply) is refused rather than applied,
+   * which is surfaced as a panel notice rather than treated as success.
+   */
+  const replaceFinding = useCallback(
+    (id: number) => {
+      dispatch({ type: "findingConflict", conflict: null });
+      applyFindingResult(commands.overwriteFinding(id), (data) => {
+        dispatch({ type: "panel", panel: data.panel });
+        dispatch({ type: "drafts", drafts: data.drafts });
+        if (data.disposition.outcome !== "Drafted") {
+          dispatch({
+            type: "panelNotice",
+            notice: "This finding is no longer waiting to be replaced.",
+          });
+        }
+      });
+    },
+    [applyFindingResult],
+  );
+
+  /** Leaves the reviewer's draft and the finding both exactly as they were. */
+  const keepFinding = useCallback(() => dispatch({ type: "findingConflict", conflict: null }), []);
+
   const clickRow = useCallback((index: number) => dispatch({ type: "click", index }), []);
 
   const openComposer = useCallback((index: number) => dispatch({ type: "openComposer", index }), []);
@@ -240,6 +366,28 @@ export function useSession(description: string, isShowing: boolean) {
         runReview();
         return;
       }
+      if (event.metaKey && event.shiftKey && key === "f") {
+        event.preventDefault();
+        selectNextFinding();
+        return;
+      }
+      if (event.metaKey && event.shiftKey && key === "y") {
+        event.preventDefault();
+        const finding = selectedFinding(current.panel);
+        // No summary editor yet, so a whole-change finding cannot be accepted.
+        if (finding !== null && finding.position !== null) {
+          acceptFinding(finding.id);
+        }
+        return;
+      }
+      if (event.metaKey && event.shiftKey && key === "d") {
+        event.preventDefault();
+        const finding = selectedFinding(current.panel);
+        if (finding !== null) {
+          dismissFinding(finding.id);
+        }
+        return;
+      }
       if (event.metaKey && !event.shiftKey && key === "c") {
         event.preventDefault();
         const [start, end] = selectionRange(current);
@@ -268,7 +416,16 @@ export function useSession(description: string, isShowing: boolean) {
 
     window.addEventListener("keydown", handleKeydown);
     return () => window.removeEventListener("keydown", handleKeydown);
-  }, [state.status, isShowing, selectFile, toggleViewed, runReview]);
+  }, [
+    state.status,
+    isShowing,
+    selectFile,
+    toggleViewed,
+    runReview,
+    selectNextFinding,
+    acceptFinding,
+    dismissFinding,
+  ]);
 
   return {
     state,
@@ -283,5 +440,10 @@ export function useSession(description: string, isShowing: boolean) {
     cancelReview,
     toggleGuidanceSection,
     toggleGuidanceFile,
+    revealFinding,
+    acceptFinding,
+    dismissFinding,
+    replaceFinding,
+    keepFinding,
   };
 }

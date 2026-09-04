@@ -85,6 +85,14 @@ pub struct ReviewModel {
     pub(crate) run: ReviewRunState,
     /// Which finding the reviewer is looking at.
     pub(crate) selected_finding: Option<FindingId>,
+    /// The finding accepting asked the reviewer to replace or keep, if one is
+    /// still waiting on an answer.
+    ///
+    /// A re-run reassigns finding ids from zero, so the id an earlier answer
+    /// names can come to mean an entirely different claim. Overwriting is
+    /// refused unless it matches this, which is cleared on every run
+    /// transition, every dismissal, and every fresh accept.
+    pub(crate) pending_replace: Option<FindingId>,
     /// Whether the guidance section is open.
     ///
     /// Open before the first run, because PLAN wants what will be sent seen before
@@ -109,6 +117,7 @@ impl ReviewModel {
             session,
             run: ReviewRunState::Idle,
             selected_finding: None,
+            pending_replace: None,
             guidance_expanded: true,
             revision: 0,
         }
