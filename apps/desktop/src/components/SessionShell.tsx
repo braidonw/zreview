@@ -22,6 +22,11 @@ export function SessionShell({
   onCancelReview,
   onToggleGuidanceSection,
   onToggleGuidanceFile,
+  onRevealFinding,
+  onAcceptFinding,
+  onDismissFinding,
+  onReplaceFinding,
+  onKeepFinding,
 }: {
   state: ReadyState;
   /** False while Home is in front, which is when this Session has no screen. */
@@ -39,6 +44,11 @@ export function SessionShell({
   onCancelReview: () => void;
   onToggleGuidanceSection: () => void;
   onToggleGuidanceFile: (path: string) => void;
+  onRevealFinding: (id: number) => void;
+  onAcceptFinding: (id: number) => void;
+  onDismissFinding: (id: number) => void;
+  onReplaceFinding: (id: number) => void;
+  onKeepFinding: () => void;
 }) {
   const [selectionStart, selectionEnd] = selectionRange(state);
   const { empty_reason: emptyReason, rows } = state.file;
@@ -86,10 +96,16 @@ export function SessionShell({
         <ReviewPanel
           panel={state.panel}
           notice={state.panelNotice}
+          findingConflict={state.findingConflict}
           onRunReview={onRunReview}
           onCancelReview={onCancelReview}
           onToggleGuidanceSection={onToggleGuidanceSection}
           onToggleGuidanceFile={onToggleGuidanceFile}
+          onRevealFinding={onRevealFinding}
+          onAcceptFinding={onAcceptFinding}
+          onDismissFinding={onDismissFinding}
+          onReplaceFinding={onReplaceFinding}
+          onKeepFinding={onKeepFinding}
         />
       )}
     </div>

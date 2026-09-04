@@ -15,6 +15,12 @@ const REJECTED_NOTICE = "This selection cannot hold a comment";
 /** The composer's frozen span and any notice it is showing, or absent when closed. */
 export type ComposerState = { rows: [number, number]; notice: string | null } | null;
 
+/**
+ * The reviewer's own text and a finding's proposal, shown while accepting asks
+ * whether to replace what is already there.
+ */
+export type FindingConflict = { id: number; existing: string; proposed: string } | null;
+
 export type SessionState =
   | { status: "loading"; description: string; stage: string }
   | { status: "failed"; failure: SessionFailureDto }
@@ -36,6 +42,8 @@ export type SessionState =
        * would throw away the diff and whatever is unsent in the composer.
        */
       panelNotice: string | null;
+      /** The confirmation accepting a finding onto an occupied line is asking. */
+      findingConflict: FindingConflict;
     };
 
 export type ReadyState = Extract<SessionState, { status: "ready" }>;
@@ -58,6 +66,7 @@ export type SessionAction =
     }
   | { type: "panel"; panel: ReviewPanelDto | null }
   | { type: "panelNotice"; notice: string }
+  | { type: "findingConflict"; conflict: FindingConflict }
   | { type: "file"; file: FileDetailDto }
   | { type: "sidebar"; sidebar: SidebarDto }
   | { type: "move"; delta: 1 | -1; extend: boolean }
@@ -101,6 +110,7 @@ export function sessionReducer(state: SessionState, action: SessionAction): Sess
         composer: null,
         panel: action.panel,
         panelNotice: null,
+        findingConflict: null,
       };
 
     case "panel": {
@@ -126,6 +136,12 @@ export function sessionReducer(state: SessionState, action: SessionAction): Sess
         return state;
       }
       return { ...state, panelNotice: action.notice };
+
+    case "findingConflict":
+      if (state.status !== "ready") {
+        return state;
+      }
+      return { ...state, findingConflict: action.conflict };
 
     case "file":
       if (state.status !== "ready") {
@@ -222,4 +238,9 @@ export function composerPrefill(state: ReadyState): string {
     return "";
   }
   return draftAtRow(state.drafts, state.composer.rows[1])?.body ?? "";
+}
+
+/** The id of the finding the panel currently has selected, if any. */
+export function selectedFindingId(panel: ReviewPanelDto | null): number | null {
+  return panel?.findings.find((finding) => finding.is_selected)?.id ?? null;
 }

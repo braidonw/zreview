@@ -2,13 +2,14 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import { act, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import type { Channel } from "@tauri-apps/api/core";
-import type { ReviewPanelDto } from "./bindings";
+import type { FindingDto, ReviewPanelDto } from "./bindings";
 import App from "./App";
 import {
   makeAnchoredDraft,
   makeDrafts,
   makeFile,
   makeFileSummary,
+  makeFinding,
   makeGuidance,
   makeGuidanceEntry,
   makePanel,
@@ -29,6 +30,11 @@ const runReview = vi.fn();
 const cancelReview = vi.fn();
 const toggleGuidancePanel = vi.fn();
 const toggleGuidance = vi.fn();
+const acceptFinding = vi.fn();
+const overwriteFinding = vi.fn();
+const dismissFinding = vi.fn();
+const revealFinding = vi.fn();
+const selectNextFinding = vi.fn();
 
 vi.mock("./bindings", () => ({
   commands: {
@@ -44,6 +50,11 @@ vi.mock("./bindings", () => ({
     cancelReview: () => cancelReview(),
     toggleGuidancePanel: () => toggleGuidancePanel(),
     toggleGuidance: (path: unknown) => toggleGuidance(path),
+    acceptFinding: (id: unknown) => acceptFinding(id),
+    overwriteFinding: (id: unknown) => overwriteFinding(id),
+    dismissFinding: (id: unknown) => dismissFinding(id),
+    revealFinding: (id: unknown) => revealFinding(id),
+    selectNextFinding: () => selectNextFinding(),
   },
 }));
 
@@ -84,6 +95,11 @@ beforeEach(() => {
   cancelReview.mockReset();
   toggleGuidancePanel.mockReset();
   toggleGuidance.mockReset();
+  acceptFinding.mockReset();
+  overwriteFinding.mockReset();
+  dismissFinding.mockReset();
+  revealFinding.mockReset();
+  selectNextFinding.mockReset();
 });
 
 /** Renders the Session and waits for its panel to appear. */
@@ -417,5 +433,174 @@ describe("the review panel in a Session", () => {
     // The disclosure has served its purpose; the summary line stays either way.
     expect(screen.queryByText("AGENTS.md")).toBeNull();
     expect(screen.getByText("1 guidance file · 2 KB")).toBeTruthy();
+  });
+
+  it("keeps the rejected count and unreviewed files on screen once a run also finds findings", async () => {
+    const user = userEvent.setup();
+    runReview.mockResolvedValue({
+      status: "ok",
+      data: makePanel({
+        findings: [makeFinding({ id: 1 })],
+        run: { state: "Complete", accepted: 1, rejected: 1, suppressed: 0 },
+        footer: {
+          refused: "1 claim(s) refused",
+          not_reviewed: "1 file(s) not reviewed",
+          unreviewed: ["vendor/lib.rs"],
+        },
+      }),
+    });
+    await openPanel();
+
+    await user.click(screen.getByRole("button", { name: "Review" }));
+
+    await waitFor(() => expect(screen.getByText("Unchecked index")).toBeTruthy());
+    expect(screen.getByText("1 claim(s) refused")).toBeTruthy();
+    expect(screen.getByText("1 file(s) not reviewed")).toBeTruthy();
+    expect(screen.getByText("vendor/lib.rs")).toBeTruthy();
+  });
+});
+
+describe("findings in the review panel", () => {
+  /** A panel already showing one finding, selected. */
+  function panelWithFinding(overrides: Partial<FindingDto> = {}) {
+    return makePanel({ findings: [makeFinding({ id: 7, is_selected: true, ...overrides })] });
+  }
+
+  it("clicking a finding reveals it, scrolling the diff and selecting the row", async () => {
+    const user = userEvent.setup();
+    reviewPanel.mockResolvedValue({ status: "ok", data: panelWithFinding() });
+    revealFinding.mockResolvedValue({
+      status: "ok",
+      data: { panel: panelWithFinding(), location: { file: 0, row: 1 } },
+    });
+    await openPanel();
+
+    await user.click(screen.getByText("Unchecked index"));
+
+    expect(revealFinding).toHaveBeenCalledWith(7);
+    await waitFor(() =>
+      expect(screen.getByText("second").closest(".diff-row")?.className).toContain(
+        "diff-row--selected",
+      ),
+    );
+  });
+
+  it("cmd-shift-F selects the next finding", async () => {
+    const user = userEvent.setup();
+    reviewPanel.mockResolvedValue({ status: "ok", data: panelWithFinding() });
+    selectNextFinding.mockResolvedValue({
+      status: "ok",
+      data: { panel: panelWithFinding(), location: null },
+    });
+    await openPanel();
+
+    await user.keyboard("{Meta>}{Shift>}f{/Shift}{/Meta}");
+
+    expect(selectNextFinding).toHaveBeenCalledOnce();
+  });
+
+  it("cmd-shift-Y accepts the selected finding", async () => {
+    const user = userEvent.setup();
+    reviewPanel.mockResolvedValue({ status: "ok", data: panelWithFinding() });
+    acceptFinding.mockResolvedValue({
+      status: "ok",
+      data: { panel: makePanel({ findings: [] }), drafts: makeDrafts(), disposition: { outcome: "Drafted" } },
+    });
+    await openPanel();
+
+    await user.keyboard("{Meta>}{Shift>}y{/Shift}{/Meta}");
+
+    expect(acceptFinding).toHaveBeenCalledWith(7);
+  });
+
+  it("cmd-shift-D dismisses the selected finding", async () => {
+    const user = userEvent.setup();
+    reviewPanel.mockResolvedValue({ status: "ok", data: panelWithFinding() });
+    dismissFinding.mockResolvedValue({ status: "ok", data: makePanel({ findings: [] }) });
+    await openPanel();
+
+    await user.keyboard("{Meta>}{Shift>}d{/Shift}{/Meta}");
+
+    expect(dismissFinding).toHaveBeenCalledWith(7);
+  });
+
+  it("does nothing on the finding shortcuts while the composer has focus", async () => {
+    const user = userEvent.setup();
+    reviewPanel.mockResolvedValue({ status: "ok", data: panelWithFinding() });
+    await openPanel();
+
+    await user.keyboard("c");
+    const editorContent = await waitFor(() => {
+      const element = document.querySelector("[data-composer] .cm-content");
+      if (!element) {
+        throw new Error("composer editor not mounted yet");
+      }
+      return element;
+    });
+
+    editorContent.dispatchEvent(
+      new KeyboardEvent("keydown", { key: "y", metaKey: true, shiftKey: true, bubbles: true }),
+    );
+
+    expect(acceptFinding).not.toHaveBeenCalled();
+  });
+
+  it("asks whether to replace, then replaces the reviewer's draft on confirmation", async () => {
+    const user = userEvent.setup();
+    reviewPanel.mockResolvedValue({ status: "ok", data: panelWithFinding() });
+    acceptFinding.mockResolvedValue({
+      status: "ok",
+      data: {
+        panel: panelWithFinding(),
+        drafts: makeDrafts(),
+        disposition: { outcome: "Occupied", existing: "mine", proposed: "Handle the failure here." },
+      },
+    });
+    overwriteFinding.mockResolvedValue({
+      status: "ok",
+      data: {
+        panel: makePanel({ findings: [] }),
+        drafts: makeDrafts({
+          anchored: [makeAnchoredDraft({ row: 0, body: "Handle the failure here.", is_proposed: true })],
+        }),
+        disposition: { outcome: "Drafted" },
+      },
+    });
+    await openPanel();
+
+    await user.click(screen.getByRole("button", { name: "Accept" }));
+    await waitFor(() =>
+      expect(
+        screen.getByText("This line already has your comment. Replace it with the proposal?"),
+      ).toBeTruthy(),
+    );
+
+    await user.click(screen.getByRole("button", { name: "Replace" }));
+
+    expect(overwriteFinding).toHaveBeenCalledWith(7);
+    await waitFor(() => expect(screen.queryByText("Unchecked index")).toBeNull());
+  });
+
+  it("keeping leaves the reviewer's draft and the finding both untouched", async () => {
+    const user = userEvent.setup();
+    reviewPanel.mockResolvedValue({ status: "ok", data: panelWithFinding() });
+    acceptFinding.mockResolvedValue({
+      status: "ok",
+      data: {
+        panel: panelWithFinding(),
+        drafts: makeDrafts(),
+        disposition: { outcome: "Occupied", existing: "mine", proposed: "Handle the failure here." },
+      },
+    });
+    await openPanel();
+
+    await user.click(screen.getByRole("button", { name: "Accept" }));
+    await waitFor(() => expect(screen.getByRole("button", { name: "Keep" })).toBeTruthy());
+
+    await user.click(screen.getByRole("button", { name: "Keep" }));
+
+    expect(overwriteFinding).not.toHaveBeenCalled();
+    await waitFor(() => expect(screen.queryByRole("button", { name: "Keep" })).toBeNull());
+    expect(screen.getByText("Unchecked index")).toBeTruthy();
   });
 });

@@ -1,17 +1,23 @@
 import { describe, expect, it, vi } from "vitest";
 import { render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { makeGuidance, makeGuidanceEntry, makePanel } from "../test/fixtures";
+import { makeFinding, makeGuidance, makeGuidanceEntry, makePanel } from "../test/fixtures";
 import { ReviewPanel } from "./ReviewPanel";
 
 /** Every handler the panel needs beyond the one a test wants to watch. */
 function baseHandlers() {
   return {
     notice: null,
+    findingConflict: null,
     onRunReview: () => {},
     onCancelReview: () => {},
     onToggleGuidanceSection: () => {},
     onToggleGuidanceFile: () => {},
+    onRevealFinding: () => {},
+    onAcceptFinding: () => {},
+    onDismissFinding: () => {},
+    onReplaceFinding: () => {},
+    onKeepFinding: () => {},
   };
 }
 
@@ -205,5 +211,177 @@ describe("ReviewPanel", () => {
     expect(screen.getByText("2 file(s) not reviewed")).toBeTruthy();
     expect(screen.getByText("vendor/lib.rs")).toBeTruthy();
     expect(screen.getByText("huge.json")).toBeTruthy();
+  });
+
+  it("renders a finding with its severity, confidence, position, rationale, citations, and who proposed it", () => {
+    render(
+      <ReviewPanel
+        panel={makePanel({
+          findings: [
+            makeFinding({
+              severity: "Error",
+              confidence: 82,
+              title: "Unchecked index",
+              rationale: "This can panic on an empty slice.",
+              citations: ["AGENTS.md", "src/AGENTS.md"],
+              origin: "claude-code",
+              position: "src/review.rs:6",
+            }),
+          ],
+        })}
+        {...baseHandlers()}
+      />,
+    );
+
+    expect(screen.getByText("error")).toBeTruthy();
+    expect(screen.getByText("82%")).toBeTruthy();
+    expect(screen.getByText("src/review.rs:6")).toBeTruthy();
+    expect(screen.getByText("Unchecked index")).toBeTruthy();
+    expect(screen.getByText("This can panic on an empty slice.")).toBeTruthy();
+    expect(screen.getByText("per AGENTS.md, src/AGENTS.md")).toBeTruthy();
+    expect(screen.getByText("Proposed by claude-code")).toBeTruthy();
+    // The note is what the empty list shows; a finding gives way to the list.
+    expect(screen.queryByText("No review has been run.")).toBeNull();
+  });
+
+  it("shows a finding about the whole change as such, with an Accept still offered", () => {
+    render(
+      <ReviewPanel
+        panel={makePanel({ findings: [makeFinding({ position: null, title: "no tests anywhere" })] })}
+        {...baseHandlers()}
+      />,
+    );
+
+    expect(screen.getByText("whole change")).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Accept" })).toBeTruthy();
+  });
+
+  it("highlights the finding the model has selected", () => {
+    render(
+      <ReviewPanel
+        panel={makePanel({
+          findings: [
+            makeFinding({ id: 1, title: "first", is_selected: false }),
+            makeFinding({ id: 2, title: "second", is_selected: true }),
+          ],
+        })}
+        {...baseHandlers()}
+      />,
+    );
+
+    const selected = screen.getByText("second").closest("li");
+    expect(selected?.className).toContain("review-panel__finding--selected");
+    const unselected = screen.getByText("first").closest("li");
+    expect(unselected?.className).not.toContain("review-panel__finding--selected");
+  });
+
+  it("reveals a finding when its card is clicked", async () => {
+    const onRevealFinding = vi.fn();
+    render(
+      <ReviewPanel
+        panel={makePanel({ findings: [makeFinding({ id: 5, title: "unchecked index" })] })}
+        {...baseHandlers()}
+        onRevealFinding={onRevealFinding}
+      />,
+    );
+
+    await userEvent.click(screen.getByText("unchecked index"));
+
+    expect(onRevealFinding).toHaveBeenCalledWith(5);
+  });
+
+  it("accepts and dismisses a finding through its own buttons, without also revealing it", async () => {
+    const onRevealFinding = vi.fn();
+    const onAcceptFinding = vi.fn();
+    const onDismissFinding = vi.fn();
+    render(
+      <ReviewPanel
+        panel={makePanel({ findings: [makeFinding({ id: 5 })] })}
+        {...baseHandlers()}
+        onRevealFinding={onRevealFinding}
+        onAcceptFinding={onAcceptFinding}
+        onDismissFinding={onDismissFinding}
+      />,
+    );
+
+    await userEvent.click(screen.getByRole("button", { name: "Accept" }));
+    await userEvent.click(screen.getByRole("button", { name: "Dismiss" }));
+
+    expect(onAcceptFinding).toHaveBeenCalledWith(5);
+    expect(onDismissFinding).toHaveBeenCalledWith(5);
+    expect(onRevealFinding).not.toHaveBeenCalled();
+  });
+
+  it("asks whether to replace before overwriting an occupied line", () => {
+    render(
+      <ReviewPanel
+        panel={makePanel({ findings: [makeFinding({ id: 5 })] })}
+        {...baseHandlers()}
+        findingConflict={{ id: 5, existing: "mine", proposed: "Handle the failure here." }}
+      />,
+    );
+
+    expect(
+      screen.getByText("This line already has your comment. Replace it with the proposal?"),
+    ).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Replace" })).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Keep" })).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Accept" })).toBeNull();
+  });
+
+  it("only asks about the finding the conflict names", () => {
+    render(
+      <ReviewPanel
+        panel={makePanel({
+          findings: [makeFinding({ id: 5, title: "first" }), makeFinding({ id: 6, title: "second" })],
+        })}
+        {...baseHandlers()}
+        findingConflict={{ id: 5, existing: "mine", proposed: "Handle the failure here." }}
+      />,
+    );
+
+    expect(screen.getAllByRole("button", { name: "Accept" })).toHaveLength(1);
+    expect(screen.getAllByRole("button", { name: "Replace" })).toHaveLength(1);
+  });
+
+  it("replaces or keeps through the confirmation's two buttons", async () => {
+    const onReplaceFinding = vi.fn();
+    const onKeepFinding = vi.fn();
+    render(
+      <ReviewPanel
+        panel={makePanel({ findings: [makeFinding({ id: 5 })] })}
+        {...baseHandlers()}
+        findingConflict={{ id: 5, existing: "mine", proposed: "Handle the failure here." }}
+        onReplaceFinding={onReplaceFinding}
+        onKeepFinding={onKeepFinding}
+      />,
+    );
+
+    await userEvent.click(screen.getByRole("button", { name: "Replace" }));
+    expect(onReplaceFinding).toHaveBeenCalledWith(5);
+
+    await userEvent.click(screen.getByRole("button", { name: "Keep" }));
+    expect(onKeepFinding).toHaveBeenCalledOnce();
+  });
+
+  it("keeps the rejected count and unreviewed files visible even though findings exist", () => {
+    render(
+      <ReviewPanel
+        panel={makePanel({
+          findings: [makeFinding()],
+          footer: {
+            refused: "1 claim(s) refused",
+            not_reviewed: "1 file(s) not reviewed",
+            unreviewed: ["vendor/lib.rs"],
+          },
+        })}
+        {...baseHandlers()}
+      />,
+    );
+
+    expect(screen.getByText("Unchecked index")).toBeTruthy();
+    expect(screen.getByText("1 claim(s) refused")).toBeTruthy();
+    expect(screen.getByText("1 file(s) not reviewed")).toBeTruthy();
+    expect(screen.getByText("vendor/lib.rs")).toBeTruthy();
   });
 });

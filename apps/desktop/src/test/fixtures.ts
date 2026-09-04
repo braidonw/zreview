@@ -3,6 +3,7 @@ import type {
   DraftsDto,
   FileDetailDto,
   FileSummaryDto,
+  FindingDto,
   GuidanceDto,
   GuidanceEntryDto,
   HomeGroupDto,
@@ -129,6 +130,21 @@ export function makeGuidance(overrides: Partial<DiscoveredGuidance> = {}): Guida
   };
 }
 
+export function makeFinding(overrides: Partial<FindingDto> = {}): FindingDto {
+  return {
+    id: 1,
+    severity: "Warning",
+    confidence: 90,
+    title: "Unchecked index",
+    rationale: "This can panic on an empty slice.",
+    citations: ["AGENTS.md"],
+    origin: "claude-code",
+    position: "src/review_fixture_00.rs:2",
+    is_selected: false,
+    ...overrides,
+  };
+}
+
 export function makePanel(overrides: Partial<ReviewPanelDto> = {}): ReviewPanelDto {
   return {
     revision: 1,
@@ -139,6 +155,7 @@ export function makePanel(overrides: Partial<ReviewPanelDto> = {}): ReviewPanelD
       heading: "No review has been run.",
       detail: "Press Review to check this change against the repository's guidance.",
     },
+    findings: [],
     footer: null,
     ...overrides,
   };
