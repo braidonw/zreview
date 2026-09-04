@@ -72,6 +72,10 @@ pub enum Opened {
     /// This window has no Home to open a row from, so nothing was opened. Only
     /// the command line opens such a window, and it never lists a row.
     Refused,
+    /// A different pull request's Session is alive with a live run, which is in
+    /// the way of dropping it silently. Nothing was touched; the reviewer must
+    /// be asked to cancel the run and continue, or stay.
+    Blocked,
 }
 
 /// Which screen the window shows, and the one Session it holds.
@@ -116,16 +120,21 @@ impl SessionSlot {
     /// Opens `pull_request` from a row, showing its Session.
     ///
     /// The Session already alive on this pull request is shown again rather
-    /// than loaded a second time. Any other is dropped, silently, because
-    /// Drafts already persist. A window with no Home refuses the row instead,
-    /// rather than growing a Home it never had.
-    pub fn open(&mut self, pull_request: PullRequestId) -> Opened {
+    /// than loaded a second time, whether or not it has a live run: returning
+    /// to a Session's own row never asks anything. A different Session with no
+    /// live run (`run_is_live` false) is dropped silently, because Drafts
+    /// already persist. A different Session with a live run is left alone and
+    /// answered with [`Opened::Blocked`] instead, so the reviewer can be asked
+    /// to cancel the run and continue, or stay. A window with no Home refuses
+    /// the row instead, rather than growing a Home it never had.
+    pub fn open(&mut self, pull_request: PullRequestId, run_is_live: bool) -> Opened {
         match &self.session {
             Some(OpenSession::FromCommandLine) => return Opened::Refused,
             Some(OpenSession::FromRow(open)) if open.is_same_pull_request(&pull_request) => {
                 self.showing = Showing::Session;
                 return Opened::Returned;
             }
+            Some(OpenSession::FromRow(_)) if run_is_live => return Opened::Blocked,
             Some(OpenSession::FromRow(_)) | None => {}
         }
         self.showing = Showing::Session;
@@ -185,7 +194,7 @@ mod tests {
     fn opening_a_row_shows_its_session_and_leaves_it_alive() {
         let mut slot = SessionSlot::home();
 
-        assert_eq!(slot.open(pull_request(412)), Opened::Loading);
+        assert_eq!(slot.open(pull_request(412), false), Opened::Loading);
 
         assert_eq!(slot.showing(), Showing::Session);
         assert_eq!(
@@ -199,10 +208,10 @@ mod tests {
     #[test]
     fn opening_the_pull_request_already_alive_returns_to_it_unloaded() {
         let mut slot = SessionSlot::home();
-        let _opened = slot.open(pull_request(412));
+        let _opened = slot.open(pull_request(412), false);
         assert!(slot.back_to_home());
 
-        assert_eq!(slot.open(pull_request(412)), Opened::Returned);
+        assert_eq!(slot.open(pull_request(412), false), Opened::Returned);
 
         assert_eq!(slot.showing(), Showing::Session);
     }
@@ -212,14 +221,14 @@ mod tests {
     #[test]
     fn a_repository_cased_differently_still_names_the_session_already_alive() {
         let mut slot = SessionSlot::home();
-        let _opened = slot.open(pull_request(412));
+        let _opened = slot.open(pull_request(412), false);
 
         let differently_cased = PullRequestId {
             repository: "ACME/Widgets".to_owned(),
             number: 412,
         };
 
-        assert_eq!(slot.open(differently_cased), Opened::Returned);
+        assert_eq!(slot.open(differently_cased, false), Opened::Returned);
     }
 
     /// Drafts already persist, so the Session that goes is not carrying
@@ -227,9 +236,9 @@ mod tests {
     #[test]
     fn opening_a_different_pull_request_drops_the_one_that_was_alive() {
         let mut slot = SessionSlot::home();
-        let _opened = slot.open(pull_request(412));
+        let _opened = slot.open(pull_request(412), false);
 
-        assert_eq!(slot.open(pull_request(398)), Opened::Loading);
+        assert_eq!(slot.open(pull_request(398), false), Opened::Loading);
 
         assert_eq!(
             slot.session(),
@@ -238,12 +247,41 @@ mod tests {
         );
     }
 
+    /// A live run is in the way of dropping the Session silently, so nothing is
+    /// touched until the reviewer answers the confirmation.
+    #[test]
+    fn opening_a_different_pull_request_with_a_live_run_is_blocked() {
+        let mut slot = SessionSlot::home();
+        let _opened = slot.open(pull_request(412), false);
+
+        assert_eq!(slot.open(pull_request(398), true), Opened::Blocked);
+
+        assert_eq!(
+            slot.session(),
+            Some(&OpenSession::FromRow(pull_request(412))),
+            "the Session with the live run is still the one alive",
+        );
+        assert_eq!(slot.showing(), Showing::Session);
+    }
+
+    /// Returning to the Session's own row never asks anything, live run or not.
+    #[test]
+    fn opening_the_pull_request_already_alive_returns_to_it_even_with_a_live_run() {
+        let mut slot = SessionSlot::home();
+        let _opened = slot.open(pull_request(412), false);
+        assert!(slot.back_to_home());
+
+        assert_eq!(slot.open(pull_request(412), true), Opened::Returned);
+
+        assert_eq!(slot.showing(), Showing::Session);
+    }
+
     /// Back is a navigation rather than a close, which is what makes returning
     /// to a half-finished review instant.
     #[test]
     fn back_shows_home_and_leaves_the_session_alive_behind_it() {
         let mut slot = SessionSlot::home();
-        let _opened = slot.open(pull_request(412));
+        let _opened = slot.open(pull_request(412), false);
 
         assert!(slot.back_to_home());
 
@@ -257,7 +295,7 @@ mod tests {
     #[test]
     fn the_header_slot_returns_to_the_session_alive_behind_home() {
         let mut slot = SessionSlot::home();
-        let _opened = slot.open(pull_request(412));
+        let _opened = slot.open(pull_request(412), false);
         assert!(slot.back_to_home());
 
         assert!(slot.return_to_session());
@@ -280,7 +318,7 @@ mod tests {
     fn a_window_the_command_line_opened_refuses_to_open_a_row() {
         let mut slot = SessionSlot::command_line();
 
-        assert_eq!(slot.open(pull_request(412)), Opened::Refused);
+        assert_eq!(slot.open(pull_request(412), false), Opened::Refused);
 
         assert_eq!(slot.session(), Some(&OpenSession::FromCommandLine));
         assert_eq!(slot.showing(), Showing::Session);
