@@ -350,6 +350,9 @@ impl SessionModel {
             return None;
         };
         review.selected_finding = Some(id);
+        // The selection is part of what the panel shows: every finding's row
+        // reads its own highlight off it.
+        review.touch();
         review
             .session
             .findings()
@@ -971,6 +974,21 @@ mod tests {
         assert!(review(&model).session().drafts().is_empty());
     }
 
+    /// The selection a reveal moves is part of what the panel shows, so it has
+    /// to bump the revision the same as any other panel-visible change.
+    #[test]
+    fn revealing_a_finding_selects_it_and_bumps_the_revision() {
+        let mut model = ready_model(None);
+        let id = give_one_finding(&mut model, "unchecked index");
+        let revision = review(&model).revision();
+
+        let location = model.reveal_finding(id);
+
+        assert_eq!(location, Some(AnchorLocation { file: 0, row: 1 }));
+        assert_eq!(review(&model).selected_finding(), Some(id));
+        bumped(&model, revision, "revealing a finding");
+    }
+
     /// The reviewer's own words are never overwritten; both texts go to the
     /// composer instead, and nothing is saved until they commit.
     #[test]
@@ -1193,6 +1211,9 @@ mod tests {
 
         let id = give_one_finding(&mut model, "still risky");
         revision = bumped(&model, revision, "findings arriving again");
+
+        model.reveal_finding(id);
+        revision = bumped(&model, revision, "revealing a finding");
 
         assert_eq!(model.accept_finding(id), FindingDisposition::Drafted);
         revision = bumped(&model, revision, "accepting a finding");
