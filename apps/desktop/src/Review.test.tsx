@@ -538,11 +538,15 @@ describe("findings in the review panel", () => {
       return element;
     });
 
-    editorContent.dispatchEvent(
-      new KeyboardEvent("keydown", { key: "y", metaKey: true, shiftKey: true, bubbles: true }),
-    );
+    for (const key of ["f", "y", "d"]) {
+      editorContent.dispatchEvent(
+        new KeyboardEvent("keydown", { key, metaKey: true, shiftKey: true, bubbles: true }),
+      );
+    }
 
+    expect(selectNextFinding).not.toHaveBeenCalled();
     expect(acceptFinding).not.toHaveBeenCalled();
+    expect(dismissFinding).not.toHaveBeenCalled();
   });
 
   it("asks whether to replace, then replaces the reviewer's draft on confirmation", async () => {
