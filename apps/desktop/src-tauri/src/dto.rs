@@ -4,10 +4,10 @@
 //! `&SessionFailure`) and returns a value, which is what keeps them testable
 //! without a running app.
 
-use app::{PullRequestId, ReviewModel, ReviewRunState};
+use app::{FindingDisposition, PullRequestId, ReviewModel, ReviewRunState};
 use domain::{
-    DiffFile, DiffLineKind, DiffSide, EmptyDiffReason, FileStatus, GuidanceSelection,
-    ReviewSession, SessionFailure, SessionSource,
+    AnchorLocation, DiffFile, DiffLineKind, DiffSide, EmptyDiffReason, FileStatus, Finding,
+    GuidanceSelection, ReviewSession, SessionFailure, SessionSource, Severity,
 };
 use serde::{Deserialize, Serialize};
 
@@ -278,6 +278,59 @@ pub struct PanelNoteDto {
     pub detail: Option<String>,
 }
 
+/// How much a finding claims to matter.
+#[derive(Clone, Copy, Debug, Serialize, specta::Type)]
+pub enum SeverityDto {
+    Info,
+    Warning,
+    Error,
+}
+
+impl From<Severity> for SeverityDto {
+    fn from(severity: Severity) -> Self {
+        match severity {
+            Severity::Info => Self::Info,
+            Severity::Warning => Self::Warning,
+            Severity::Error => Self::Error,
+        }
+    }
+}
+
+/// Where a finding's anchor lands in the displayed diff.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, specta::Type)]
+pub struct FindingLocationDto {
+    pub file: u32,
+    pub row: u32,
+}
+
+impl From<AnchorLocation> for FindingLocationDto {
+    fn from(location: AnchorLocation) -> Self {
+        Self {
+            file: as_u32(location.file),
+            row: as_u32(location.row),
+        }
+    }
+}
+
+/// A suggestion a review backend proposed, waiting for the reviewer to act on it.
+#[derive(Clone, Debug, Serialize, specta::Type)]
+pub struct FindingDto {
+    pub id: u32,
+    pub severity: SeverityDto,
+    /// Rounded to a whole percentage; a fraction reads as odd precision to a
+    /// reviewer deciding whether to spend attention on it.
+    pub confidence: u32,
+    pub title: String,
+    pub rationale: String,
+    /// Guidance paths this finding cites, e.g. "AGENTS.md".
+    pub citations: Vec<String>,
+    /// The backend that proposed this, e.g. "claude-code".
+    pub origin: String,
+    /// "path:line", absent for a finding about the change as a whole.
+    pub position: Option<String>,
+    pub is_selected: bool,
+}
+
 /// The caveats under the panel: what was refused, and what was never looked at.
 #[derive(Clone, Debug, Serialize, specta::Type)]
 pub struct PanelFooterDto {
@@ -301,7 +354,66 @@ pub struct ReviewPanelDto {
     pub guidance: GuidanceDto,
     pub run: ReviewRunDto,
     pub note: Option<PanelNoteDto>,
+    /// Waiting for the reviewer, most severe and most confident first.
+    pub findings: Vec<FindingDto>,
     pub footer: Option<PanelFooterDto>,
+}
+
+/// What accepting a finding left for the panel to do.
+#[derive(Clone, Debug, Serialize, specta::Type)]
+#[serde(tag = "outcome")]
+pub enum AcceptDispositionDto {
+    /// Became a draft at the anchor, which the diff now shows the mark for.
+    Drafted,
+    /// The anchor already held the reviewer's own draft. Neither text was
+    /// written; the panel asks whether to replace it.
+    Occupied { existing: String, proposed: String },
+    /// The finding was about the change as a whole, so it went into the summary.
+    Summary,
+    /// No pending finding had that id.
+    Unknown,
+}
+
+/// Maps what accepting a finding left for the panel to do.
+///
+/// `occupied` is the reviewer's own text and the finding's proposal, read off the
+/// session by the caller; present exactly when `disposition` is
+/// [`FindingDisposition::Composer`], which the GPUI composer opens pre-filled
+/// with and the desktop panel asks a plain replace-or-keep question about
+/// instead.
+#[must_use]
+pub fn project_disposition(
+    disposition: &FindingDisposition,
+    occupied: Option<(String, String)>,
+) -> AcceptDispositionDto {
+    match disposition {
+        FindingDisposition::Drafted => AcceptDispositionDto::Drafted,
+        FindingDisposition::Composer { .. } => {
+            let (existing, proposed) =
+                occupied.expect("an occupied disposition always carries its two texts");
+            AcceptDispositionDto::Occupied { existing, proposed }
+        }
+        FindingDisposition::Summary { .. } => AcceptDispositionDto::Summary,
+        FindingDisposition::Unknown => AcceptDispositionDto::Unknown,
+    }
+}
+
+/// What accepting or replacing a finding answers with.
+#[derive(Clone, Debug, Serialize, specta::Type)]
+pub struct AcceptOutcomeDto {
+    pub panel: ReviewPanelDto,
+    /// The selected file's drafts, refreshed in case the finding landed there.
+    pub drafts: DraftsDto,
+    pub disposition: AcceptDispositionDto,
+}
+
+/// What revealing a finding, or selecting the next one, answers with.
+#[derive(Clone, Debug, Serialize, specta::Type)]
+pub struct RevealOutcomeDto {
+    pub panel: ReviewPanelDto,
+    /// Absent for a finding about the change as a whole, which has nowhere to
+    /// scroll to.
+    pub location: Option<FindingLocationDto>,
 }
 
 #[derive(Clone, Debug, Serialize, specta::Type)]
@@ -748,8 +860,7 @@ pub fn project_drafts(session: &ReviewSession, file_index: usize) -> DraftsDto {
 /// on.
 ///
 /// Mirrors `crates/ui/src/findings.rs`, which is the parity target: the same copy
-/// in the same order, read off the same model. The findings list itself is not
-/// projected yet.
+/// in the same order, read off the same model.
 #[must_use]
 pub fn project_panel(review: &ReviewModel) -> Option<ReviewPanelDto> {
     if !review.findings_panel_visible() {
@@ -757,6 +868,7 @@ pub fn project_panel(review: &ReviewModel) -> Option<ReviewPanelDto> {
     }
     let session = review.session();
     let run = review.run();
+    let selected = review.selected_finding();
     Some(ReviewPanelDto {
         revision: review.revision(),
         heading: match session.findings().len() {
@@ -767,8 +879,46 @@ pub fn project_panel(review: &ReviewModel) -> Option<ReviewPanelDto> {
         guidance: project_guidance(session.guidance(), review.guidance_expanded()),
         run: project_run(run),
         note: project_note(session, run),
+        findings: session
+            .findings()
+            .accepted()
+            .iter()
+            .map(|finding| project_finding(finding, selected))
+            .collect(),
         footer: project_footer(session, run),
     })
+}
+
+fn project_finding(finding: &Finding, selected: Option<domain::FindingId>) -> FindingDto {
+    FindingDto {
+        id: finding.id.0,
+        severity: finding.severity.into(),
+        confidence: confidence_percent(finding.confidence),
+        title: finding.title.clone(),
+        rationale: finding.rationale.clone(),
+        citations: finding
+            .guidance_sources
+            .iter()
+            .map(|source| source.path.to_string())
+            .collect(),
+        origin: finding.origin.to_string(),
+        position: finding
+            .anchor
+            .as_ref()
+            .map(|anchor| format!("{}:{}", anchor.path, anchor.line)),
+        is_selected: selected == Some(finding.id),
+    }
+}
+
+/// A finding's confidence as a whole percentage, mirroring the GPUI panel.
+fn confidence_percent(confidence: f32) -> u32 {
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "confidence is validated into 0..=1 before it reaches a view"
+    )]
+    let percent = (confidence * 100.0).round() as u32;
+    percent
 }
 
 fn project_guidance(guidance: &GuidanceSelection, expanded: bool) -> GuidanceDto {

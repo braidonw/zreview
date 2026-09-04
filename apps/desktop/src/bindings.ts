@@ -162,6 +162,8 @@ export const commands = {
 	guidance: GuidanceDto,
 	run: ReviewRunDto,
 	note: PanelNoteDto | null,
+	/**  Waiting for the reviewer, most severe and most confident first. */
+	findings: FindingDto[],
 	footer: PanelFooterDto | null,
 } | null, SessionFailureDto>(__TAURI_INVOKE("review_panel")),
 	/**
@@ -189,6 +191,8 @@ export const commands = {
 	guidance: GuidanceDto,
 	run: ReviewRunDto,
 	note: PanelNoteDto | null,
+	/**  Waiting for the reviewer, most severe and most confident first. */
+	findings: FindingDto[],
 	footer: PanelFooterDto | null,
 } | null, SessionFailureDto>(__TAURI_INVOKE("run_review", { onProgress })),
 	/**
@@ -209,6 +213,8 @@ export const commands = {
 	guidance: GuidanceDto,
 	run: ReviewRunDto,
 	note: PanelNoteDto | null,
+	/**  Waiting for the reviewer, most severe and most confident first. */
+	findings: FindingDto[],
 	footer: PanelFooterDto | null,
 } | null, SessionFailureDto>(__TAURI_INVOKE("cancel_review")),
 	/**
@@ -229,6 +235,8 @@ export const commands = {
 	guidance: GuidanceDto,
 	run: ReviewRunDto,
 	note: PanelNoteDto | null,
+	/**  Waiting for the reviewer, most severe and most confident first. */
+	findings: FindingDto[],
 	footer: PanelFooterDto | null,
 } | null, SessionFailureDto>(__TAURI_INVOKE("toggle_guidance_panel")),
 	/**
@@ -250,11 +258,121 @@ export const commands = {
 	guidance: GuidanceDto,
 	run: ReviewRunDto,
 	note: PanelNoteDto | null,
+	/**  Waiting for the reviewer, most severe and most confident first. */
+	findings: FindingDto[],
 	footer: PanelFooterDto | null,
 } | null, SessionFailureDto>(__TAURI_INVOKE("toggle_guidance", { path })),
+	/**
+	 *  Accepts a finding, turning it into a draft where the model allows it.
+	 * 
+	 *  Refuses to overwrite the reviewer's own draft. The disposition answers
+	 *  `Occupied` instead, and the panel asks whether to replace it.
+	 * 
+	 *  # Errors
+	 * 
+	 *  Returns a failure when no session is open.
+	 */
+	acceptFinding: (id: number) => typedError<{
+	panel: ReviewPanelDto,
+	/**  The selected file's drafts, refreshed in case the finding landed there. */
+	drafts: DraftsDto,
+	disposition: AcceptDispositionDto,
+} | null, SessionFailureDto>(__TAURI_INVOKE("accept_finding", { id })),
+	/**
+	 *  Forces a finding onto its anchor, overwriting the reviewer's own draft there.
+	 * 
+	 *  Reached only once the reviewer has chosen to replace what they wrote, after
+	 *  `accept_finding` answered with the confirmation.
+	 * 
+	 *  # Errors
+	 * 
+	 *  Returns a failure when no session is open.
+	 */
+	overwriteFinding: (id: number) => typedError<{
+	panel: ReviewPanelDto,
+	/**  The selected file's drafts, refreshed in case the finding landed there. */
+	drafts: DraftsDto,
+	disposition: AcceptDispositionDto,
+} | null, SessionFailureDto>(__TAURI_INVOKE("overwrite_finding", { id })),
+	/**
+	 *  Dismisses a finding, recording the decision so a later run suppresses the
+	 *  same claim.
+	 * 
+	 *  # Errors
+	 * 
+	 *  Returns a failure when no session is open.
+	 */
+	dismissFinding: (id: number) => typedError<{
+	/**
+	 *  How many times the panel has changed, so a snapshot that was read before
+	 *  a change can be told from one that carries it.
+	 */
+	revision: number,
+	/**  "Review" before there is anything to act on, otherwise the finding count. */
+	heading: string,
+	guidance: GuidanceDto,
+	run: ReviewRunDto,
+	note: PanelNoteDto | null,
+	/**  Waiting for the reviewer, most severe and most confident first. */
+	findings: FindingDto[],
+	footer: PanelFooterDto | null,
+} | null, SessionFailureDto>(__TAURI_INVOKE("dismiss_finding", { id })),
+	/**
+	 *  Selects a finding, scrolling the diff to its anchor and selecting the row.
+	 * 
+	 *  # Errors
+	 * 
+	 *  Returns a failure when no session is open.
+	 */
+	revealFinding: (id: number) => typedError<{
+	panel: ReviewPanelDto,
+	/**
+	 *  Absent for a finding about the change as a whole, which has nowhere to
+	 *  scroll to.
+	 */
+	location: FindingLocationDto | null,
+} | null, SessionFailureDto>(__TAURI_INVOKE("reveal_finding", { id })),
+	/**
+	 *  Moves the selection to the finding after the one selected, wrapping to the
+	 *  first, and scrolls the diff to show it.
+	 * 
+	 *  # Errors
+	 * 
+	 *  Returns a failure when no session is open.
+	 */
+	selectNextFinding: () => typedError<{
+	panel: ReviewPanelDto,
+	/**
+	 *  Absent for a finding about the change as a whole, which has nowhere to
+	 *  scroll to.
+	 */
+	location: FindingLocationDto | null,
+} | null, SessionFailureDto>(__TAURI_INVOKE("select_next_finding")),
 };
 
 /* Types */
+/**  What accepting a finding left for the panel to do. */
+export type AcceptDispositionDto = 
+/**  Became a draft at the anchor, which the diff now shows the mark for. */
+{ outcome: "Drafted" } | 
+/**
+ *  The anchor already held the reviewer's own draft. Neither text was
+ *  written; the panel asks whether to replace it.
+ */
+{ outcome: "Occupied"; existing: string; proposed: string } | 
+/**  The finding was about the change as a whole, so it went into the summary. */
+{ outcome: "Summary" } | 
+/**  No pending finding had that id. */
+{ outcome: "Unknown" };
+
+/**  What accepting or replacing a finding answers with. */
+export type AcceptOutcomeDto = {
+	panel: ReviewPanelDto,
+	/**  The selected file's drafts, refreshed in case the finding landed there. */
+	drafts: DraftsDto,
+	disposition: AcceptDispositionDto,
+};
+
 /**  A draft resolved to the row it is drawn on. */
 export type AnchoredDraftDto = {
 	row: number,
@@ -323,6 +441,32 @@ export type FileSummaryDto = {
 	deletions: number,
 	viewed: boolean,
 	thread_count: number,
+};
+
+/**  A suggestion a review backend proposed, waiting for the reviewer to act on it. */
+export type FindingDto = {
+	id: number,
+	severity: SeverityDto,
+	/**
+	 *  Rounded to a whole percentage; a fraction reads as odd precision to a
+	 *  reviewer deciding whether to spend attention on it.
+	 */
+	confidence: number,
+	title: string,
+	rationale: string,
+	/**  Guidance paths this finding cites, e.g. "AGENTS.md". */
+	citations: string[],
+	/**  The backend that proposed this, e.g. "claude-code". */
+	origin: string,
+	/**  "path:line", absent for a finding about the change as a whole. */
+	position: string | null,
+	is_selected: boolean,
+};
+
+/**  Where a finding's anchor lands in the displayed diff. */
+export type FindingLocationDto = {
+	file: number,
+	row: number,
 };
 
 /**  The guidance section at the top of the panel. */
@@ -488,6 +632,16 @@ export type RefusalDto = {
 	reason: string,
 };
 
+/**  What revealing a finding, or selecting the next one, answers with. */
+export type RevealOutcomeDto = {
+	panel: ReviewPanelDto,
+	/**
+	 *  Absent for a finding about the change as a whole, which has nowhere to
+	 *  scroll to.
+	 */
+	location: FindingLocationDto | null,
+};
+
 /**
  *  The Session's right-hand panel: what a review is held to, and how far the run
  *  that populates it has got.
@@ -503,6 +657,8 @@ export type ReviewPanelDto = {
 	guidance: GuidanceDto,
 	run: ReviewRunDto,
 	note: PanelNoteDto | null,
+	/**  Waiting for the reviewer, most severe and most confident first. */
+	findings: FindingDto[],
 	footer: PanelFooterDto | null,
 };
 
@@ -546,6 +702,9 @@ export type SessionSnapshotDto = {
 	sidebar: SidebarDto,
 	warnings: SessionFailureDto[],
 };
+
+/**  How much a finding claims to matter. */
+export type SeverityDto = "Info" | "Warning" | "Error";
 
 export type SidebarDto = {
 	files: FileSummaryDto[],

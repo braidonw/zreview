@@ -289,6 +289,36 @@ impl SessionModel {
         disposition
     }
 
+    /// Forces a finding onto its anchor, overwriting the reviewer's own draft
+    /// there.
+    ///
+    /// Only reached after the reviewer has been asked and chosen to replace what
+    /// they wrote; `accept_finding` refuses this on its own. Reports whether a
+    /// pending finding still had that id.
+    pub fn overwrite_finding(&mut self, id: FindingId) -> bool {
+        let Self {
+            phase, review_sink, ..
+        } = self;
+        let SessionPhase::Ready(review) = phase else {
+            return false;
+        };
+        let Some((anchor, body)) = review.session.overwrite_finding(id) else {
+            return false;
+        };
+        let provenance = review
+            .session
+            .drafts()
+            .get(&anchor)
+            .and_then(|draft| draft.provenance.clone());
+        review.reselect_finding();
+        if let (Some(sink), Some(provenance)) = (review_sink.as_deref(), provenance) {
+            sink.save(&anchor, &body);
+            sink.save_provenance(&anchor, &provenance);
+        }
+        review.touch();
+        true
+    }
+
     /// Rejects a claim and remembers the decision, so a re-run does not offer it
     /// again.
     pub fn dismiss_finding(&mut self, id: FindingId) -> bool {
@@ -969,6 +999,39 @@ mod tests {
         assert_eq!(sink.calls().len(), before, "nothing was written");
     }
 
+    /// The desktop panel's alternative to the composer: overwrite rather than
+    /// merge, chosen only once the reviewer has been asked.
+    #[test]
+    fn overwriting_a_findings_own_line_replaces_the_reviewers_draft() {
+        let sink = RecordingSink::default();
+        let mut model = ready_model(Some(Box::new(sink.clone())));
+        assert!(model.draft_edited(1..=1, "mine".to_owned()));
+        let id = give_one_finding(&mut model, "unchecked index");
+        let before = sink.calls().len();
+
+        assert!(model.overwrite_finding(id));
+
+        assert_eq!(
+            &sink.calls()[before..],
+            [
+                "save src/review.rs 2 Handle the failure here.".to_owned(),
+                "provenance src/review.rs 2 claude-code".to_owned(),
+            ]
+        );
+        let session = review(&model).session();
+        assert!(session.findings().is_empty(), "acted on");
+        let draft = session.draft_at(0, 1).expect("the draft is there");
+        assert_eq!(draft.body, "Handle the failure here.");
+        assert!(draft.is_proposed());
+    }
+
+    #[test]
+    fn overwriting_an_unknown_finding_changes_nothing() {
+        let mut model = ready_model(None);
+
+        assert!(!model.overwrite_finding(FindingId(7)));
+    }
+
     #[test]
     fn a_finding_about_the_whole_change_goes_into_the_summary() {
         let sink = RecordingSink::default();
@@ -1132,7 +1195,11 @@ mod tests {
         revision = bumped(&model, revision, "findings arriving again");
 
         assert_eq!(model.accept_finding(id), FindingDisposition::Drafted);
-        bumped(&model, revision, "accepting a finding");
+        revision = bumped(&model, revision, "accepting a finding");
+
+        let id = give_one_finding(&mut model, "occupying its own line");
+        assert!(model.overwrite_finding(id));
+        bumped(&model, revision, "overwriting a finding");
     }
 
     /// The panel shows the latest line, so a report that arrives once the run is

@@ -734,6 +734,32 @@ impl ReviewSession {
         FindingAcceptance::Drafted { anchor, body }
     }
 
+    /// Forces a finding's proposed comment onto its anchor, overwriting whatever
+    /// the reviewer wrote there.
+    ///
+    /// Used only after the reviewer has explicitly chosen to replace their own
+    /// words with a finding [`accept_finding`] refused to write over. Returns
+    /// `None` for an id that no longer names a pending finding, or a finding with
+    /// nowhere to anchor, and changes nothing in either case.
+    ///
+    /// [`accept_finding`]: Self::accept_finding
+    pub fn overwrite_finding(&mut self, id: FindingId) -> Option<(DiffAnchor, String)> {
+        let finding = self.findings.get(id)?;
+        let anchor = finding.anchor.clone()?;
+        let location = finding.location?;
+        let provenance = finding.provenance();
+        let body = finding.proposed_comment.clone();
+        Arc::make_mut(&mut self.drafts).insert_with(
+            anchor.clone(),
+            body.clone(),
+            Some(provenance),
+            location.file,
+            location.row,
+        );
+        self.findings.take(id);
+        Some((anchor, body))
+    }
+
     /// Dismisses a finding and remembers the decision.
     ///
     /// Returns the fingerprint to persist, so the same claim is not offered again on
@@ -1299,6 +1325,40 @@ mod tests {
         assert_eq!(
             session.draft_at(0, 6).map(|draft| draft.body.as_str()),
             Some("mine, and also: handle the failure")
+        );
+    }
+
+    /// The reviewer's alternative to `retire_finding` by hand: overwrite rather
+    /// than merge.
+    #[test]
+    fn overwriting_an_occupied_anchor_replaces_the_reviewers_draft_and_keeps_provenance() {
+        let mut session = anchored_session();
+        session.set_draft(0, 6, "I already said something here");
+        let raw = raw_finding(&session, 6, "unchecked index");
+        with_findings(&mut session, vec![raw]);
+        let id = session.findings().accepted()[0].id;
+
+        let (anchor, body) = session
+            .overwrite_finding(id)
+            .expect("the finding is pending");
+
+        assert_eq!(body, "Handle the failure here.");
+        let draft = session.drafts().get(&anchor).expect("the draft is there");
+        assert_eq!(draft.body, "Handle the failure here.");
+        assert!(draft.is_proposed());
+        assert!(session.findings().is_empty(), "acted on");
+    }
+
+    #[test]
+    fn overwriting_an_unknown_finding_changes_nothing() {
+        let mut session = anchored_session();
+        session.set_draft(0, 6, "mine");
+
+        assert!(session.overwrite_finding(FindingId(7)).is_none());
+
+        assert_eq!(
+            session.draft_at(0, 6).map(|draft| draft.body.as_str()),
+            Some("mine")
         );
     }
 
