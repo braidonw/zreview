@@ -220,7 +220,7 @@ describe("ReviewPanel", () => {
           findings: [
             makeFinding({
               severity: "Error",
-              confidence: 82,
+              confidence_percent: 82,
               title: "Unchecked index",
               rationale: "This can panic on an empty slice.",
               citations: ["AGENTS.md", "src/AGENTS.md"],
@@ -244,7 +244,7 @@ describe("ReviewPanel", () => {
     expect(screen.queryByText("No review has been run.")).toBeNull();
   });
 
-  it("shows a finding about the whole change as such, with an Accept still offered", () => {
+  it("shows a finding about the whole change as such, offering no Accept", () => {
     render(
       <ReviewPanel
         panel={makePanel({ findings: [makeFinding({ position: null, title: "no tests anywhere" })] })}
@@ -253,7 +253,10 @@ describe("ReviewPanel", () => {
     );
 
     expect(screen.getByText("whole change")).toBeTruthy();
-    expect(screen.getByRole("button", { name: "Accept" })).toBeTruthy();
+    // The desktop has no summary editor yet, so accepting a whole-change
+    // finding would write to storage the reviewer would never see.
+    expect(screen.queryByRole("button", { name: "Accept" })).toBeNull();
+    expect(screen.getByRole("button", { name: "Dismiss" })).toBeTruthy();
   });
 
   it("highlights the finding the model has selected", () => {
@@ -270,9 +273,9 @@ describe("ReviewPanel", () => {
     );
 
     const selected = screen.getByText("second").closest("li");
-    expect(selected?.className).toContain("review-panel__finding--selected");
+    expect(selected?.getAttribute("aria-selected")).toBe("true");
     const unselected = screen.getByText("first").closest("li");
-    expect(unselected?.className).not.toContain("review-panel__finding--selected");
+    expect(unselected?.getAttribute("aria-selected")).toBe("false");
   });
 
   it("reveals a finding when its card is clicked", async () => {
@@ -321,9 +324,10 @@ describe("ReviewPanel", () => {
       />,
     );
 
-    expect(
-      screen.getByText("This line already has your comment. Replace it with the proposal?"),
-    ).toBeTruthy();
+    expect(screen.getByText("Replace your comment with this proposal?")).toBeTruthy();
+    // Both texts are on screen, so nobody replaces words they cannot see.
+    expect(screen.getByText("mine")).toBeTruthy();
+    expect(screen.getByText("Handle the failure here.")).toBeTruthy();
     expect(screen.getByRole("button", { name: "Replace" })).toBeTruthy();
     expect(screen.getByRole("button", { name: "Keep" })).toBeTruthy();
     expect(screen.queryByRole("button", { name: "Accept" })).toBeNull();

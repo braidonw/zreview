@@ -229,6 +229,7 @@ function FindingCard({
       className={`review-panel__finding ${
         finding.is_selected ? "review-panel__finding--selected" : ""
       }`}
+      aria-selected={finding.is_selected}
       onClick={onReveal}
     >
       <div className="review-panel__finding-meta">
@@ -237,7 +238,7 @@ function FindingCard({
         >
           {SEVERITY_LABEL[finding.severity]}
         </span>
-        <span className="review-panel__confidence">{finding.confidence}%</span>
+        <span className="review-panel__confidence">{finding.confidence_percent}%</span>
         <span className="review-panel__position">{finding.position ?? "whole change"}</span>
       </div>
       <p className="review-panel__finding-title">{finding.title}</p>
@@ -250,7 +251,17 @@ function FindingCard({
       <p className="review-panel__finding-origin">Proposed by {finding.origin}</p>
       {conflict !== null ? (
         <div className="review-panel__finding-conflict">
-          <p>This line already has your comment. Replace it with the proposal?</p>
+          <p className="review-panel__finding-conflict-intro">
+            Replace your comment with this proposal?
+          </p>
+          <p className="review-panel__finding-conflict-text">
+            <span className="review-panel__finding-conflict-label">Your comment</span>
+            {conflict.existing}
+          </p>
+          <p className="review-panel__finding-conflict-text">
+            <span className="review-panel__finding-conflict-label">Proposal</span>
+            {conflict.proposed}
+          </p>
           <div className="review-panel__finding-actions">
             <button
               type="button"
@@ -276,16 +287,19 @@ function FindingCard({
         </div>
       ) : (
         <div className="review-panel__finding-actions">
-          <button
-            type="button"
-            className="review-panel__finding-accept"
-            onClick={(event) => {
-              event.stopPropagation();
-              onAccept();
-            }}
-          >
-            Accept
-          </button>
+          {/* No summary editor yet, so a whole-change finding can only be dismissed. */}
+          {finding.position !== null && (
+            <button
+              type="button"
+              className="review-panel__finding-accept"
+              onClick={(event) => {
+                event.stopPropagation();
+                onAccept();
+              }}
+            >
+              Accept
+            </button>
+          )}
           <button
             type="button"
             className="review-panel__finding-dismiss"

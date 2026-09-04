@@ -14,7 +14,7 @@ import {
   composerPrefill,
   draftAtRow,
   initialState,
-  selectedFindingId,
+  selectedFinding,
   selectionRange,
   sessionReducer,
 } from "./sessionReducer";
@@ -133,6 +133,19 @@ describe("sessionReducer", () => {
     const cleared = sessionReducer(asked, { type: "findingConflict", conflict: null });
 
     expect(cleared).toMatchObject({ findingConflict: null });
+  });
+
+  /**
+   * A re-run can reassign the pending finding's id to a different claim, so a
+   * panel that lands while a confirmation is showing must drop it too.
+   */
+  it("clears a pending conflict when a new panel lands", () => {
+    const conflict = { id: 3, existing: "mine", proposed: "Handle the failure here." };
+    const asked = sessionReducer(readyState(1), { type: "findingConflict", conflict });
+
+    const next = sessionReducer(asked, { type: "panel", panel: makePanel() });
+
+    expect(next).toMatchObject({ findingConflict: null });
   });
 
   it("clamps the cursor at the top of the file", () => {
@@ -305,18 +318,18 @@ describe("sessionReducer", () => {
     expect(composerPrefill(opened)).toBe("");
   });
 
-  it("finds the id of the panel's selected finding", () => {
+  it("finds the panel's selected finding", () => {
     const panel = makePanel({
       findings: [
         makeFinding({ id: 1, is_selected: false }),
         makeFinding({ id: 2, is_selected: true }),
       ],
     });
-    expect(selectedFindingId(panel)).toBe(2);
+    expect(selectedFinding(panel)?.id).toBe(2);
   });
 
   it("has no selected finding on a null panel or an empty list", () => {
-    expect(selectedFindingId(null)).toBeNull();
-    expect(selectedFindingId(makePanel({ findings: [] }))).toBeNull();
+    expect(selectedFinding(null)).toBeNull();
+    expect(selectedFinding(makePanel({ findings: [] }))).toBeNull();
   });
 });

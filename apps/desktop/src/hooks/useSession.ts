@@ -5,13 +5,14 @@ import type { DiffSideDto, FindingLocationDto, ReviewPanelDto } from "../binding
 import { commands } from "../bindings";
 import { clamp } from "../lib/clamp";
 import { toFailure } from "../lib/failure";
-import { initialState, selectedFindingId, selectionRange, sessionReducer } from "./sessionReducer";
+import { initialState, selectedFinding, selectionRange, sessionReducer } from "./sessionReducer";
 import { useDraftQueue } from "./useDraftQueue";
 
+/** What a command answering with `T`, or `null` when nothing can be reviewed. */
+type CommandResult<T> = { status: "ok"; data: T | null } | { status: "error"; error: unknown };
+
 /** What a command answering with the review panel hands back. */
-type PanelResult =
-  | { status: "ok"; data: ReviewPanelDto | null }
-  | { status: "error"; error: unknown };
+type PanelResult = CommandResult<ReviewPanelDto>;
 
 /**
  * Loads one session and exposes every action the UI can take on it.
@@ -162,6 +163,28 @@ export function useSession(description: string, isShowing: boolean) {
   );
 
   /**
+   * Applies a finding command's answer: a refusal becomes a panel notice, and
+   * an answer of `null` (nothing to review) is silently skipped. Only a real
+   * answer reaches `onData`, which the caller uses to update the rest of the
+   * state.
+   */
+  const applyFindingResult = useCallback(
+    <T,>(promise: Promise<CommandResult<T>>, onData: (data: T) => void) => {
+      promise.then((result) => {
+        if (result.status === "error") {
+          dispatch({ type: "panelNotice", notice: toFailure(result.error).summary });
+          return;
+        }
+        if (result.data === null) {
+          return;
+        }
+        onData(result.data);
+      });
+    },
+    [],
+  );
+
+  /**
    * Switches to a finding's file and selects its row, if it has one.
    *
    * A finding about the change as a whole has nowhere to scroll to, so the panel
@@ -189,63 +212,46 @@ export function useSession(description: string, isShowing: boolean) {
   /** Selects a finding, scrolling the diff to its anchor and selecting the row. */
   const revealFinding = useCallback(
     (id: number) => {
-      commands.revealFinding(id).then((result) => {
-        if (result.status === "error") {
-          dispatch({ type: "panelNotice", notice: toFailure(result.error).summary });
-          return;
-        }
-        if (result.data === null) {
-          return;
-        }
-        dispatch({ type: "panel", panel: result.data.panel });
-        applyLocation(result.data.location);
+      applyFindingResult(commands.revealFinding(id), (data) => {
+        dispatch({ type: "panel", panel: data.panel });
+        applyLocation(data.location);
       });
     },
-    [applyLocation],
+    [applyFindingResult, applyLocation],
   );
 
   /** Moves the selection to the finding after the one selected, wrapping to the first. */
   const selectNextFinding = useCallback(() => {
-    commands.selectNextFinding().then((result) => {
-      if (result.status === "error") {
-        dispatch({ type: "panelNotice", notice: toFailure(result.error).summary });
-        return;
-      }
-      if (result.data === null) {
-        return;
-      }
-      dispatch({ type: "panel", panel: result.data.panel });
-      applyLocation(result.data.location);
+    applyFindingResult(commands.selectNextFinding(), (data) => {
+      dispatch({ type: "panel", panel: data.panel });
+      applyLocation(data.location);
     });
-  }, [applyLocation]);
+  }, [applyFindingResult, applyLocation]);
 
   /**
    * Accepts a finding, turning it into a draft where the model allows it.
    *
    * When the anchor already holds the reviewer's own draft, neither text is
-   * written; the panel asks whether to replace it instead.
+   * written; the panel asks whether to replace it instead, first revealing the
+   * row so the reviewer can see what they are being asked about.
    */
-  const acceptFinding = useCallback((id: number) => {
-    commands.acceptFinding(id).then((result) => {
-      if (result.status === "error") {
-        dispatch({ type: "panelNotice", notice: toFailure(result.error).summary });
-        return;
-      }
-      if (result.data === null) {
-        return;
-      }
-      const { panel, drafts, disposition } = result.data;
-      dispatch({ type: "panel", panel });
-      dispatch({ type: "drafts", drafts });
-      dispatch({
-        type: "findingConflict",
-        conflict:
-          disposition.outcome === "Occupied"
-            ? { id, existing: disposition.existing, proposed: disposition.proposed }
-            : null,
+  const acceptFinding = useCallback(
+    (id: number) => {
+      applyFindingResult(commands.acceptFinding(id), (data) => {
+        const { panel, drafts, disposition } = data;
+        dispatch({ type: "panel", panel });
+        dispatch({ type: "drafts", drafts });
+        if (disposition.outcome === "Occupied") {
+          applyLocation(disposition.location);
+          dispatch({
+            type: "findingConflict",
+            conflict: { id, existing: disposition.existing, proposed: disposition.proposed },
+          });
+        }
       });
-    });
-  }, []);
+    },
+    [applyFindingResult, applyLocation],
+  );
 
   const dismissFinding = useCallback(
     (id: number) => {
@@ -255,21 +261,28 @@ export function useSession(description: string, isShowing: boolean) {
     [onPanel],
   );
 
-  /** Forces a finding onto its anchor, overwriting the reviewer's own draft there. */
-  const replaceFinding = useCallback((id: number) => {
-    commands.overwriteFinding(id).then((result) => {
+  /**
+   * Forces a finding onto its anchor, overwriting the reviewer's own draft
+   * there. A stale answer (the finding this was asked about no longer exists,
+   * or is no longer the one awaiting a reply) is refused rather than applied,
+   * which is surfaced as a panel notice rather than treated as success.
+   */
+  const replaceFinding = useCallback(
+    (id: number) => {
       dispatch({ type: "findingConflict", conflict: null });
-      if (result.status === "error") {
-        dispatch({ type: "panelNotice", notice: toFailure(result.error).summary });
-        return;
-      }
-      if (result.data === null) {
-        return;
-      }
-      dispatch({ type: "panel", panel: result.data.panel });
-      dispatch({ type: "drafts", drafts: result.data.drafts });
-    });
-  }, []);
+      applyFindingResult(commands.overwriteFinding(id), (data) => {
+        dispatch({ type: "panel", panel: data.panel });
+        dispatch({ type: "drafts", drafts: data.drafts });
+        if (data.disposition.outcome !== "Drafted") {
+          dispatch({
+            type: "panelNotice",
+            notice: "This finding is no longer waiting to be replaced.",
+          });
+        }
+      });
+    },
+    [applyFindingResult],
+  );
 
   /** Leaves the reviewer's draft and the finding both exactly as they were. */
   const keepFinding = useCallback(() => dispatch({ type: "findingConflict", conflict: null }), []);
@@ -360,17 +373,18 @@ export function useSession(description: string, isShowing: boolean) {
       }
       if (event.metaKey && event.shiftKey && key === "y") {
         event.preventDefault();
-        const id = selectedFindingId(current.panel);
-        if (id !== null) {
-          acceptFinding(id);
+        const finding = selectedFinding(current.panel);
+        // No summary editor yet, so a whole-change finding cannot be accepted.
+        if (finding !== null && finding.position !== null) {
+          acceptFinding(finding.id);
         }
         return;
       }
       if (event.metaKey && event.shiftKey && key === "d") {
         event.preventDefault();
-        const id = selectedFindingId(current.panel);
-        if (id !== null) {
-          dismissFinding(id);
+        const finding = selectedFinding(current.panel);
+        if (finding !== null) {
+          dismissFinding(finding.id);
         }
         return;
       }

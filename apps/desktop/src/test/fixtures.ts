@@ -134,7 +134,7 @@ export function makeFinding(overrides: Partial<FindingDto> = {}): FindingDto {
   return {
     id: 1,
     severity: "Warning",
-    confidence: 90,
+    confidence_percent: 90,
     title: "Unchecked index",
     rationale: "This can panic on an empty slice.",
     citations: ["AGENTS.md"],

@@ -553,7 +553,12 @@ describe("findings in the review panel", () => {
       data: {
         panel: panelWithFinding(),
         drafts: makeDrafts(),
-        disposition: { outcome: "Occupied", existing: "mine", proposed: "Handle the failure here." },
+        disposition: {
+          outcome: "Occupied",
+          existing: "mine",
+          proposed: "Handle the failure here.",
+          location: { file: 0, row: 0 },
+        },
       },
     });
     overwriteFinding.mockResolvedValue({
@@ -570,9 +575,7 @@ describe("findings in the review panel", () => {
 
     await user.click(screen.getByRole("button", { name: "Accept" }));
     await waitFor(() =>
-      expect(
-        screen.getByText("This line already has your comment. Replace it with the proposal?"),
-      ).toBeTruthy(),
+      expect(screen.getByText("Replace your comment with this proposal?")).toBeTruthy(),
     );
 
     await user.click(screen.getByRole("button", { name: "Replace" }));
@@ -589,7 +592,12 @@ describe("findings in the review panel", () => {
       data: {
         panel: panelWithFinding(),
         drafts: makeDrafts(),
-        disposition: { outcome: "Occupied", existing: "mine", proposed: "Handle the failure here." },
+        disposition: {
+          outcome: "Occupied",
+          existing: "mine",
+          proposed: "Handle the failure here.",
+          location: { file: 0, row: 0 },
+        },
       },
     });
     await openPanel();

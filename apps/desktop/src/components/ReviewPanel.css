@@ -310,6 +310,26 @@
   margin: 0 0 4px;
 }
 
+.review-panel__finding-conflict-intro {
+  color: var(--text-primary);
+}
+
+.review-panel__finding-conflict-text {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 4px 6px;
+  border-radius: 4px;
+  background: var(--surface-overlay);
+  white-space: pre-wrap;
+}
+
+.review-panel__finding-conflict-label {
+  color: var(--text-tertiary);
+  text-transform: uppercase;
+  font-size: 10px;
+}
+
 .review-panel__footer {
   flex-shrink: 0;
   padding: 8px 12px;

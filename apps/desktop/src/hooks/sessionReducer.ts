@@ -2,6 +2,7 @@ import type {
   AnchoredDraftDto,
   DraftsDto,
   FileDetailDto,
+  FindingDto,
   ReviewPanelDto,
   SessionFailureDto,
   SessionSnapshotDto,
@@ -128,7 +129,10 @@ export function sessionReducer(state: SessionState, action: SessionAction): Sess
       if (stale) {
         return state;
       }
-      return { ...state, panel: action.panel, panelNotice: null };
+      // A finding's id can come to mean a different claim after a re-run, so a
+      // pending replace-or-keep confirmation cannot be trusted across any new
+      // panel and is dropped along with it.
+      return { ...state, panel: action.panel, panelNotice: null, findingConflict: null };
     }
 
     case "panelNotice":
@@ -240,7 +244,7 @@ export function composerPrefill(state: ReadyState): string {
   return draftAtRow(state.drafts, state.composer.rows[1])?.body ?? "";
 }
 
-/** The id of the finding the panel currently has selected, if any. */
-export function selectedFindingId(panel: ReviewPanelDto | null): number | null {
-  return panel?.findings.find((finding) => finding.is_selected)?.id ?? null;
+/** The finding the panel currently has selected, if any. */
+export function selectedFinding(panel: ReviewPanelDto | null): FindingDto | null {
+  return panel?.findings.find((finding) => finding.is_selected) ?? null;
 }
