@@ -319,7 +319,7 @@ pub struct FindingDto {
     pub severity: SeverityDto,
     /// Rounded to a whole percentage; a fraction reads as odd precision to a
     /// reviewer deciding whether to spend attention on it.
-    pub confidence: u32,
+    pub confidence_percent: u32,
     pub title: String,
     pub rationale: String,
     /// Guidance paths this finding cites, e.g. "AGENTS.md".
@@ -366,8 +366,13 @@ pub enum AcceptDispositionDto {
     /// Became a draft at the anchor, which the diff now shows the mark for.
     Drafted,
     /// The anchor already held the reviewer's own draft. Neither text was
-    /// written; the panel asks whether to replace it.
-    Occupied { existing: String, proposed: String },
+    /// written; the panel asks whether to replace it. `location` is where
+    /// accepting it should first reveal, as the GPUI composer path does.
+    Occupied {
+        existing: String,
+        proposed: String,
+        location: FindingLocationDto,
+    },
     /// The finding was about the change as a whole, so it went into the summary.
     Summary,
     /// No pending finding had that id.
@@ -376,22 +381,26 @@ pub enum AcceptDispositionDto {
 
 /// Maps what accepting a finding left for the panel to do.
 ///
-/// `occupied` is the reviewer's own text and the finding's proposal, read off the
-/// session by the caller; present exactly when `disposition` is
-/// [`FindingDisposition::Composer`], which the GPUI composer opens pre-filled
-/// with and the desktop panel asks a plain replace-or-keep question about
-/// instead.
+/// `occupied` is the reviewer's own text, the finding's proposal, and where it
+/// sits, read off the session by the caller; present exactly when
+/// `disposition` is [`FindingDisposition::Composer`], which the GPUI composer
+/// opens pre-filled with and the desktop panel asks a plain replace-or-keep
+/// question about instead.
 #[must_use]
 pub fn project_disposition(
     disposition: &FindingDisposition,
-    occupied: Option<(String, String)>,
+    occupied: Option<(String, String, AnchorLocation)>,
 ) -> AcceptDispositionDto {
     match disposition {
         FindingDisposition::Drafted => AcceptDispositionDto::Drafted,
         FindingDisposition::Composer { .. } => {
-            let (existing, proposed) =
-                occupied.expect("an occupied disposition always carries its two texts");
-            AcceptDispositionDto::Occupied { existing, proposed }
+            let (existing, proposed, location) = occupied
+                .expect("an occupied disposition always carries its two texts and location");
+            AcceptDispositionDto::Occupied {
+                existing,
+                proposed,
+                location: location.into(),
+            }
         }
         FindingDisposition::Summary { .. } => AcceptDispositionDto::Summary,
         FindingDisposition::Unknown => AcceptDispositionDto::Unknown,
@@ -859,8 +868,9 @@ pub fn project_drafts(session: &ReviewSession, file_index: usize) -> DraftsDto {
 /// The Session's review panel, or `None` when this session has nothing to put one
 /// on.
 ///
-/// Mirrors `crates/ui/src/findings.rs`, which is the parity target: the same copy
-/// in the same order, read off the same model.
+/// Mirrors `crates/ui/src/findings.rs` for the guidance, run, and footer copy,
+/// read off the same model in the same order. The finding card goes further,
+/// adding the rationale and the proposing backend that the GPUI list omits.
 #[must_use]
 pub fn project_panel(review: &ReviewModel) -> Option<ReviewPanelDto> {
     if !review.findings_panel_visible() {
@@ -893,7 +903,7 @@ fn project_finding(finding: &Finding, selected: Option<domain::FindingId>) -> Fi
     FindingDto {
         id: finding.id.0,
         severity: finding.severity.into(),
-        confidence: confidence_percent(finding.confidence),
+        confidence_percent: confidence_percent(finding.confidence),
         title: finding.title.clone(),
         rationale: finding.rationale.clone(),
         citations: finding

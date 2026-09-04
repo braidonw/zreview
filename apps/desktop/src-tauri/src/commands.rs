@@ -597,7 +597,7 @@ fn accept_finding_on_model(
 ) -> Option<dto::AcceptOutcomeDto> {
     let mut guard = lock(model);
     let finding_id = FindingId(id);
-    // Read before the call: an occupied disposition leaves the finding pending,
+    // Read before the call. An occupied disposition leaves the finding pending,
     // but its proposed text is needed for the confirmation regardless.
     let proposed = match guard.phase() {
         SessionPhase::Ready(review) => review
@@ -615,31 +615,29 @@ fn accept_finding_on_model(
 /// Forces a finding onto its anchor, overwriting the reviewer's own draft there.
 ///
 /// Reached only once the reviewer has chosen to replace what they wrote, after
-/// `accept_finding` answered with the confirmation.
+/// `accept_finding` answered with the confirmation. Refused, with an `Unknown`
+/// disposition, for any id other than the one the reviewer was actually asked
+/// about.
 fn overwrite_finding_on_model(
     model: &Mutex<app::SessionModel>,
     id: u32,
 ) -> Option<dto::AcceptOutcomeDto> {
     let mut guard = lock(model);
-    let disposition = if guard.overwrite_finding(FindingId(id)) {
-        app::FindingDisposition::Drafted
-    } else {
-        app::FindingDisposition::Unknown
-    };
+    let disposition = guard.overwrite_finding(FindingId(id));
     accept_outcome(&guard, &disposition, None)
 }
 
-/// The reviewer's own text and the finding's proposal, when accepting answered
-/// with [`app::FindingDisposition::Composer`].
+/// The reviewer's own text, the finding's proposal, and where it sits, when
+/// accepting answered with [`app::FindingDisposition::Composer`].
 ///
-/// The GPUI composer merges both into one seed string to open pre-filled; the
-/// desktop panel needs them apart to ask its replace-or-keep question, so they
-/// are read straight off the session instead.
+/// The GPUI composer merges the two texts into one seed string to open
+/// pre-filled; the desktop panel needs them apart to ask its replace-or-keep
+/// question, so they are read straight off the session instead.
 fn occupied_texts(
     model: &app::SessionModel,
     disposition: &app::FindingDisposition,
     proposed: Option<String>,
-) -> Option<(String, String)> {
+) -> Option<(String, String, AnchorLocation)> {
     let app::FindingDisposition::Composer { location, .. } = disposition else {
         return None;
     };
@@ -649,9 +647,12 @@ fn occupied_texts(
     let existing = review
         .session()
         .draft_at(location.file, location.row)
-        .map(|draft| draft.body.clone())
-        .unwrap_or_default();
-    Some((existing, proposed.unwrap_or_default()))
+        .expect("a Composer disposition means the anchor holds a draft")
+        .body
+        .clone();
+    let proposed = proposed
+        .expect("a Composer disposition means the finding still holds its proposed comment");
+    Some((existing, proposed, *location))
 }
 
 /// Bundles the panel and the selected file's drafts with a mapped disposition.
@@ -660,7 +661,7 @@ fn occupied_texts(
 fn accept_outcome(
     model: &app::SessionModel,
     disposition: &app::FindingDisposition,
-    occupied: Option<(String, String)>,
+    occupied: Option<(String, String, AnchorLocation)>,
 ) -> Option<dto::AcceptOutcomeDto> {
     let panel = panel_of(model)?;
     let selected = match model.phase() {
@@ -3391,7 +3392,12 @@ mod tests {
 
         let outcome = accept_finding_on_model(&model, id).expect("the session can be reviewed");
 
-        let dto::AcceptDispositionDto::Occupied { existing, proposed } = outcome.disposition else {
+        let dto::AcceptDispositionDto::Occupied {
+            existing,
+            proposed,
+            location,
+        } = outcome.disposition
+        else {
             panic!(
                 "expected an occupied disposition, got {:?}",
                 outcome.disposition
@@ -3399,6 +3405,7 @@ mod tests {
         };
         assert_eq!(existing, "mine");
         assert_eq!(proposed, "Handle the failure here.");
+        assert_eq!(location, dto::FindingLocationDto { file: 0, row: 1 });
         assert_eq!(outcome.panel.findings.len(), 1, "still pending");
     }
 
@@ -3499,13 +3506,22 @@ mod tests {
     fn the_footer_survives_a_run_that_also_found_findings() {
         let repository = guided_repository();
         let model = local_model(&local_request(&repository), &ReviewStorage::Disabled);
-        let backend = FakeBackend::new(Vec::new(), Ok(vec![raw_finding_on(2, "unchecked index")]));
+        // A line outside the diff is refused, so the run keeps one claim and
+        // rejects another, which is the shape the criterion is about.
+        let backend = FakeBackend::new(
+            Vec::new(),
+            Ok(vec![
+                raw_finding_on(2, "unchecked index"),
+                raw_finding_on(9999, "impossible"),
+            ]),
+        );
 
         let (finished, _) = run_with(&model, &backend);
 
         let panel = finished.expect("the session can be reviewed");
         assert_eq!(panel.findings.len(), 1);
         let footer = panel.footer.expect("a partial review says it was partial");
+        assert_eq!(footer.refused, Some("1 claim(s) refused".to_owned()));
         assert_eq!(footer.unreviewed, vec!["vendor/lib.rs".to_owned()]);
     }
 }

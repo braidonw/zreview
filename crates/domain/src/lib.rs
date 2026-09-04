@@ -1328,8 +1328,8 @@ mod tests {
         );
     }
 
-    /// The reviewer's alternative to `retire_finding` by hand: overwrite rather
-    /// than merge.
+    /// The reviewer's alternative to `retire_finding` by hand. Overwrites rather
+    /// than merging.
     #[test]
     fn overwriting_an_occupied_anchor_replaces_the_reviewers_draft_and_keeps_provenance() {
         let mut session = anchored_session();

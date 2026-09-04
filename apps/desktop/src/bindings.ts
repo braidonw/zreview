@@ -357,9 +357,10 @@ export type AcceptDispositionDto =
 { outcome: "Drafted" } | 
 /**
  *  The anchor already held the reviewer's own draft. Neither text was
- *  written; the panel asks whether to replace it.
+ *  written; the panel asks whether to replace it. `location` is where
+ *  accepting it should first reveal, as the GPUI composer path does.
  */
-{ outcome: "Occupied"; existing: string; proposed: string } | 
+{ outcome: "Occupied"; existing: string; proposed: string; location: FindingLocationDto } | 
 /**  The finding was about the change as a whole, so it went into the summary. */
 { outcome: "Summary" } | 
 /**  No pending finding had that id. */
@@ -451,7 +452,7 @@ export type FindingDto = {
 	 *  Rounded to a whole percentage; a fraction reads as odd precision to a
 	 *  reviewer deciding whether to spend attention on it.
 	 */
-	confidence: number,
+	confidence_percent: number,
 	title: string,
 	rationale: string,
 	/**  Guidance paths this finding cites, e.g. "AGENTS.md". */

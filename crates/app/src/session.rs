@@ -283,6 +283,10 @@ impl SessionModel {
             }
             FindingAcceptance::Unknown => FindingDisposition::Unknown,
         };
+        // Recomputed on every call, so a fresh accept always names the finding it
+        // just asked about, whatever an earlier call left behind.
+        review.pending_replace =
+            matches!(disposition, FindingDisposition::Composer { .. }).then_some(id);
         if !matches!(disposition, FindingDisposition::Unknown) {
             review.touch();
         }
@@ -293,30 +297,36 @@ impl SessionModel {
     /// there.
     ///
     /// Only reached after the reviewer has been asked and chosen to replace what
-    /// they wrote; `accept_finding` refuses this on its own. Reports whether a
-    /// pending finding still had that id.
-    pub fn overwrite_finding(&mut self, id: FindingId) -> bool {
+    /// they wrote; `accept_finding` refuses this on its own. Refuses any id
+    /// other than the one that was asked about: a re-run reassigns finding ids
+    /// from zero, so an answer given before a re-run could otherwise overwrite a
+    /// draft the reviewer was never asked about.
+    pub fn overwrite_finding(&mut self, id: FindingId) -> FindingDisposition {
         let Self {
             phase, review_sink, ..
         } = self;
         let SessionPhase::Ready(review) = phase else {
-            return false;
+            return FindingDisposition::Unknown;
         };
+        if review.pending_replace != Some(id) {
+            return FindingDisposition::Unknown;
+        }
         let Some((anchor, body)) = review.session.overwrite_finding(id) else {
-            return false;
+            return FindingDisposition::Unknown;
         };
         let provenance = review
             .session
             .drafts()
             .get(&anchor)
             .and_then(|draft| draft.provenance.clone());
+        review.pending_replace = None;
         review.reselect_finding();
         if let (Some(sink), Some(provenance)) = (review_sink.as_deref(), provenance) {
             sink.save(&anchor, &body);
             sink.save_provenance(&anchor, &provenance);
         }
         review.touch();
-        true
+        FindingDisposition::Drafted
     }
 
     /// Rejects a claim and remembers the decision, so a re-run does not offer it
@@ -331,6 +341,7 @@ impl SessionModel {
         let Some(fingerprint) = review.session.dismiss_finding(id) else {
             return false;
         };
+        review.pending_replace = None;
         review.reselect_finding();
         if let (Some(sink), Some(head_sha)) =
             (review_sink.as_deref(), review.session.source().head_sha())
@@ -344,20 +355,18 @@ impl SessionModel {
     /// Selects a finding, returning where the diff should scroll to show it.
     ///
     /// `None` for a finding about the change as a whole, which has nowhere to
-    /// scroll to.
+    /// scroll to, or for an id that no longer names a pending finding, which
+    /// selects nothing rather than pointing the panel at a finding that is gone.
     pub fn reveal_finding(&mut self, id: FindingId) -> Option<AnchorLocation> {
         let SessionPhase::Ready(review) = &mut self.phase else {
             return None;
         };
+        let finding = review.session.findings().get(id)?;
+        let location = finding.location;
         review.selected_finding = Some(id);
-        // The selection is part of what the panel shows: every finding's row
-        // reads its own highlight off it.
+        // The selection is part of what the panel shows, so this counts as a change.
         review.touch();
-        review
-            .session
-            .findings()
-            .get(id)
-            .and_then(|finding| finding.location)
+        location
     }
 
     /// The session a review would run against, when one can be started.
@@ -381,6 +390,10 @@ impl SessionModel {
             detail: "Starting...".to_owned(),
             cancel,
         };
+        // A run in flight will reassign every finding id when it lands, so any
+        // reply still awaited from before it started names a claim that may no
+        // longer be the one it was asked about.
+        review.pending_replace = None;
         review.touch();
     }
 
@@ -417,6 +430,7 @@ impl SessionModel {
         let rejected = findings.rejected().len();
         let suppressed = review.session.set_findings(findings);
         let accepted = review.session.findings().len();
+        review.pending_replace = None;
         review.reselect_finding();
         review.run = ReviewRunState::Complete {
             accepted,
@@ -439,6 +453,7 @@ impl SessionModel {
             summary: summary.into(),
             remediation,
         };
+        review.pending_replace = None;
         review.touch();
     }
 
@@ -989,6 +1004,22 @@ mod tests {
         bumped(&model, revision, "revealing a finding");
     }
 
+    /// A click can arrive for a row a re-run has already dropped. It must select
+    /// and publish nothing, not a finding that no longer exists.
+    #[test]
+    fn revealing_a_finding_that_no_longer_exists_changes_nothing() {
+        let mut model = ready_model(None);
+        let id = give_one_finding(&mut model, "unchecked index");
+        model.review_finished(Findings::default(), Vec::new());
+        let revision = review(&model).revision();
+
+        let location = model.reveal_finding(id);
+
+        assert_eq!(location, None);
+        assert_eq!(review(&model).selected_finding(), None);
+        assert_eq!(review(&model).revision(), revision, "nothing changed");
+    }
+
     /// The reviewer's own words are never overwritten; both texts go to the
     /// composer instead, and nothing is saved until they commit.
     #[test]
@@ -1017,17 +1048,21 @@ mod tests {
         assert_eq!(sink.calls().len(), before, "nothing was written");
     }
 
-    /// The desktop panel's alternative to the composer: overwrite rather than
-    /// merge, chosen only once the reviewer has been asked.
+    /// The desktop panel's alternative to the composer. Overwrites rather than
+    /// merging, chosen only once the reviewer has been asked.
     #[test]
     fn overwriting_a_findings_own_line_replaces_the_reviewers_draft() {
         let sink = RecordingSink::default();
         let mut model = ready_model(Some(Box::new(sink.clone())));
         assert!(model.draft_edited(1..=1, "mine".to_owned()));
         let id = give_one_finding(&mut model, "unchecked index");
+        assert!(matches!(
+            model.accept_finding(id),
+            FindingDisposition::Composer { .. }
+        ));
         let before = sink.calls().len();
 
-        assert!(model.overwrite_finding(id));
+        assert_eq!(model.overwrite_finding(id), FindingDisposition::Drafted);
 
         assert_eq!(
             &sink.calls()[before..],
@@ -1047,7 +1082,54 @@ mod tests {
     fn overwriting_an_unknown_finding_changes_nothing() {
         let mut model = ready_model(None);
 
-        assert!(!model.overwrite_finding(FindingId(7)));
+        assert_eq!(
+            model.overwrite_finding(FindingId(7)),
+            FindingDisposition::Unknown
+        );
+    }
+
+    /// The gate the whole design turns on: nothing may be overwritten unless
+    /// the reviewer was actually asked about that finding.
+    #[test]
+    fn overwriting_a_finding_that_was_never_asked_about_changes_nothing() {
+        let sink = RecordingSink::default();
+        let mut model = ready_model(Some(Box::new(sink.clone())));
+        assert!(model.draft_edited(1..=1, "mine".to_owned()));
+        let id = give_one_finding(&mut model, "unchecked index");
+        let before = sink.calls().len();
+
+        // No accept_finding call happened, so nothing is awaiting a replace answer.
+        assert_eq!(model.overwrite_finding(id), FindingDisposition::Unknown);
+
+        assert_eq!(sink.calls().len(), before, "nothing was written");
+        let session = review(&model).session();
+        assert_eq!(
+            session.draft_at(0, 1).map(|draft| draft.body.as_str()),
+            Some("mine")
+        );
+        assert_eq!(session.findings().len(), 1, "the finding is still pending");
+    }
+
+    /// The premise a re-run breaks otherwise: ids reset from zero every run, so
+    /// an id asked about before a re-run can come to name a different claim.
+    #[test]
+    fn a_re_run_clears_the_pending_replace_so_the_same_numeric_id_is_refused() {
+        let sink = RecordingSink::default();
+        let mut model = ready_model(Some(Box::new(sink.clone())));
+        assert!(model.draft_edited(1..=1, "mine".to_owned()));
+        let id = give_one_finding(&mut model, "unchecked index");
+        assert!(matches!(
+            model.accept_finding(id),
+            FindingDisposition::Composer { .. }
+        ));
+
+        let reran_id = give_one_finding(&mut model, "a different claim");
+        assert_eq!(reran_id, id, "ids reset each run");
+        let before = sink.calls().len();
+
+        assert_eq!(model.overwrite_finding(id), FindingDisposition::Unknown);
+
+        assert_eq!(sink.calls().len(), before, "nothing was written");
     }
 
     #[test]
@@ -1219,7 +1301,13 @@ mod tests {
         revision = bumped(&model, revision, "accepting a finding");
 
         let id = give_one_finding(&mut model, "occupying its own line");
-        assert!(model.overwrite_finding(id));
+        assert!(matches!(
+            model.accept_finding(id),
+            FindingDisposition::Composer { .. }
+        ));
+        revision = bumped(&model, revision, "asking about an occupied line");
+
+        assert_eq!(model.overwrite_finding(id), FindingDisposition::Drafted);
         bumped(&model, revision, "overwriting a finding");
     }
 
