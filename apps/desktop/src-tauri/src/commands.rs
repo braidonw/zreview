@@ -474,7 +474,7 @@ fn reanchor_draft_on_model(
 /// Stores the review summary, which the store keys by pull request and head.
 ///
 /// Called on every keystroke, like a draft edit, because that is what makes the
-/// text survive a crash. Answers with nothing: the editor already holds what it
+/// text survive a crash. Answers with nothing. The editor already holds what it
 /// just sent, and echoing it back would fight the cursor.
 fn edit_summary_on_model(
     model: &Mutex<app::SessionModel>,
@@ -528,7 +528,7 @@ fn cancel_submission_on_model(
 /// Posts the confirmed review, then records what the forge said.
 ///
 /// The model refuses to post for itself, so this is where the hop happens. No
-/// lock is held across the send: the forge takes as long as it takes, and
+/// lock is held across the send. The forge takes as long as it takes, and
 /// nothing else about the Session may stall behind it. Local drafts are
 /// forgotten only once the review has landed, because until then the local copy
 /// is the only copy.

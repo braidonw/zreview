@@ -21,9 +21,7 @@ type CommandResult<T> = { status: "ok"; data: T | null } | { status: "error"; er
 type PanelResult = CommandResult<ReviewPanelDto>;
 
 /** What a command answering with the submission hands back. */
-type SubmissionResult =
-  | { status: "ok"; data: SubmissionDto }
-  | { status: "error"; error: unknown };
+type SubmissionResult = { status: "ok"; data: SubmissionDto } | { status: "error"; error: unknown };
 
 /**
  * Loads one session and exposes every action the UI can take on it.
@@ -318,10 +316,7 @@ export function useSession(
   const keepFinding = useCallback(() => dispatch({ type: "findingConflict", conflict: null }), []);
 
   /** Persists the summary, on the same queue the drafts use, on every keystroke. */
-  const summaryChange = useCallback(
-    (body: string) => draftQueue.editSummary(body),
-    [draftQueue],
-  );
+  const summaryChange = useCallback((body: string) => draftQueue.editSummary(body), [draftQueue]);
 
   /**
    * Runs a submission command, showing a refusal in the panel.
@@ -387,9 +382,9 @@ export function useSession(
           }
           dispatch({ type: "submission", submission: sent.data.submission });
           dispatch({ type: "drafts", drafts: sent.data.drafts });
-          // Only a review that landed empties the editor. A failed send must
-          // leave it alone: its text is the reviewer's, and the backend's copy
-          // can be a keystroke behind what they are still typing.
+          // Only a review that landed empties the editor. A failed send leaves
+          // it alone, because the backend's copy of the summary can be a
+          // keystroke behind what the reviewer is still typing.
           if (sent.data.submission.phase.state === "Sent") {
             dispatch({ type: "summary", body: sent.data.summary });
           }

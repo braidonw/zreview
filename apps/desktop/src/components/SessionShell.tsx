@@ -64,84 +64,78 @@ export function SessionShell({
   const { empty_reason: emptyReason, rows } = state.file;
   const isEmpty = emptyReason !== null || rows.length === 0;
   const { phase } = state.submission;
-  // Nothing new may be asked for while one is in flight, which is what stops a
-  // second confirmation being built over a send that has not come back. A
-  // failure leaves the actions live, because retrying is exactly what it asks
-  // the reviewer to do.
+  // Nothing new may be started over a send that has not come back. A failure
+  // leaves the actions live, because retrying is what it asks the reviewer to do.
   const isSending = phase.state === "Sending";
 
   return (
     <div className="session-shell">
-      <SubmissionPanel
-        phase={phase}
-        onCancel={onCancelSubmission}
-        onSend={onSendSubmission}
-      />
+      <SubmissionPanel phase={phase} onCancel={onCancelSubmission} onSend={onSendSubmission} />
       <div className="session-shell__body">
-      <FileSidebar
-        onBack={onBack}
-        title={state.snapshot.title}
-        subtitle={state.snapshot.subtitle}
-        sidebar={state.snapshot.sidebar}
-        warnings={state.snapshot.warnings}
-        writeFailure={state.drafts.write_failure}
-        fileDraftCount={state.drafts.file_draft_count}
-        staleDrafts={state.drafts.stale}
-        cursor={state.cursor}
-        onSelect={onSelectFile}
-        onReanchorDraft={onReanchorDraft}
-      />
-      <div className="session-shell__main">
-        {isEmpty ? (
-          <EmptyDiffPane
-            label={emptyReason?.label ?? "No lines to show"}
-            detail={emptyReason?.detail ?? "This file has nothing to display."}
-          />
-        ) : (
-          <DiffList
-            rows={rows}
-            isShowing={isShowing}
-            fileIndex={state.file.index}
-            cursor={state.cursor}
-            selectionStart={selectionStart}
-            selectionEnd={selectionEnd}
-            drafts={state.drafts}
-            composer={state.composer}
-            composerPrefill={composerPrefill(state)}
-            onRowClick={onRowClick}
-            onOpenComposer={onOpenComposer}
-            onComposerChange={onComposerChange}
-            onComposerClose={onComposerClose}
-            onComposerDiscard={onComposerDiscard}
-          />
-        )}
-        {state.snapshot.can_submit && (
-          <SubmitBar
-            readyCount={state.drafts.ready_count}
-            notAnchoredCount={state.drafts.not_anchored_count}
-            summary={state.summary}
-            isSending={isSending}
-            onSummaryChange={onSummaryChange}
-            onSubmit={onSubmit}
-          />
-        )}
-      </div>
-      {state.panel !== null && (
-        <ReviewPanel
-          panel={state.panel}
-          notice={state.panelNotice}
-          findingConflict={state.findingConflict}
-          onRunReview={onRunReview}
-          onCancelReview={onCancelReview}
-          onToggleGuidanceSection={onToggleGuidanceSection}
-          onToggleGuidanceFile={onToggleGuidanceFile}
-          onRevealFinding={onRevealFinding}
-          onAcceptFinding={onAcceptFinding}
-          onDismissFinding={onDismissFinding}
-          onReplaceFinding={onReplaceFinding}
-          onKeepFinding={onKeepFinding}
+        <FileSidebar
+          onBack={onBack}
+          title={state.snapshot.title}
+          subtitle={state.snapshot.subtitle}
+          sidebar={state.snapshot.sidebar}
+          warnings={state.snapshot.warnings}
+          writeFailure={state.drafts.write_failure}
+          fileDraftCount={state.drafts.file_draft_count}
+          staleDrafts={state.drafts.stale}
+          cursor={state.cursor}
+          onSelect={onSelectFile}
+          onReanchorDraft={onReanchorDraft}
         />
-      )}
+        <div className="session-shell__main">
+          {isEmpty ? (
+            <EmptyDiffPane
+              label={emptyReason?.label ?? "No lines to show"}
+              detail={emptyReason?.detail ?? "This file has nothing to display."}
+            />
+          ) : (
+            <DiffList
+              rows={rows}
+              isShowing={isShowing}
+              fileIndex={state.file.index}
+              cursor={state.cursor}
+              selectionStart={selectionStart}
+              selectionEnd={selectionEnd}
+              drafts={state.drafts}
+              composer={state.composer}
+              composerPrefill={composerPrefill(state)}
+              onRowClick={onRowClick}
+              onOpenComposer={onOpenComposer}
+              onComposerChange={onComposerChange}
+              onComposerClose={onComposerClose}
+              onComposerDiscard={onComposerDiscard}
+            />
+          )}
+          {state.snapshot.can_submit && (
+            <SubmitBar
+              readyCount={state.drafts.ready_count}
+              notAnchoredCount={state.drafts.not_anchored_count}
+              summary={state.summary}
+              isSending={isSending}
+              onSummaryChange={onSummaryChange}
+              onSubmit={onSubmit}
+            />
+          )}
+        </div>
+        {state.panel !== null && (
+          <ReviewPanel
+            panel={state.panel}
+            notice={state.panelNotice}
+            findingConflict={state.findingConflict}
+            onRunReview={onRunReview}
+            onCancelReview={onCancelReview}
+            onToggleGuidanceSection={onToggleGuidanceSection}
+            onToggleGuidanceFile={onToggleGuidanceFile}
+            onRevealFinding={onRevealFinding}
+            onAcceptFinding={onAcceptFinding}
+            onDismissFinding={onDismissFinding}
+            onReplaceFinding={onReplaceFinding}
+            onKeepFinding={onKeepFinding}
+          />
+        )}
       </div>
     </div>
   );
