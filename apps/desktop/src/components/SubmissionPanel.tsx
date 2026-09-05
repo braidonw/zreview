@@ -53,10 +53,20 @@ export function SubmissionPanel({
       return <Confirmation request={phase.request} onCancel={onCancel} onSend={onSend} />;
 
     default: {
-      // A submission state the backend grew that nothing here can draw. Drawing
-      // nothing would hide a review that may be in flight or may have failed.
+      // A submission state the backend grew that nothing here can draw. There is
+      // no error boundary above this, so throwing would blank the window, and
+      // drawing nothing would hide a review that may be in flight. The `never`
+      // is what turns a new state into a compile error rather than this line.
       const unknown: never = phase;
-      throw new Error(`the submission is in an unknown state ${JSON.stringify(unknown)}`);
+      return (
+        <section className="submission-panel">
+          <p className="submission-panel__failed">
+            This submission is in a state ZReview cannot show. Check the pull request on GitHub
+            before submitting again.
+          </p>
+          <p className="submission-panel__detail">{JSON.stringify(unknown)}</p>
+        </section>
+      );
     }
   }
 }

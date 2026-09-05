@@ -16,11 +16,16 @@ const ACTIONS: { event: ReviewEventDto; label: string; tone: string }[] = [
  *
  * Choosing an action posts nothing. It opens the confirmation holding the exact
  * request, so what the reviewer approves is what leaves the machine.
+ *
+ * The counts and the editor are here for every Session. Only the verdicts need
+ * somewhere to post to, and a Session without one still has a summary that a
+ * whole-change finding can be accepted into.
  */
 export function SubmitBar({
   readyCount,
   notAnchoredCount,
   summary,
+  canSubmit,
   isSending,
   onSummaryChange,
   onSubmit,
@@ -29,6 +34,8 @@ export function SubmitBar({
   notAnchoredCount: number;
   /** What the editor holds, and how many times the backend has replaced it. */
   summary: SummaryState;
+  /** Whether this Session has somewhere to post a review at all. */
+  canSubmit: boolean;
   /** True while a review is in flight, when no other submission may be started. */
   isSending: boolean;
   onSummaryChange: (body: string) => void;
@@ -43,19 +50,21 @@ export function SubmitBar({
         )}
       </div>
       <SummaryEditor body={summary.body} loads={summary.loads} onChange={onSummaryChange} />
-      <div className="submit-bar__actions">
-        {ACTIONS.map(({ event, label, tone }) => (
-          <button
-            key={event}
-            type="button"
-            className={`submit-bar__action submit-bar__action--${tone}`}
-            disabled={isSending}
-            onClick={() => onSubmit(event)}
-          >
-            {label}
-          </button>
-        ))}
-      </div>
+      {canSubmit && (
+        <div className="submit-bar__actions">
+          {ACTIONS.map(({ event, label, tone }) => (
+            <button
+              key={event}
+              type="button"
+              className={`submit-bar__action submit-bar__action--${tone}`}
+              disabled={isSending}
+              onClick={() => onSubmit(event)}
+            >
+              {label}
+            </button>
+          ))}
+        </div>
+      )}
     </div>
   );
 }

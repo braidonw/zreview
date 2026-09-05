@@ -192,7 +192,7 @@ export function useSession(
    * state.
    */
   const applyFindingResult = useCallback(
-    <T,>(promise: Promise<CommandResult<T>>, onData: (data: T) => void) => {
+    <T,>(promise: Promise<CommandResult<T>>, onData: (data: T) => void) =>
       promise.then((result) => {
         if (result.status === "error") {
           dispatch({ type: "panelNotice", notice: toFailure(result.error).summary });
@@ -202,8 +202,7 @@ export function useSession(
           return;
         }
         onData(result.data);
-      });
-    },
+      }),
     [],
   );
 
@@ -257,28 +256,35 @@ export function useSession(
    * When the anchor already holds the reviewer's own draft, neither text is
    * written; the panel asks whether to replace it instead, first revealing the
    * row so the reviewer can see what they are being asked about.
+   *
+   * Run behind whatever the summary queue is holding. A finding about the whole
+   * change is merged into the summary by the backend and retires either way, so
+   * a keystroke still in flight landing on top of the merge would lose the
+   * proposal for good.
    */
   const acceptFinding = useCallback(
     (id: number) => {
-      applyFindingResult(commands.acceptFinding(id), (data) => {
-        const { panel, drafts, disposition } = data;
-        dispatch({ type: "panel", panel });
-        dispatch({ type: "drafts", drafts });
-        if (disposition.outcome === "Occupied") {
-          applyLocation(disposition.location);
-          dispatch({
-            type: "findingConflict",
-            conflict: { id, existing: disposition.existing, proposed: disposition.proposed },
-          });
-        }
-        // A finding about the change as a whole has nowhere to anchor, so its
-        // proposal goes into the summary editor for the reviewer to edit or clear.
-        if (disposition.outcome === "Summary") {
-          dispatch({ type: "summaryLoaded", body: disposition.body });
-        }
-      });
+      draftQueue.runInOrder(() =>
+        applyFindingResult(commands.acceptFinding(id), (data) => {
+          const { panel, drafts, disposition } = data;
+          dispatch({ type: "panel", panel });
+          dispatch({ type: "drafts", drafts });
+          if (disposition.outcome === "Occupied") {
+            applyLocation(disposition.location);
+            dispatch({
+              type: "findingConflict",
+              conflict: { id, existing: disposition.existing, proposed: disposition.proposed },
+            });
+          }
+          // A finding about the change as a whole has nowhere to anchor, so its
+          // proposal goes into the summary editor for the reviewer to edit or clear.
+          if (disposition.outcome === "Summary") {
+            dispatch({ type: "summaryLoaded", body: disposition.body });
+          }
+        }),
+      );
     },
-    [applyFindingResult, applyLocation],
+    [applyFindingResult, applyLocation, draftQueue],
   );
 
   const dismissFinding = useCallback(

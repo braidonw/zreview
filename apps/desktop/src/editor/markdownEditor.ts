@@ -23,9 +23,9 @@ export function createMarkdownEditor({
   onChange: (text: string) => void;
   onClose: () => void;
 }): MarkdownEditorHandle {
-  // Set while `load` replaces the document, so text the model already holds is
-  // not written straight back to it as though the reviewer had typed it.
-  let isLoading = false;
+  // Set while `load` replaces the whole document, so text the model already
+  // holds is not reported back as though the reviewer had typed it.
+  let isReplacingDocument = false;
   const view = new EditorView({
     parent,
     state: EditorState.create({
@@ -53,7 +53,7 @@ export function createMarkdownEditor({
         ]),
         EditorView.lineWrapping,
         EditorView.updateListener.of((update) => {
-          if (update.docChanged && !isLoading) {
+          if (update.docChanged && !isReplacingDocument) {
             onChange(update.state.doc.toString());
           }
         }),
@@ -88,9 +88,9 @@ export function createMarkdownEditor({
   return {
     focus: () => view.focus(),
     load: (text) => {
-      isLoading = true;
+      isReplacingDocument = true;
       view.dispatch({ changes: { from: 0, to: view.state.doc.length, insert: text } });
-      isLoading = false;
+      isReplacingDocument = false;
     },
     destroy: () => view.destroy(),
   };

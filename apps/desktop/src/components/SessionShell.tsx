@@ -109,16 +109,15 @@ export function SessionShell({
               onComposerDiscard={onComposerDiscard}
             />
           )}
-          {state.snapshot.can_submit && (
-            <SubmitBar
-              readyCount={state.drafts.ready_count}
-              notAnchoredCount={state.drafts.not_anchored_count}
-              summary={state.summary}
-              isSending={isSending}
-              onSummaryChange={onSummaryChange}
-              onSubmit={onSubmit}
-            />
-          )}
+          <SubmitBar
+            readyCount={state.drafts.ready_count}
+            notAnchoredCount={state.drafts.not_anchored_count}
+            summary={state.summary}
+            canSubmit={state.snapshot.can_submit}
+            isSending={isSending}
+            onSummaryChange={onSummaryChange}
+            onSubmit={onSubmit}
+          />
         </div>
         {state.panel !== null && (
           <ReviewPanel

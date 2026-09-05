@@ -440,15 +440,18 @@ describe("sending the review", () => {
     await openSubmitBar();
     await confirm(user, "Comment");
 
+    // Both presses land while the confirmation is still up and the button live,
+    // which is the whole window a double press has.
     const send = screen.getByRole("button", { name: "Post this review to GitHub" });
     await user.click(send);
+    await user.click(send);
+
+    expect(sendSubmission).toHaveBeenCalledTimes(1);
+
     act(() => channel?.onmessage(makeSubmission({ state: "Sending" }, 2)));
 
     await waitFor(() => expect(screen.getByText("Submitting the review...")).toBeTruthy());
-    // The confirmation is gone, so there is nothing left to press twice.
     expect(screen.queryByRole("button", { name: "Post this review to GitHub" })).toBeNull();
-    await user.click(send);
-    expect(sendSubmission).toHaveBeenCalledTimes(1);
   });
 });
 
@@ -477,6 +480,50 @@ describe("a finding about the whole change", () => {
     await waitFor(() => expect(screen.queryByText("no tests anywhere")).toBeNull());
     const field = await summaryField();
     expect(field.textContent).toContain("Add tests for the new branch.");
+  });
+
+  /**
+   * The finding retires whatever happens, so a summary write still in flight
+   * overtaking the merge would lose the proposal for good.
+   */
+  it("waits for a summary write already in flight before merging the proposal", async () => {
+    const user = userEvent.setup();
+    reviewPanel.mockResolvedValue({
+      status: "ok",
+      data: makePanel({
+        findings: [makeFinding({ id: 7, position: null, title: "no tests anywhere" })],
+      }),
+    });
+    let settleWrite: (answer: unknown) => void = () => {};
+    editSummary.mockReturnValue(
+      new Promise((resolve) => {
+        settleWrite = resolve;
+      }),
+    );
+    acceptFinding.mockResolvedValue({
+      status: "ok",
+      data: {
+        panel: makePanel({ revision: 2, findings: [] }),
+        drafts: makeDrafts({ ready_count: 2 }),
+        disposition: { outcome: "Summary", body: "Mostly good.\n\nAdd tests." },
+      },
+    });
+    await openSubmitBar();
+    await user.click(await summaryField());
+    await user.keyboard("Mostly good.");
+    await waitFor(() => expect(editSummary).toHaveBeenCalled());
+
+    await user.click(screen.getByRole("button", { name: "Accept" }));
+
+    expect(acceptFinding).not.toHaveBeenCalled();
+
+    settleWrite({ status: "ok", data: null });
+
+    await waitFor(() => expect(acceptFinding).toHaveBeenCalledWith(7));
+    await waitFor(() =>
+      expect((document.querySelector("[data-summary-editor] .cm-content") as HTMLElement).textContent)
+        .toContain("Add tests."),
+    );
   });
 });
 
@@ -510,7 +557,11 @@ describe("the submit bar", () => {
     expect(screen.queryByText(/not anchored/)).toBeNull();
   });
 
-  it("offers no submit bar at all for a Session that cannot be submitted", async () => {
+  /**
+   * A local comparison has no forge to post to, but it still has a summary,
+   * which a whole-change finding can be accepted into and a reviewer can read.
+   */
+  it("keeps the counts and the editor but offers no verdicts when there is nowhere to post", async () => {
     openSession.mockResolvedValue({
       status: "ok",
       data: makeSnapshot({ sidebar: makeSidebar([makeFileSummary()]), can_submit: false }),
@@ -519,7 +570,9 @@ describe("the submit bar", () => {
     render(<App />);
     await waitFor(() => expect(screen.getByText("first")).toBeTruthy());
 
+    expect(screen.getByText("2 to submit")).toBeTruthy();
+    expect(document.querySelector("[data-summary-editor]")).toBeTruthy();
     expect(screen.queryByRole("button", { name: "Approve" })).toBeNull();
-    expect(screen.queryByText(/to submit/)).toBeNull();
+    expect(screen.queryByRole("button", { name: "Request changes" })).toBeNull();
   });
 });
