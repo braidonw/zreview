@@ -6,7 +6,8 @@ import type { SessionAction } from "./sessionReducer";
 type DraftCommand =
   | { kind: "edit"; fileIndex: number; start: number; end: number; body: string }
   | { kind: "discard"; fileIndex: number; row: number }
-  | { kind: "reanchor"; fileIndex: number; path: string; side: DiffSideDto; line: number; row: number };
+  | { kind: "reanchor"; fileIndex: number; path: string; side: DiffSideDto; line: number; row: number }
+  | { kind: "summary"; body: string };
 
 function send(command: DraftCommand) {
   switch (command.kind) {
@@ -22,6 +23,8 @@ function send(command: DraftCommand) {
         command.line,
         command.row,
       );
+    case "summary":
+      return commands.editSummary(command.body);
   }
 }
 
@@ -32,13 +35,28 @@ function outcome(command: DraftCommand, data: DraftsDto | { accepted: boolean; d
     : { accepted: true, drafts: data as DraftsDto };
 }
 
-/** Serialises draft edits, discards, and reanchors, at most one in flight, consecutive edits coalescing while a discard or reanchor is always sent in order. */
+/** Whether two consecutive commands may collapse into the later one, which only per-keystroke writes of the same text may. */
+function coalesces(command: DraftCommand, previous: DraftCommand | undefined): boolean {
+  if (command.kind === "edit") {
+    return previous?.kind === "edit";
+  }
+  if (command.kind === "summary") {
+    return previous?.kind === "summary";
+  }
+  return false;
+}
+
+/** Serialises draft edits, discards, reanchors, and summary writes, at most one in flight, consecutive writes of one text coalescing while a discard or reanchor is always sent in order. */
 export function useDraftQueue(dispatch: (action: SessionAction) => void) {
   const inFlight = useRef(false);
   const pending = useRef<DraftCommand[]>([]);
 
   const settle = useCallback(
-    (command: DraftCommand, data: DraftsDto | { accepted: boolean; drafts: DraftsDto }) => {
+    (command: DraftCommand, data: DraftsDto | { accepted: boolean; drafts: DraftsDto } | null) => {
+      // The summary answers with nothing. The editor already holds what it sent.
+      if (command.kind === "summary" || data === null) {
+        return;
+      }
       const { accepted, drafts } = outcome(command, data);
       dispatch({ type: "drafts", drafts });
       if (!accepted) {
@@ -76,8 +94,7 @@ export function useDraftQueue(dispatch: (action: SessionAction) => void) {
         return;
       }
       const queue = pending.current;
-      const last = queue[queue.length - 1];
-      if (command.kind === "edit" && last?.kind === "edit") {
+      if (coalesces(command, queue[queue.length - 1])) {
         queue[queue.length - 1] = command;
       } else {
         queue.push(command);
@@ -103,5 +120,7 @@ export function useDraftQueue(dispatch: (action: SessionAction) => void) {
     [enqueue],
   );
 
-  return { editDraft, discardDraft, reanchorDraft };
+  const editSummary = useCallback((body: string) => enqueue({ kind: "summary", body }), [enqueue]);
+
+  return { editDraft, discardDraft, reanchorDraft, editSummary };
 }

@@ -7,6 +7,7 @@ import type {
   SessionFailureDto,
   SessionSnapshotDto,
   SidebarDto,
+  SubmissionDto,
 } from "../bindings";
 import { clamp } from "../lib/clamp";
 
@@ -45,6 +46,22 @@ export type SessionState =
       panelNotice: string | null;
       /** The confirmation accepting a finding onto an occupied line is asking. */
       findingConflict: FindingConflict;
+      /**
+       * How far a submission has got, held in memory only.
+       *
+       * Never persisted, so a fresh Session starts idle however the last one
+       * ended.
+       */
+      submission: SubmissionDto;
+      /**
+       * The text the backend last said the summary editor should hold.
+       *
+       * Typing does not change this. It moves only when the backend hands back
+       * text of its own, which is a whole-change finding accepted into the
+       * summary or a successful send emptying it, and that is what tells the
+       * editor to reload rather than fighting the reviewer's cursor.
+       */
+      summary: string;
     };
 
 export type ReadyState = Extract<SessionState, { status: "ready" }>;
@@ -66,6 +83,8 @@ export type SessionAction =
       panel: ReviewPanelDto | null;
     }
   | { type: "panel"; panel: ReviewPanelDto | null }
+  | { type: "submission"; submission: SubmissionDto }
+  | { type: "summary"; body: string }
   | { type: "panelNotice"; notice: string }
   | { type: "findingConflict"; conflict: FindingConflict }
   | { type: "file"; file: FileDetailDto }
@@ -112,7 +131,29 @@ export function sessionReducer(state: SessionState, action: SessionAction): Sess
         panel: action.panel,
         panelNotice: null,
         findingConflict: null,
+        submission: { revision: 0, phase: { state: "Idle" } },
+        summary: action.snapshot.summary,
       };
+
+    case "submission": {
+      if (state.status !== "ready") {
+        return state;
+      }
+      // Several submission commands answer with the whole state and they can be
+      // in flight at once. One that read the model before a change must not land
+      // on top of one that carries it, which would show a confirmation for a
+      // verdict the model is no longer holding.
+      if (action.submission.revision < state.submission.revision) {
+        return state;
+      }
+      return { ...state, submission: action.submission };
+    }
+
+    case "summary":
+      if (state.status !== "ready") {
+        return state;
+      }
+      return { ...state, summary: action.body };
 
     case "panel": {
       if (state.status !== "ready") {

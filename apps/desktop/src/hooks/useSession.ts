@@ -1,7 +1,13 @@
 import { useCallback, useEffect, useReducer, useRef } from "react";
 import { Channel } from "@tauri-apps/api/core";
 import { writeText } from "@tauri-apps/plugin-clipboard-manager";
-import type { DiffSideDto, FindingLocationDto, ReviewPanelDto } from "../bindings";
+import type {
+  DiffSideDto,
+  FindingLocationDto,
+  ReviewEventDto,
+  ReviewPanelDto,
+  SubmissionDto,
+} from "../bindings";
 import { commands } from "../bindings";
 import { clamp } from "../lib/clamp";
 import { toFailure } from "../lib/failure";
@@ -13,6 +19,11 @@ type CommandResult<T> = { status: "ok"; data: T | null } | { status: "error"; er
 
 /** What a command answering with the review panel hands back. */
 type PanelResult = CommandResult<ReviewPanelDto>;
+
+/** What a command answering with the submission hands back. */
+type SubmissionResult =
+  | { status: "ok"; data: SubmissionDto }
+  | { status: "error"; error: unknown };
 
 /**
  * Loads one session and exposes every action the UI can take on it.
@@ -259,6 +270,11 @@ export function useSession(
             conflict: { id, existing: disposition.existing, proposed: disposition.proposed },
           });
         }
+        // A finding about the change as a whole has nowhere to anchor, so its
+        // proposal goes into the summary editor for the reviewer to edit or clear.
+        if (disposition.outcome === "Summary") {
+          dispatch({ type: "summary", body: disposition.body });
+        }
       });
     },
     [applyFindingResult, applyLocation],
@@ -297,6 +313,75 @@ export function useSession(
 
   /** Leaves the reviewer's draft and the finding both exactly as they were. */
   const keepFinding = useCallback(() => dispatch({ type: "findingConflict", conflict: null }), []);
+
+  /** Persists the summary, on the same queue the drafts use, on every keystroke. */
+  const summaryChange = useCallback(
+    (body: string) => draftQueue.editSummary(body),
+    [draftQueue],
+  );
+
+  /**
+   * Runs a submission command, showing a refusal in the panel.
+   *
+   * A command that never answered is about the review, not the sitting.
+   * Replacing the Session with a failure screen would throw away the diff and
+   * every draft over it.
+   */
+  const onSubmission = useCallback((call: Promise<SubmissionResult>) => {
+    call
+      .then((answered) => {
+        if (answered.status === "error") {
+          dispatch({ type: "panelNotice", notice: toFailure(answered.error).summary });
+          return;
+        }
+        dispatch({ type: "submission", submission: answered.data });
+      })
+      .catch((error: unknown) => {
+        dispatch({ type: "panelNotice", notice: toFailure(error).summary });
+      });
+  }, []);
+
+  /**
+   * Assembles what submitting would post and opens the confirmation.
+   *
+   * Posts nothing. What comes back is the exact request, which the reviewer
+   * approves before anything leaves the machine.
+   */
+  const submit = useCallback(
+    (event: ReviewEventDto) => onSubmission(commands.requestSubmission(event)),
+    [onSubmission],
+  );
+
+  /** Puts the confirmation away, leaving every draft and the summary as they were. */
+  const cancelSubmission = useCallback(
+    () => onSubmission(commands.cancelSubmission()),
+    [onSubmission],
+  );
+
+  /**
+   * Posts the confirmed review.
+   *
+   * The backend refuses a second send while one is in flight, and the panel is
+   * put into its sending state first so the confirmation's own buttons go with
+   * it. A failure keeps every draft and the summary exactly where they were.
+   */
+  const sendSubmission = useCallback(() => {
+    commands
+      .sendSubmission()
+      .then((sent) => {
+        if (sent.status === "error") {
+          dispatch({ type: "panelNotice", notice: toFailure(sent.error).summary });
+          return;
+        }
+        dispatch({ type: "submission", submission: sent.data.submission });
+        dispatch({ type: "drafts", drafts: sent.data.drafts });
+        // Only now is it safe for the editor to forget what was posted.
+        dispatch({ type: "summary", body: sent.data.summary });
+      })
+      .catch((error: unknown) => {
+        dispatch({ type: "panelNotice", notice: toFailure(error).summary });
+      });
+  }, []);
 
   const clickRow = useCallback((index: number) => dispatch({ type: "click", index }), []);
 
@@ -344,8 +429,12 @@ export function useSession(
     }
 
     function handleKeydown(event: KeyboardEvent) {
-      // The composer is a real text editor, so global shortcuts yield to it entirely.
-      if (event.target instanceof HTMLElement && event.target.closest("[data-composer]")) {
+      // The composer and the summary are real text editors, so global shortcuts
+      // yield to either of them entirely.
+      if (
+        event.target instanceof HTMLElement &&
+        event.target.closest("[data-composer], [data-summary-editor]")
+      ) {
         return;
       }
 
@@ -385,8 +474,7 @@ export function useSession(
       if (event.metaKey && event.shiftKey && key === "y") {
         event.preventDefault();
         const finding = selectedFinding(current.panel);
-        // No summary editor yet, so a whole-change finding cannot be accepted.
-        if (finding !== null && finding.position !== null) {
+        if (finding !== null) {
           acceptFinding(finding.id);
         }
         return;
@@ -456,5 +544,9 @@ export function useSession(
     dismissFinding,
     replaceFinding,
     keepFinding,
+    summaryChange,
+    submit,
+    cancelSubmission,
+    sendSubmission,
   };
 }

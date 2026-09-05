@@ -1,10 +1,12 @@
-import type { DiffSideDto } from "../bindings";
+import type { DiffSideDto, ReviewEventDto } from "../bindings";
 import type { ReadyState } from "../hooks/sessionReducer";
 import { composerPrefill, selectionRange } from "../hooks/sessionReducer";
 import { DiffList } from "./DiffList";
 import { EmptyDiffPane } from "./EmptyDiffPane";
 import { FileSidebar } from "./FileSidebar";
 import { ReviewPanel } from "./ReviewPanel";
+import { SubmissionPanel } from "./SubmissionPanel";
+import { SubmitBar } from "./SubmitBar";
 import "./SessionShell.css";
 
 export function SessionShell({
@@ -27,6 +29,10 @@ export function SessionShell({
   onDismissFinding,
   onReplaceFinding,
   onKeepFinding,
+  onSummaryChange,
+  onSubmit,
+  onCancelSubmission,
+  onSendSubmission,
 }: {
   state: ReadyState;
   /** False while Home is in front, which is when this Session has no screen. */
@@ -49,13 +55,27 @@ export function SessionShell({
   onDismissFinding: (id: number) => void;
   onReplaceFinding: (id: number) => void;
   onKeepFinding: () => void;
+  onSummaryChange: (body: string) => void;
+  onSubmit: (event: ReviewEventDto) => void;
+  onCancelSubmission: () => void;
+  onSendSubmission: () => void;
 }) {
   const [selectionStart, selectionEnd] = selectionRange(state);
   const { empty_reason: emptyReason, rows } = state.file;
   const isEmpty = emptyReason !== null || rows.length === 0;
+  const { phase } = state.submission;
+  // Only an idle submission may start another, so a double press cannot post
+  // twice and a landed review cannot silently resend.
+  const isSubmitting = phase.state !== "Idle";
 
   return (
     <div className="session-shell">
+      <SubmissionPanel
+        phase={phase}
+        onCancel={onCancelSubmission}
+        onSend={onSendSubmission}
+      />
+      <div className="session-shell__body">
       <FileSidebar
         onBack={onBack}
         title={state.snapshot.title}
@@ -69,29 +89,41 @@ export function SessionShell({
         onSelect={onSelectFile}
         onReanchorDraft={onReanchorDraft}
       />
-      {isEmpty ? (
-        <EmptyDiffPane
-          label={emptyReason?.label ?? "No lines to show"}
-          detail={emptyReason?.detail ?? "This file has nothing to display."}
-        />
-      ) : (
-        <DiffList
-          rows={rows}
-          isShowing={isShowing}
-          fileIndex={state.file.index}
-          cursor={state.cursor}
-          selectionStart={selectionStart}
-          selectionEnd={selectionEnd}
-          drafts={state.drafts}
-          composer={state.composer}
-          composerPrefill={composerPrefill(state)}
-          onRowClick={onRowClick}
-          onOpenComposer={onOpenComposer}
-          onComposerChange={onComposerChange}
-          onComposerClose={onComposerClose}
-          onComposerDiscard={onComposerDiscard}
-        />
-      )}
+      <div className="session-shell__main">
+        {isEmpty ? (
+          <EmptyDiffPane
+            label={emptyReason?.label ?? "No lines to show"}
+            detail={emptyReason?.detail ?? "This file has nothing to display."}
+          />
+        ) : (
+          <DiffList
+            rows={rows}
+            isShowing={isShowing}
+            fileIndex={state.file.index}
+            cursor={state.cursor}
+            selectionStart={selectionStart}
+            selectionEnd={selectionEnd}
+            drafts={state.drafts}
+            composer={state.composer}
+            composerPrefill={composerPrefill(state)}
+            onRowClick={onRowClick}
+            onOpenComposer={onOpenComposer}
+            onComposerChange={onComposerChange}
+            onComposerClose={onComposerClose}
+            onComposerDiscard={onComposerDiscard}
+          />
+        )}
+        {state.snapshot.can_submit && (
+          <SubmitBar
+            readyCount={state.drafts.ready_count}
+            notAnchoredCount={state.drafts.not_anchored_count}
+            summary={state.summary}
+            isSubmitting={isSubmitting}
+            onSummaryChange={onSummaryChange}
+            onSubmit={onSubmit}
+          />
+        )}
+      </div>
       {state.panel !== null && (
         <ReviewPanel
           panel={state.panel}
@@ -108,6 +140,7 @@ export function SessionShell({
           onKeepFinding={onKeepFinding}
         />
       )}
+      </div>
     </div>
   );
 }

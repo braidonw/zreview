@@ -1,0 +1,136 @@
+.submission-panel {
+  flex-shrink: 0;
+  max-height: 420px;
+  overflow-y: auto;
+  padding: 12px 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  border-bottom: 1px solid var(--border-default);
+  background: var(--surface-base);
+  font-family: var(--font-mono);
+  font-size: var(--size-body);
+}
+
+.submission-panel p {
+  margin: 0;
+}
+
+.submission-panel__heading {
+  color: var(--text-primary);
+  font-weight: 600;
+}
+
+.submission-panel__pinned {
+  color: var(--text-tertiary);
+  font-size: var(--size-label);
+}
+
+.submission-panel__body {
+  padding: 8px;
+  border-radius: 6px;
+  background: var(--surface-raised);
+  color: var(--text-secondary);
+  white-space: pre-wrap;
+}
+
+.submission-panel__comments,
+.submission-panel__excluded-list {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.submission-panel__comment {
+  padding: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  border-left: 2px solid var(--accent-base);
+  border-radius: 6px;
+  background: var(--surface-raised);
+}
+
+.submission-panel__position {
+  color: var(--text-secondary);
+  font-size: var(--size-label);
+}
+
+.submission-panel__comment-body {
+  color: var(--text-primary);
+  white-space: pre-wrap;
+}
+
+.submission-panel__excluded {
+  margin-top: 4px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.submission-panel__excluded-heading {
+  color: var(--severity-error-text);
+}
+
+.submission-panel__excluded-draft {
+  color: var(--text-secondary);
+  font-size: var(--size-label);
+}
+
+.submission-panel__actions {
+  margin-top: 8px;
+  display: flex;
+  gap: 8px;
+}
+
+.submission-panel__send,
+.submission-panel__cancel {
+  padding: 8px 12px;
+  border-radius: 6px;
+  font-family: inherit;
+  font-size: var(--size-body);
+  cursor: pointer;
+}
+
+.submission-panel__send {
+  border: none;
+  background: var(--accent-base);
+  color: var(--text-on-accent);
+}
+
+.submission-panel__cancel {
+  border: 1px solid var(--border-strong);
+  background: transparent;
+  color: var(--text-secondary);
+}
+
+.submission-panel__sending {
+  color: var(--accent-text);
+}
+
+.submission-panel__sent {
+  color: var(--severity-success-text);
+  font-weight: 600;
+}
+
+.submission-panel__url {
+  color: var(--text-secondary);
+  font-size: var(--size-label);
+}
+
+.submission-panel__failed {
+  color: var(--severity-error-text);
+  font-weight: 600;
+}
+
+.submission-panel__remediation {
+  color: var(--severity-warning-text);
+}
+
+.submission-panel__detail {
+  color: var(--text-secondary);
+  font-size: var(--size-label);
+}

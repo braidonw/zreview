@@ -38,6 +38,8 @@ function readyState(rowCount: number, cursor = 0, anchor = 0): ReadyState {
     panel: null,
     panelNotice: null,
     findingConflict: null,
+    submission: { revision: 0, phase: { state: "Idle" } },
+    summary: "",
   };
 }
 

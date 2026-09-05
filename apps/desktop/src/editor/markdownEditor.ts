@@ -6,6 +6,8 @@ import { EditorView, keymap } from "@codemirror/view";
 /** What a component gets back from the composer's editor; components never import CodeMirror directly. */
 export interface MarkdownEditorHandle {
   focus: () => void;
+  /** Replaces the whole document with text the model already holds, reporting no change for it. */
+  load: (text: string) => void;
   destroy: () => void;
 }
 
@@ -21,6 +23,9 @@ export function createMarkdownEditor({
   onChange: (text: string) => void;
   onClose: () => void;
 }): MarkdownEditorHandle {
+  // Set while `load` replaces the document, so text the model already holds is
+  // not written straight back to it as though the reviewer had typed it.
+  let isLoading = false;
   const view = new EditorView({
     parent,
     state: EditorState.create({
@@ -48,7 +53,7 @@ export function createMarkdownEditor({
         ]),
         EditorView.lineWrapping,
         EditorView.updateListener.of((update) => {
-          if (update.docChanged) {
+          if (update.docChanged && !isLoading) {
             onChange(update.state.doc.toString());
           }
         }),
@@ -82,6 +87,11 @@ export function createMarkdownEditor({
 
   return {
     focus: () => view.focus(),
+    load: (text) => {
+      isLoading = true;
+      view.dispatch({ changes: { from: 0, to: view.state.doc.length, insert: text } });
+      isLoading = false;
+    },
     destroy: () => view.destroy(),
   };
 }

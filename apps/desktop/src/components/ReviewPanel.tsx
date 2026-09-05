@@ -287,19 +287,16 @@ function FindingCard({
         </div>
       ) : (
         <div className="review-panel__finding-actions">
-          {/* No summary editor yet, so a whole-change finding can only be dismissed. */}
-          {finding.position !== null && (
-            <button
-              type="button"
-              className="review-panel__finding-accept"
-              onClick={(event) => {
-                event.stopPropagation();
-                onAccept();
-              }}
-            >
-              Accept
-            </button>
-          )}
+          <button
+            type="button"
+            className="review-panel__finding-accept"
+            onClick={(event) => {
+              event.stopPropagation();
+              onAccept();
+            }}
+          >
+            Accept
+          </button>
           <button
             type="button"
             className="review-panel__finding-dismiss"

@@ -25,6 +25,10 @@ function baseHandlers() {
     onDismissFinding: () => {},
     onReplaceFinding: () => {},
     onKeepFinding: () => {},
+    onSummaryChange: () => {},
+    onSubmit: () => {},
+    onCancelSubmission: () => {},
+    onSendSubmission: () => {},
   };
 }
 
@@ -40,6 +44,8 @@ function readyState(overrides: Partial<ReadyState["file"]> = {}): ReadyState {
     panel: null,
     panelNotice: null,
     findingConflict: null,
+    submission: { revision: 0, phase: { state: "Idle" } },
+    summary: "",
   };
 }
 
