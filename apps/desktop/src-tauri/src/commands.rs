@@ -467,6 +467,26 @@ fn reanchor_draft_on_model(
     Ok(drafts_snapshot(&guard, selected))
 }
 
+/// Stores the review summary, which the store keys by pull request and head.
+///
+/// Called on every keystroke, like a draft edit, because that is what makes the
+/// text survive a crash. Answers with nothing: the editor already holds what it
+/// just sent, and echoing it back would fight the cursor.
+fn edit_summary_on_model(
+    model: &Mutex<app::SessionModel>,
+    body: String,
+) -> Result<(), dto::SessionFailureDto> {
+    let mut guard = lock(model);
+    match guard.phase() {
+        SessionPhase::Ready(_) => {}
+        SessionPhase::Loading { .. } | SessionPhase::Failed(_) => {
+            return Err(dto::command_failure("the session is not ready"));
+        }
+    }
+    guard.summary_edited(body);
+    Ok(())
+}
+
 /// Publishes a run's progress into the model and out to whoever asked for it, and
 /// tells the backend when the reviewer has abandoned the run.
 struct RunEvents<'a> {
@@ -2860,6 +2880,55 @@ mod tests {
         assert_eq!(draft.body, "worth keeping");
         assert!(!draft.is_stale);
         assert!(review.session().warnings().is_empty());
+    }
+
+    #[test]
+    fn edit_summary_on_model_persists_and_restores_against_the_same_head() {
+        let repository = temporary_repository();
+        let data = TempDir::new().unwrap();
+        let storage = ReviewStorage::At(data.path().join("review-data.sqlite3"));
+
+        {
+            let model = local_model(&local_request(&repository), &storage);
+            edit_summary_on_model(&model, "Two notes.".to_owned()).expect("session is ready");
+            // Dropping joins the writer thread, so the write has landed.
+        }
+
+        let model = local_model(&local_request(&repository), &storage);
+        let guard = lock(&model);
+        let SessionPhase::Ready(review) = guard.phase() else {
+            panic!("session should be ready");
+        };
+        assert_eq!(review.session().summary(), "Two notes.");
+    }
+
+    /// The summary is pinned to the head it was written against, so a pushed-to
+    /// branch starts the editor empty rather than showing words about old code.
+    #[test]
+    fn a_summary_written_against_another_head_is_not_restored() {
+        let repository = temporary_repository();
+        let data = TempDir::new().unwrap();
+        let storage = ReviewStorage::At(data.path().join("review-data.sqlite3"));
+
+        {
+            let model = local_model(&local_request(&repository), &storage);
+            edit_summary_on_model(&model, "about the old head".to_owned())
+                .expect("session is ready");
+        }
+
+        let path = repository.path();
+        git(path, ["checkout", "--quiet", "feature"]);
+        std::fs::write(path.join("other.txt"), "unrelated\n").unwrap();
+        git(path, ["add", "."]);
+        git(path, ["commit", "--quiet", "-m", "advance"]);
+        git(path, ["checkout", "--quiet", "main"]);
+
+        let model = local_model(&local_request(&repository), &storage);
+        let guard = lock(&model);
+        let SessionPhase::Ready(review) = guard.phase() else {
+            panic!("session should be ready");
+        };
+        assert_eq!(review.session().summary(), "");
     }
 
     /// Advancing the branch's head, without touching the file the draft is on,
