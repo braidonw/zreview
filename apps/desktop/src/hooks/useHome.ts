@@ -11,6 +11,15 @@ type HomeResult =
   | { status: "ok"; data: HomeSnapshotDto }
   | { status: "error"; error: SessionFailureDto };
 
+/**
+ * What opening a row answered with: it opened, a live run behind Home blocked
+ * it and the reviewer must be asked, or it was refused outright.
+ */
+export type OpenRowResult =
+  | { status: "opened" }
+  | { status: "blocked" }
+  | { status: "error"; error: SessionFailureDto };
+
 /** Whether a keystroke belongs to something the reviewer is typing into. */
 function isTyping(target: EventTarget | null): boolean {
   if (!(target instanceof HTMLElement)) {
@@ -28,15 +37,20 @@ function isTyping(target: EventTarget | null): boolean {
 export function useHome({
   isShowing,
   onOpenRow,
+  onCancelRunAndOpenRow,
   onReturnToSession,
 }: {
   isShowing: boolean;
-  onOpenRow: (repository: string, number: number) => Promise<SessionFailureDto | null>;
+  onOpenRow: (repository: string, number: number) => Promise<OpenRowResult>;
+  onCancelRunAndOpenRow: (repository: string, number: number) => Promise<SessionFailureDto | null>;
   onReturnToSession: () => Promise<SessionFailureDto | null>;
 }) {
   const [snapshot, setSnapshot] = useState<HomeSnapshotDto | null>(null);
   const [failure, setFailure] = useState<SessionFailureDto | null>(null);
   const [openFailure, setOpenFailure] = useState<SessionFailureDto | null>(null);
+  // The row a live run behind Home is blocking, waiting on the reviewer's
+  // answer to the confirmation: cancel the run and continue, or stay.
+  const [runConfirmation, setRunConfirmation] = useState<HomeRowDto | null>(null);
   const refreshing = useRef(false);
   // Read by the key handler, which is attached once and must still see the
   // list as it stands rather than as it was when it was attached.
@@ -191,15 +205,42 @@ export function useHome({
    * alive behind Home.
    *
    * Returning never reloads, which is what keeps a half-finished review whole.
-   * A refusal stays on Home, which is where the reviewer can act on it.
+   * A refusal stays on Home, which is where the reviewer can act on it. A live
+   * run behind Home in the way of dropping that Session opens the
+   * confirmation instead of touching anything.
    */
   const openRow = useCallback(
     (row: HomeRowDto) => {
-      const navigated = row.is_alive ? onReturnToSession() : onOpenRow(row.repository, row.number);
-      navigated.then(setOpenFailure);
+      if (row.is_alive) {
+        onReturnToSession().then(setOpenFailure);
+        return;
+      }
+      onOpenRow(row.repository, row.number).then((result) => {
+        if (result.status === "error") {
+          setOpenFailure(result.error);
+          return;
+        }
+        setOpenFailure(null);
+        if (result.status === "blocked") {
+          setRunConfirmation(row);
+        }
+      });
     },
     [onOpenRow, onReturnToSession],
   );
+
+  /** Cancels the run in the way and opens the row it was asked about. */
+  const cancelRunAndOpenRow = useCallback(() => {
+    const row = runConfirmation;
+    if (row === null) {
+      return;
+    }
+    setRunConfirmation(null);
+    onCancelRunAndOpenRow(row.repository, row.number).then(setOpenFailure);
+  }, [runConfirmation, onCancelRunAndOpenRow]);
+
+  /** Leaves the run and the Session it belongs to exactly as they were. */
+  const stayOnHome = useCallback(() => setRunConfirmation(null), []);
 
   const openCursorRow = useCallback(() => {
     const listed = shown.current;
@@ -267,5 +308,8 @@ export function useHome({
     addRepositories,
     removeRepository,
     openRow,
+    runConfirmation,
+    cancelRunAndOpenRow,
+    stayOnHome,
   };
 }

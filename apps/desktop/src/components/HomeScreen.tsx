@@ -1,5 +1,6 @@
 import { useEffect, useRef } from "react";
 import type { HomeRowDto, HomeSnapshotDto, RefreshStateDto, SessionFailureDto } from "../bindings";
+import type { OpenRowResult } from "../hooks/useHome";
 import { useHome } from "../hooks/useHome";
 import { useNow } from "../hooks/useNow";
 import { refreshedStamp, shortAge } from "../lib/relativeTime";
@@ -26,18 +27,33 @@ function stampText(refresh: RefreshStateDto, nowMs: number): string | null {
 export function HomeScreen({
   isShowing,
   aliveIdentity,
+  isReviewRunning,
   onOpenRow,
+  onCancelRunAndOpenRow,
   onReturnToSession,
 }: {
   /** False while a Session is in front, which is when Home goes quiet. */
   isShowing: boolean;
   /** `owner/name#number` of the Session alive behind Home, if one is. */
   aliveIdentity: string | null;
-  onOpenRow: (repository: string, number: number) => Promise<SessionFailureDto | null>;
+  /** Whether that Session has a review run in flight. */
+  isReviewRunning: boolean;
+  onOpenRow: (repository: string, number: number) => Promise<OpenRowResult>;
+  onCancelRunAndOpenRow: (repository: string, number: number) => Promise<SessionFailureDto | null>;
   onReturnToSession: () => Promise<SessionFailureDto | null>;
 }) {
-  const { snapshot, failure, openFailure, toggleFooter, addRepositories, removeRepository, openRow } =
-    useHome({ isShowing, onOpenRow, onReturnToSession });
+  const {
+    snapshot,
+    failure,
+    openFailure,
+    toggleFooter,
+    addRepositories,
+    removeRepository,
+    openRow,
+    runConfirmation,
+    cancelRunAndOpenRow,
+    stayOnHome,
+  } = useHome({ isShowing, onOpenRow, onCancelRunAndOpenRow, onReturnToSession });
   const nowMs = useNow();
 
   // A command that never answered leaves nothing worth trusting on screen.
@@ -57,8 +73,16 @@ export function HomeScreen({
         countLine={snapshot.count_line}
         stamp={stamp}
         aliveIdentity={aliveIdentity}
+        isReviewRunning={isReviewRunning}
         onReturnToSession={onReturnToSession}
       />
+      {runConfirmation !== null && (
+        <RunConfirmation
+          row={runConfirmation}
+          onCancelAndContinue={cancelRunAndOpenRow}
+          onStay={stayOnHome}
+        />
+      )}
       <HomeBody
         snapshot={snapshot}
         openFailure={openFailure}
@@ -106,11 +130,13 @@ function Header({
   countLine,
   stamp,
   aliveIdentity,
+  isReviewRunning,
   onReturnToSession,
 }: {
   countLine: string | null;
   stamp: string | null;
   aliveIdentity: string | null;
+  isReviewRunning: boolean;
   onReturnToSession: () => void;
 }) {
   return (
@@ -124,6 +150,7 @@ function Header({
         {aliveIdentity !== null && (
           <button className="home__slot" type="button" onClick={onReturnToSession}>
             <span className="home__slot-identity">{aliveIdentity}</span>
+            {isReviewRunning && <span className="home__slot-status">review running</span>}
             <span className="home__keycap">cmd-[</span>
           </button>
         )}
@@ -135,6 +162,40 @@ function Header({
         )}
       </div>
     </header>
+  );
+}
+
+/**
+ * The confirmation opening a different row asks for while the Session behind
+ * Home has a live run in the way. Exactly two choices, no third way out.
+ */
+function RunConfirmation({
+  row,
+  onCancelAndContinue,
+  onStay,
+}: {
+  row: HomeRowDto;
+  onCancelAndContinue: () => void;
+  onStay: () => void;
+}) {
+  return (
+    <div className="home__confirm" role="alertdialog" aria-label="A review is running">
+      <span className="home__confirm-text">
+        The Session behind Home is still reviewing. Cancel it and open {row.identity}?
+      </span>
+      <div className="home__confirm-actions">
+        <button className="home__button" type="button" onClick={onStay}>
+          Stay
+        </button>
+        <button
+          className="home__button home__button--primary"
+          type="button"
+          onClick={onCancelAndContinue}
+        >
+          Cancel run and continue
+        </button>
+      </div>
+    </div>
   );
 }
 

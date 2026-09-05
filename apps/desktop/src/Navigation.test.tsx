@@ -21,6 +21,7 @@ import {
 
 const describeWindow = vi.fn();
 const openRow = vi.fn();
+const openRowCancellingRun = vi.fn();
 const returnToHome = vi.fn();
 const returnToSession = vi.fn();
 const refreshHome = vi.fn();
@@ -36,6 +37,7 @@ const discardDraft = vi.fn();
 const reanchorDraft = vi.fn();
 const reviewPanel = vi.fn();
 const runReview = vi.fn();
+const cancelReview = vi.fn();
 const selectNextFinding = vi.fn();
 const acceptFinding = vi.fn();
 const dismissFinding = vi.fn();
@@ -44,6 +46,8 @@ vi.mock("./bindings", () => ({
   commands: {
     describeWindow: () => describeWindow(),
     openRow: (repository: unknown, number: unknown) => openRow(repository, number),
+    openRowCancellingRun: (repository: unknown, number: unknown) =>
+      openRowCancellingRun(repository, number),
     returnToHome: () => returnToHome(),
     returnToSession: () => returnToSession(),
     refreshHome: (onProgress: unknown) => refreshHome(onProgress),
@@ -59,6 +63,7 @@ vi.mock("./bindings", () => ({
     reanchorDraft: (...args: unknown[]) => reanchorDraft(...args),
     reviewPanel: () => reviewPanel(),
     runReview: (channel: unknown) => runReview(channel),
+    cancelReview: () => cancelReview(),
     selectNextFinding: () => selectNextFinding(),
     acceptFinding: (id: unknown) => acceptFinding(id),
     dismissFinding: (id: unknown) => dismissFinding(id),
@@ -100,6 +105,14 @@ function showingHome(session: OpenSessionDto | null = null): WindowDto {
 function showingSession(session: OpenSessionDto = alive()): WindowDto {
   return { Session: { session } };
 }
+
+/** What `openRow` answers with once the row opened, wrapping `window`. */
+function opened(window: WindowDto) {
+  return { outcome: "Opened" as const, window };
+}
+
+/** What `openRow` answers with when a live run behind Home is in the way. */
+const blocked = { outcome: "Blocked" as const };
 
 /** Two rows to review, one of which the alive Session was opened from. */
 function listed(): HomeSnapshotDto {
@@ -159,7 +172,9 @@ beforeEach(() => {
   describeWindow.mockReset();
   describeWindow.mockResolvedValue(showingHome());
   openRow.mockReset();
-  openRow.mockResolvedValue(ok(showingSession()));
+  openRow.mockResolvedValue(ok(opened(showingSession())));
+  openRowCancellingRun.mockReset();
+  openRowCancellingRun.mockResolvedValue(ok(showingSession()));
   returnToHome.mockReset();
   returnToHome.mockResolvedValue(ok(showingHome(alive())));
   returnToSession.mockReset();
@@ -184,6 +199,8 @@ beforeEach(() => {
   discardDraft.mockReset();
   reanchorDraft.mockReset();
   reviewPanel.mockReset();
+  cancelReview.mockReset();
+  cancelReview.mockResolvedValue(ok(null));
   selectNextFinding.mockReset();
   acceptFinding.mockReset();
   dismissFinding.mockReset();
@@ -327,6 +344,56 @@ describe("the Session kept alive behind Home", () => {
     expect(runReview).toHaveBeenCalledOnce();
   });
 
+  /// A run keeps going once Home is in front, and its Findings wait for the
+  /// reviewer's return rather than being lost or reset.
+  it("keeps a review run going behind Home and shows it still running on return", async () => {
+    reviewPanel.mockResolvedValue(ok(makePanel()));
+    let deliver: ((panel: unknown) => void) | null = null;
+    runReview.mockImplementation((channel: { onmessage: (panel: unknown) => void }) => {
+      deliver = (panel: unknown) => channel.onmessage(panel);
+      return new Promise(() => {
+        // Never settles: the run is still going when Home comes in front.
+      });
+    });
+    await openTheCursorRow();
+    fireEvent.keyDown(window, { key: "r", metaKey: true, shiftKey: true });
+    act(() => deliver?.(makePanel({ run: { state: "Running", detail: "Reading src/main.rs" } })));
+    await waitFor(() => expect(screen.getByText("Reading src/main.rs")).toBeTruthy());
+
+    fireEvent.keyDown(window, { key: "[", metaKey: true });
+    await waitFor(() => expect(screen.getByText("Retry webhook deliveries")).toBeTruthy());
+
+    await userEvent.setup().click(screen.getByRole("button", { name: /acme\/widgets#412/ }));
+
+    await waitFor(() => expect(screen.getByText("Reading src/main.rs")).toBeTruthy());
+    expect(screen.getByRole("button", { name: "Cancel" })).toBeTruthy();
+    expect(cancelReview).not.toHaveBeenCalled();
+  });
+
+  it("shows review running in the header slot while the hidden Session's run is live, and drops it once the run ends", async () => {
+    reviewPanel.mockResolvedValue(ok(makePanel()));
+    let settleRun: ((result: unknown) => void) | null = null;
+    runReview.mockImplementation((channel: { onmessage: (panel: unknown) => void }) => {
+      channel.onmessage(makePanel({ run: { state: "Running", detail: "Starting..." } }));
+      return new Promise((resolve) => {
+        settleRun = resolve;
+      });
+    });
+    await openTheCursorRow();
+    fireEvent.keyDown(window, { key: "r", metaKey: true, shiftKey: true });
+    await waitFor(() => expect(screen.getByText("Starting...")).toBeTruthy());
+
+    fireEvent.keyDown(window, { key: "[", metaKey: true });
+
+    await waitFor(() => expect(screen.getByText("review running")).toBeTruthy());
+
+    act(() =>
+      settleRun?.(ok(makePanel({ run: { state: "Complete", accepted: 0, rejected: 0, suppressed: 0 } }))),
+    );
+
+    await waitFor(() => expect(screen.queryByText("review running")).toBeNull());
+  });
+
   it("leaves the finding shortcuts alone once Home is in front of the Session", async () => {
     // A selected finding, so accept and dismiss have something to act on and
     // the assertions below can only pass because Home has the keys.
@@ -447,6 +514,57 @@ describe("the Session kept alive behind Home", () => {
 
     await waitFor(() => expect(openRow).toHaveBeenCalledWith("acme/widgets", 398));
     expect(returnToSession).not.toHaveBeenCalled();
+  });
+
+  it("asks for confirmation before opening a different row with a live run behind it, and stay leaves everything untouched", async () => {
+    const user = userEvent.setup();
+    describeWindow.mockResolvedValue(showingHome(alive()));
+    refreshHome.mockResolvedValue(ok(withAliveRow()));
+    openRow.mockResolvedValue(ok(blocked));
+    await openHome();
+
+    await user.click(screen.getByText("Split the invoice renderer"));
+
+    await waitFor(() =>
+      expect(screen.getByText(/Cancel it and open acme\/widgets#398/)).toBeTruthy(),
+    );
+    expect(openRowCancellingRun).not.toHaveBeenCalled();
+
+    await user.click(screen.getByRole("button", { name: "Stay" }));
+
+    expect(screen.queryByRole("button", { name: "Cancel run and continue" })).toBeNull();
+    expect(openRowCancellingRun).not.toHaveBeenCalled();
+    expect(screen.getByText("Retry webhook deliveries")).toBeTruthy();
+  });
+
+  it("cancels the run and opens the new row when the confirmation is answered cancel and continue", async () => {
+    const user = userEvent.setup();
+    describeWindow.mockResolvedValue(showingHome(alive()));
+    refreshHome.mockResolvedValue(ok(withAliveRow()));
+    openRow.mockResolvedValue(ok(blocked));
+    await openHome();
+    await user.click(screen.getByText("Split the invoice renderer"));
+    await waitFor(() =>
+      expect(screen.getByRole("button", { name: "Cancel run and continue" })).toBeTruthy(),
+    );
+
+    await user.click(screen.getByRole("button", { name: "Cancel run and continue" }));
+
+    await waitFor(() => expect(openRowCancellingRun).toHaveBeenCalledWith("acme/widgets", 398));
+    await waitFor(() => expect(screen.getByText("first")).toBeTruthy());
+  });
+
+  it("opens a different row with no confirmation when the hidden Session has no live run", async () => {
+    const user = userEvent.setup();
+    describeWindow.mockResolvedValue(showingHome(alive()));
+    refreshHome.mockResolvedValue(ok(withAliveRow()));
+    await openHome();
+
+    await user.click(screen.getByText("Split the invoice renderer"));
+
+    await waitFor(() => expect(screen.getByText("first")).toBeTruthy());
+    expect(screen.queryByRole("button", { name: "Cancel run and continue" })).toBeNull();
+    expect(openRowCancellingRun).not.toHaveBeenCalled();
   });
 
   it("reaches a Session whose pull request has no row through the slot alone", async () => {

@@ -3,6 +3,7 @@ import type { OpenSessionDto, SessionFailureDto, WindowDto } from "./bindings";
 import { commands } from "./bindings";
 import { FailureScreen } from "./components/FailureScreen";
 import { HomeScreen } from "./components/HomeScreen";
+import type { OpenRowResult } from "./hooks/useHome";
 import { toFailure } from "./lib/failure";
 import { SessionApp } from "./SessionApp";
 import "./App.css";
@@ -30,6 +31,10 @@ function currentScreen(shown: WindowDto): Screen {
 export default function App() {
   const [shown, setShown] = useState<WindowDto | null>(null);
   const [failure, setFailure] = useState<SessionFailureDto | null>(null);
+  // Told by the Session behind Home whenever its run's state changes, so the
+  // header slot follows a run it cannot see. Reset by the fresh `useSession`
+  // a new Session mounts with, whether by a row opening one or replacing one.
+  const [isReviewRunning, setIsReviewRunning] = useState(false);
 
   useEffect(() => {
     commands
@@ -56,8 +61,32 @@ export default function App() {
       .catch((error: unknown) => toFailure(error));
   }, []);
 
-  const openRow = useCallback(
-    (repository: string, number: number) => navigate(commands.openRow(repository, number)),
+  /**
+   * Opens `repository#number`, answering with whether it opened, whether a
+   * live run behind Home blocked it, or a refusal.
+   *
+   * A block is not a failure and is not shown here: Home renders the
+   * confirmation and asks again through `cancelRunAndOpenRow`.
+   */
+  const openRow = useCallback((repository: string, number: number): Promise<OpenRowResult> => {
+    return commands
+      .openRow(repository, number)
+      .then((result) => {
+        if (result.status === "error") {
+          return { status: "error" as const, error: toFailure(result.error) };
+        }
+        if (result.data.outcome === "Blocked") {
+          return { status: "blocked" as const };
+        }
+        setShown(result.data.window);
+        return { status: "opened" as const };
+      })
+      .catch((error: unknown) => ({ status: "error" as const, error: toFailure(error) }));
+  }, []);
+  /** Cancels the run in the way, then opens the row, once Home has confirmed. */
+  const cancelRunAndOpenRow = useCallback(
+    (repository: string, number: number) =>
+      navigate(commands.openRowCancellingRun(repository, number)),
     [navigate],
   );
   const returnToSession = useCallback(() => navigate(commands.returnToSession()), [navigate]);
@@ -110,7 +139,9 @@ export default function App() {
           <HomeScreen
             isShowing={isShowingHome}
             aliveIdentity={session?.row_identity ?? null}
+            isReviewRunning={isReviewRunning}
             onOpenRow={openRow}
+            onCancelRunAndOpenRow={cancelRunAndOpenRow}
             onReturnToSession={returnToSession}
           />
         </div>
@@ -124,6 +155,7 @@ export default function App() {
             description={session.description}
             isShowing={!isShowingHome}
             onBack={canGoBack ? returnToHome : null}
+            onRunningChange={setIsReviewRunning}
           />
         </div>
       )}
