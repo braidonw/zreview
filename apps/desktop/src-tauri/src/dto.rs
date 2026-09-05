@@ -4,10 +4,13 @@
 //! `&SessionFailure`) and returns a value, which is what keeps them testable
 //! without a running app.
 
-use app::{FindingDisposition, PullRequestId, ReviewModel, ReviewRunState};
+use app::{
+    FindingDisposition, PullRequestId, ReviewModel, ReviewRunState, SessionModel, SubmissionState,
+};
 use domain::{
-    AnchorLocation, DiffFile, DiffLineKind, DiffSide, EmptyDiffReason, FileStatus, Finding,
-    GuidanceSelection, ReviewSession, SessionFailure, SessionSource, Severity,
+    AnchorLocation, DiffFile, DiffLineKind, DiffSide, EmptyDiffReason, ExcludedDraft, FileStatus,
+    Finding, GuidanceSelection, ReviewEvent, ReviewSession, ReviewSubmission, SessionFailure,
+    SessionSource, Severity, SubmissionOutcome,
 };
 use serde::{Deserialize, Serialize};
 
@@ -141,6 +144,13 @@ pub struct SessionSnapshotDto {
     pub subtitle: String,
     pub sidebar: SidebarDto,
     pub warnings: Vec<SessionFailureDto>,
+    /// Whether this Session has somewhere to post a review, which is what decides
+    /// if the submit bar is there at all. False for the generated fixture and a
+    /// local comparison, neither of which is a pull request.
+    pub can_submit: bool,
+    /// What the summary editor seeds from, restored from storage on a fresh load
+    /// of the same pull request and head.
+    pub summary: String,
 }
 
 #[derive(Clone, Debug, Serialize, specta::Type)]
@@ -186,6 +196,12 @@ pub struct DraftsDto {
     pub anchored: Vec<AnchoredDraftDto>,
     pub stale: Vec<StaleDraftDto>,
     pub file_draft_count: u32,
+    /// Every draft in the session that would be posted, not just this file's,
+    /// which is the count the submit bar leads with.
+    pub ready_count: u32,
+    /// Every draft in the session whose anchor no longer resolves. Counted apart
+    /// because a submission leaves these behind.
+    pub not_anchored_count: u32,
     pub write_failure: Option<String>,
 }
 
@@ -385,8 +401,10 @@ pub enum AcceptDispositionDto {
         proposed: String,
         location: FindingLocationDto,
     },
-    /// The finding was about the change as a whole, so it went into the summary.
-    Summary,
+    /// The finding was about the change as a whole, so its proposal went into the
+    /// summary. `body` is what the editor should now hold, the reviewer's own
+    /// text and the proposal together.
+    Summary { body: String },
     /// No pending finding had that id.
     Unknown,
 }
@@ -414,7 +432,9 @@ pub fn project_disposition(
                 location: location.into(),
             }
         }
-        FindingDisposition::Summary { .. } => AcceptDispositionDto::Summary,
+        FindingDisposition::Summary { body } => {
+            AcceptDispositionDto::Summary { body: body.clone() }
+        }
         FindingDisposition::Unknown => AcceptDispositionDto::Unknown,
     }
 }
@@ -435,6 +455,181 @@ pub struct RevealOutcomeDto {
     /// Absent for a finding about the change as a whole, which has nowhere to
     /// scroll to.
     pub location: Option<FindingLocationDto>,
+}
+
+/// What submitting the review asserts about it.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, specta::Type)]
+pub enum ReviewEventDto {
+    Comment,
+    Approve,
+    RequestChanges,
+}
+
+impl From<ReviewEventDto> for ReviewEvent {
+    fn from(event: ReviewEventDto) -> Self {
+        match event {
+            ReviewEventDto::Comment => Self::Comment,
+            ReviewEventDto::Approve => Self::Approve,
+            ReviewEventDto::RequestChanges => Self::RequestChanges,
+        }
+    }
+}
+
+/// One inline comment, at the position the forge will be given for it.
+#[derive(Clone, Debug, Serialize, specta::Type)]
+pub struct SubmittableCommentDto {
+    /// "path SIDE line N", which is the position itself, not a paraphrase of it.
+    pub position: String,
+    pub body: String,
+}
+
+/// A draft the submission leaves behind, and why.
+#[derive(Clone, Debug, Serialize, specta::Type)]
+pub struct ExcludedDraftDto {
+    /// "path line N", where the draft still claims to be.
+    pub position: String,
+    /// Why it will not be posted, e.g. "not on a line in the current diff".
+    pub reason: String,
+    pub body: String,
+}
+
+/// The exact request a confirmed submission would post.
+///
+/// Mirrors the GPUI confirmation in `crates/ui`: what the reviewer approves is
+/// what leaves the machine, so every part of it is shown rather than summarised.
+#[derive(Clone, Debug, Serialize, specta::Type)]
+pub struct SubmissionRequestDto {
+    /// The verdict and how many inline comments go with it, e.g. "Comment with
+    /// 1 inline comment".
+    pub heading: String,
+    /// "pinned to abc1234". Shown because it is what the forge can still reject
+    /// the review for.
+    pub pinned: String,
+    pub body: String,
+    pub comments: Vec<SubmittableCommentDto>,
+    /// Always shown. A reviewer must not believe these were posted.
+    pub excluded: Vec<ExcludedDraftDto>,
+    /// "1 draft will NOT be posted", absent when nothing is excluded.
+    pub excluded_heading: Option<String>,
+}
+
+/// A review the forge accepted.
+#[derive(Clone, Debug, Serialize, specta::Type)]
+pub struct SubmissionOutcomeDto {
+    /// What it was recorded as and how much went with it, e.g. "Submitted as
+    /// COMMENTED with 1 inline comment".
+    pub heading: String,
+    /// Where to read it.
+    pub url: String,
+}
+
+/// How far the submission has got.
+#[derive(Clone, Debug, Serialize, specta::Type)]
+#[serde(tag = "state")]
+pub enum SubmissionPhaseDto {
+    Idle,
+    /// Holding the exact request, waiting on a person. Nothing has been posted.
+    Confirming {
+        request: SubmissionRequestDto,
+    },
+    Sending,
+    Sent {
+        outcome: SubmissionOutcomeDto,
+    },
+    /// The forge refused it, or it could not be assembled at all. Every draft
+    /// and the summary are still exactly where they were.
+    Failed {
+        failure: SessionFailureDto,
+    },
+}
+
+/// The submission, and how many times it has changed.
+#[derive(Clone, Debug, Serialize, specta::Type)]
+pub struct SubmissionDto {
+    /// So a snapshot read before a change can be told from one that carries it.
+    /// Several submission commands can be in flight at once.
+    pub revision: u32,
+    pub phase: SubmissionPhaseDto,
+}
+
+/// What a send answers with once the forge has replied.
+#[derive(Clone, Debug, Serialize, specta::Type)]
+pub struct SendOutcomeDto {
+    pub submission: SubmissionDto,
+    /// The selected file's drafts, emptied of whatever was posted.
+    pub drafts: DraftsDto,
+    /// What the summary editor should now hold, which a successful send empties.
+    pub summary: String,
+}
+
+/// How far the submission has got, read off the model that decides it.
+#[must_use]
+pub fn project_submission(model: &SessionModel) -> SubmissionDto {
+    SubmissionDto {
+        revision: model.submission_revision(),
+        phase: match model.submission() {
+            SubmissionState::Idle => SubmissionPhaseDto::Idle,
+            SubmissionState::Confirming(submission) => SubmissionPhaseDto::Confirming {
+                request: project_submission_request(submission),
+            },
+            SubmissionState::Sending => SubmissionPhaseDto::Sending,
+            SubmissionState::Sent(outcome) => SubmissionPhaseDto::Sent {
+                outcome: project_submission_outcome(outcome),
+            },
+            SubmissionState::Failed(failure) => SubmissionPhaseDto::Failed {
+                failure: failure.into(),
+            },
+        },
+    }
+}
+
+fn project_submission_request(submission: &ReviewSubmission) -> SubmissionRequestDto {
+    let excluded_count = submission.excluded.len();
+    SubmissionRequestDto {
+        heading: format!(
+            "{} with {} inline comment{}",
+            submission.event.label(),
+            submission.comments.len(),
+            plural(submission.comments.len()),
+        ),
+        pinned: format!("pinned to {}", short_sha(&submission.head_sha)),
+        body: submission.body.clone(),
+        comments: submission
+            .comments
+            .iter()
+            .map(|comment| SubmittableCommentDto {
+                position: format!("{} {} line {}", comment.path, comment.side, comment.line),
+                body: comment.body.clone(),
+            })
+            .collect(),
+        excluded: submission
+            .excluded
+            .iter()
+            .map(|ExcludedDraft { draft, reason }| ExcludedDraftDto {
+                position: format!("{} line {}", draft.anchor.path, draft.anchor.line),
+                reason: reason.to_string(),
+                body: draft.body.clone(),
+            })
+            .collect(),
+        excluded_heading: (excluded_count > 0).then(|| {
+            format!(
+                "{excluded_count} draft{} will NOT be posted",
+                plural(excluded_count),
+            )
+        }),
+    }
+}
+
+fn project_submission_outcome(outcome: &SubmissionOutcome) -> SubmissionOutcomeDto {
+    SubmissionOutcomeDto {
+        heading: format!(
+            "Submitted as {} with {} inline comment{}",
+            outcome.state,
+            outcome.comment_count,
+            plural(outcome.comment_count),
+        ),
+        url: outcome.url.clone(),
+    }
 }
 
 #[derive(Clone, Debug, Serialize, specta::Type)]
@@ -764,14 +959,20 @@ fn short_sha(sha: &str) -> &str {
     }
 }
 
+/// Everything the Session shows once, from a model that has finished loading.
+///
+/// `can_submit` comes off the model rather than the session because only the
+/// model knows whether there is anywhere to post to.
 #[must_use]
-pub fn project_snapshot(session: &ReviewSession) -> SessionSnapshotDto {
+pub fn project_snapshot(session: &ReviewSession, can_submit: bool) -> SessionSnapshotDto {
     let (title, subtitle) = source_header(session.source());
     SessionSnapshotDto {
         title,
         subtitle,
         sidebar: project_sidebar(session),
         warnings: session.warnings().iter().map(Into::into).collect(),
+        can_submit,
+        summary: session.summary().to_owned(),
     }
 }
 
@@ -868,11 +1069,14 @@ pub fn project_drafts(session: &ReviewSession, file_index: usize) -> DraftsDto {
     }
     anchored.sort_by_key(|draft| draft.row);
     let file_draft_count = as_u32(anchored.len() + stale.len());
+    let not_anchored_count = session.drafts().stale_count();
     DraftsDto {
         file_index: as_u32(file_index),
         anchored,
         stale,
         file_draft_count,
+        ready_count: as_u32(session.drafts().len() - not_anchored_count),
+        not_anchored_count: as_u32(not_anchored_count),
         write_failure: None,
     }
 }
@@ -1146,7 +1350,7 @@ mod tests {
     #[test]
     fn snapshot_shows_the_pull_requests_identity_and_title() {
         let session = pull_request_session();
-        let snapshot = project_snapshot(&session);
+        let snapshot = project_snapshot(&session, false);
 
         assert_eq!(snapshot.title, "acme/widgets \u{00B7} PR #42");
         assert_eq!(snapshot.subtitle, "Add the widget factory");
@@ -1155,7 +1359,7 @@ mod tests {
     #[test]
     fn snapshot_projects_the_demo_sidebar() {
         let session = demo_session();
-        let snapshot = project_snapshot(&session);
+        let snapshot = project_snapshot(&session, false);
 
         assert_eq!(snapshot.title, "Generated fixture");
         assert_eq!(snapshot.subtitle, "Diff virtualization demo");
@@ -1459,7 +1663,7 @@ mod tests {
         let mut session = demo_session();
         session.push_warning(SessionFailure::new("drafts are not being saved"));
 
-        let snapshot = project_snapshot(&session);
+        let snapshot = project_snapshot(&session, false);
 
         assert_eq!(snapshot.warnings.len(), 1);
         assert_eq!(snapshot.warnings[0].summary, "drafts are not being saved");

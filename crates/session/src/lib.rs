@@ -211,6 +211,17 @@ fn attach_draft_storage(
     {
         session.restore_dismissed(dismissed.into_iter().collect());
     }
+    // The summary is the reviewer's own words, like the drafts, so a read that
+    // fails is worth saying rather than quietly starting them on an empty editor.
+    // Keyed by head as well as scope, so a branch that was pushed to restores
+    // nothing rather than words written about code that has moved.
+    if let Some(head_sha) = session.source().head_sha() {
+        match reader.load_summary(&scope, head_sha) {
+            Ok(Some(summary)) => session.set_summary(summary),
+            Ok(None) => {}
+            Err(error) => session.push_warning(review_storage_warning(&error)),
+        }
+    }
 
     match ReviewStore::open(&path) {
         Ok(writer) => Some(Box::new(ReviewStateWriter::spawn(writer, scope))),

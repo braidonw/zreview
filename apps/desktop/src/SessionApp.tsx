@@ -35,6 +35,10 @@ export function SessionApp({
     dismissFinding,
     replaceFinding,
     keepFinding,
+    summaryChange,
+    submit,
+    cancelSubmission,
+    sendSubmission,
   } = useSession(description, isShowing, onRunningChange);
 
   switch (state.status) {
@@ -64,6 +68,10 @@ export function SessionApp({
           onDismissFinding={dismissFinding}
           onReplaceFinding={replaceFinding}
           onKeepFinding={keepFinding}
+          onSummaryChange={summaryChange}
+          onSubmit={submit}
+          onCancelSubmission={cancelSubmission}
+          onSendSubmission={sendSubmission}
         />
       );
   }

@@ -361,6 +361,55 @@ export const commands = {
 	 */
 	location: FindingLocationDto | null,
 } | null, SessionFailureDto>(__TAURI_INVOKE("select_next_finding")),
+	/**
+	 *  Stores the review summary, keyed by pull request and head.
+	 * 
+	 *  Called on every keystroke, like a draft edit. That is what makes the text
+	 *  survive a crash, and what a later Session restores it from. Answers with
+	 *  what is stopping writes landing, if anything is, which for a reviewer
+	 *  writing only a summary is the one place that can say so.
+	 * 
+	 *  # Errors
+	 * 
+	 *  Returns a failure when no session is open, or the session is not ready.
+	 */
+	editSummary: (body: string) => typedError<string | null, SessionFailureDto>(__TAURI_INVOKE("edit_summary", { body })),
+	/**
+	 *  Assembles what submitting would post and holds it for approval.
+	 * 
+	 *  Posts nothing. What comes back is the exact request that would be sent, so
+	 *  what the reviewer approves is what leaves the machine.
+	 * 
+	 *  # Errors
+	 * 
+	 *  Returns a failure when no session is open, or the session is not ready.
+	 */
+	requestSubmission: (event: ReviewEventDto) => typedError<SubmissionDto, SessionFailureDto>(__TAURI_INVOKE("request_submission", { event })),
+	/**
+	 *  Puts the confirmation away, leaving every draft and the summary as they were.
+	 * 
+	 *  # Errors
+	 * 
+	 *  Returns a failure when no session is open, or the session is not ready.
+	 */
+	cancelSubmission: () => typedError<SubmissionDto, SessionFailureDto>(__TAURI_INVOKE("cancel_submission")),
+	/**
+	 *  Posts the confirmed review on a background thread, then reports what the
+	 *  forge said.
+	 * 
+	 *  The sending state goes to `on_sending` before the post starts, so the panel
+	 *  stops offering a confirmation the moment one is acted on. The model is taken
+	 *  out of the window as its own handle, so a Session dropped or a window closed
+	 *  mid-send leaves the post finishing into a model nobody reads rather than
+	 *  panicking. A second call while the first is in flight posts nothing more, and
+	 *  a task that dies without reporting leaves a submission that can be retried.
+	 * 
+	 *  # Errors
+	 * 
+	 *  Returns a failure when no session is open, the session is not ready, or the
+	 *  task doing the posting does not finish.
+	 */
+	sendSubmission: (onSending: Channel<SubmissionDto>) => typedError<SendOutcomeDto, SessionFailureDto>(__TAURI_INVOKE("send_submission", { onSending })),
 };
 
 /* Types */
@@ -374,8 +423,12 @@ export type AcceptDispositionDto =
  *  accepting it should first reveal, as the GPUI composer path does.
  */
 { outcome: "Occupied"; existing: string; proposed: string; location: FindingLocationDto } | 
-/**  The finding was about the change as a whole, so it went into the summary. */
-{ outcome: "Summary" } | 
+/**
+ *  The finding was about the change as a whole, so its proposal went into the
+ *  summary. `body` is what the editor should now hold, the reviewer's own
+ *  text and the proposal together.
+ */
+{ outcome: "Summary"; body: string } | 
 /**  No pending finding had that id. */
 { outcome: "Unknown" };
 
@@ -418,6 +471,16 @@ export type DraftsDto = {
 	anchored: AnchoredDraftDto[],
 	stale: StaleDraftDto[],
 	file_draft_count: number,
+	/**
+	 *  Every draft in the session that would be posted, not just this file's,
+	 *  which is the count the submit bar leads with.
+	 */
+	ready_count: number,
+	/**
+	 *  Every draft in the session whose anchor no longer resolves. Counted apart
+	 *  because a submission leaves these behind.
+	 */
+	not_anchored_count: number,
 	write_failure: string | null,
 };
 
@@ -425,6 +488,15 @@ export type DraftsDto = {
 export type EmptyReasonDto = {
 	label: string,
 	detail: string,
+};
+
+/**  A draft the submission leaves behind, and why. */
+export type ExcludedDraftDto = {
+	/**  "path line N", where the draft still claims to be. */
+	position: string,
+	/**  Why it will not be posted, e.g. "not on a line in the current diff". */
+	reason: string,
+	body: string,
 };
 
 /**  One configured repository whose pull requests could not be fetched. */
@@ -667,6 +739,9 @@ export type RevealOutcomeDto = {
 	location: FindingLocationDto | null,
 };
 
+/**  What submitting the review asserts about it. */
+export type ReviewEventDto = "Comment" | "Approve" | "RequestChanges";
+
 /**
  *  The Session's right-hand panel: what a review is held to, and how far the run
  *  that populates it has got.
@@ -715,6 +790,15 @@ export type RowStatusDto = {
 	tone: StatusToneDto,
 };
 
+/**  What a send answers with once the forge has replied. */
+export type SendOutcomeDto = {
+	submission: SubmissionDto,
+	/**  The selected file's drafts, emptied of whatever was posted. */
+	drafts: DraftsDto,
+	/**  What the summary editor should now hold, which a successful send empties. */
+	summary: string,
+};
+
 export type SessionFailureDto = {
 	summary: string,
 	detail: string | null,
@@ -726,6 +810,17 @@ export type SessionSnapshotDto = {
 	subtitle: string,
 	sidebar: SidebarDto,
 	warnings: SessionFailureDto[],
+	/**
+	 *  Whether this Session has somewhere to post a review, which is what decides
+	 *  if the submit bar is there at all. False for the generated fixture and a
+	 *  local comparison, neither of which is a pull request.
+	 */
+	can_submit: boolean,
+	/**
+	 *  What the summary editor seeds from, restored from storage on a fresh load
+	 *  of the same pull request and head.
+	 */
+	summary: string,
 };
 
 /**  How much a finding claims to matter. */
@@ -755,6 +850,69 @@ export type StaleDraftDto = {
  *  sheet that owns them.
  */
 export type StatusToneDto = "Success" | "Error" | "Warning" | "Muted";
+
+/**  The submission, and how many times it has changed. */
+export type SubmissionDto = {
+	/**
+	 *  So a snapshot read before a change can be told from one that carries it.
+	 *  Several submission commands can be in flight at once.
+	 */
+	revision: number,
+	phase: SubmissionPhaseDto,
+};
+
+/**  A review the forge accepted. */
+export type SubmissionOutcomeDto = {
+	/**
+	 *  What it was recorded as and how much went with it, e.g. "Submitted as
+	 *  COMMENTED with 1 inline comment".
+	 */
+	heading: string,
+	/**  Where to read it. */
+	url: string,
+};
+
+/**  How far the submission has got. */
+export type SubmissionPhaseDto = { state: "Idle" } | 
+/**  Holding the exact request, waiting on a person. Nothing has been posted. */
+{ state: "Confirming"; request: SubmissionRequestDto } | { state: "Sending" } | { state: "Sent"; outcome: SubmissionOutcomeDto } | 
+/**
+ *  The forge refused it, or it could not be assembled at all. Every draft
+ *  and the summary are still exactly where they were.
+ */
+{ state: "Failed"; failure: SessionFailureDto };
+
+/**
+ *  The exact request a confirmed submission would post.
+ * 
+ *  Mirrors the GPUI confirmation in `crates/ui`: what the reviewer approves is
+ *  what leaves the machine, so every part of it is shown rather than summarised.
+ */
+export type SubmissionRequestDto = {
+	/**
+	 *  The verdict and how many inline comments go with it, e.g. "Comment with
+	 *  1 inline comment".
+	 */
+	heading: string,
+	/**
+	 *  "pinned to abc1234". Shown because it is what the forge can still reject
+	 *  the review for.
+	 */
+	pinned: string,
+	body: string,
+	comments: SubmittableCommentDto[],
+	/**  Always shown. A reviewer must not believe these were posted. */
+	excluded: ExcludedDraftDto[],
+	/**  "1 draft will NOT be posted", absent when nothing is excluded. */
+	excluded_heading: string | null,
+};
+
+/**  One inline comment, at the position the forge will be given for it. */
+export type SubmittableCommentDto = {
+	/**  "path SIDE line N", which is the position itself, not a paraphrase of it. */
+	position: string,
+	body: string,
+};
 
 /**  Which screen the window shows, and the Session it is holding. */
 export type WindowDto = 

@@ -15,6 +15,8 @@ import type {
   SessionSnapshotDto,
   SidebarDto,
   StaleDraftDto,
+  SubmissionDto,
+  SubmissionRequestDto,
 } from "../bindings";
 
 /** The guidance section once discovery has found something. */
@@ -58,6 +60,8 @@ export function makeDrafts(overrides: Partial<DraftsDto> = {}): DraftsDto {
     anchored: [],
     stale: [],
     file_draft_count: 0,
+    ready_count: 0,
+    not_anchored_count: 0,
     write_failure: null,
     ...overrides,
   };
@@ -104,8 +108,32 @@ export function makeSnapshot(overrides: Partial<SessionSnapshotDto> = {}): Sessi
     subtitle: "Diff virtualization demo",
     sidebar: makeSidebar(),
     warnings: [],
+    can_submit: false,
+    summary: "",
     ...overrides,
   };
+}
+
+export function makeSubmissionRequest(
+  overrides: Partial<SubmissionRequestDto> = {},
+): SubmissionRequestDto {
+  return {
+    heading: "Comment with 1 inline comment",
+    pinned: "pinned to abc1234",
+    body: "Two notes.",
+    comments: [{ position: "src/review_fixture_00.rs RIGHT line 2", body: "needs a test" }],
+    excluded: [],
+    excluded_heading: null,
+    ...overrides,
+  };
+}
+
+/** The submission at whatever phase a test needs, one revision on from idle. */
+export function makeSubmission(
+  phase: SubmissionDto["phase"] = { state: "Idle" },
+  revision = 1,
+): SubmissionDto {
+  return { revision, phase };
 }
 
 export function makeGuidanceEntry(overrides: Partial<GuidanceEntryDto> = {}): GuidanceEntryDto {

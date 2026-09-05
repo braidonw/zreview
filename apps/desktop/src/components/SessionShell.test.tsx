@@ -1,7 +1,14 @@
 import { describe, expect, it } from "vitest";
 import { render, screen } from "@testing-library/react";
 import type { ReadyState } from "../hooks/sessionReducer";
-import { makeFile, makeFileSummary, makeRow, makeSidebar, makeSnapshot } from "../test/fixtures";
+import {
+  makeFile,
+  makeFileSummary,
+  makeRow,
+  makeSidebar,
+  makeSnapshot,
+  makeSubmission,
+} from "../test/fixtures";
 import { SessionShell } from "./SessionShell";
 
 /** Every prop SessionShell needs beyond the ones a test wants to vary. */
@@ -25,6 +32,10 @@ function baseHandlers() {
     onDismissFinding: () => {},
     onReplaceFinding: () => {},
     onKeepFinding: () => {},
+    onSummaryChange: () => {},
+    onSubmit: () => {},
+    onCancelSubmission: () => {},
+    onSendSubmission: () => {},
   };
 }
 
@@ -40,6 +51,8 @@ function readyState(overrides: Partial<ReadyState["file"]> = {}): ReadyState {
     panel: null,
     panelNotice: null,
     findingConflict: null,
+    submission: makeSubmission({ state: "Idle" }, 0),
+    summary: { body: "", loads: 0 },
   };
 }
 

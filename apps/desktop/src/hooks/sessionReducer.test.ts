@@ -8,6 +8,7 @@ import {
   makePanel,
   makeRow,
   makeSnapshot,
+  makeSubmission,
 } from "../test/fixtures";
 import {
   type ReadyState,
@@ -38,6 +39,8 @@ function readyState(rowCount: number, cursor = 0, anchor = 0): ReadyState {
     panel: null,
     panelNotice: null,
     findingConflict: null,
+    submission: makeSubmission({ state: "Idle" }, 0),
+    summary: { body: "", loads: 0 },
   };
 }
 
@@ -95,6 +98,22 @@ describe("sessionReducer", () => {
     });
 
     expect(next).toMatchObject({ panel: { revision: 7, heading: "2 findings" } });
+  });
+
+  it("drops a submission that was read before the one it already holds", () => {
+    const held = sessionReducer(readyState(1), {
+      type: "submission",
+      submission: makeSubmission({ state: "Sending" }, 7),
+    });
+
+    const next = sessionReducer(held, {
+      type: "submission",
+      submission: makeSubmission({ state: "Idle" }, 5),
+    });
+
+    expect(next).toMatchObject({
+      submission: { revision: 7, phase: { state: "Sending" } },
+    });
   });
 
   it("keeps a panel read at the same revision, which carries the same state", () => {
