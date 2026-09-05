@@ -52,6 +52,10 @@ pub fn specta_builder() -> tauri_specta::Builder<tauri::Wry> {
         dismiss_finding,
         reveal_finding,
         select_next_finding,
+        edit_summary,
+        request_submission,
+        cancel_submission,
+        send_submission,
     ])
 }
 
@@ -487,6 +491,97 @@ fn edit_summary_on_model(
     Ok(())
 }
 
+/// Assembles what submitting would post and holds it for approval.
+///
+/// Posts nothing. The model builds the exact request and stops there, because
+/// nothing may leave the machine without a person confirming it.
+fn request_submission_on_model(
+    model: &Mutex<app::SessionModel>,
+    event: dto::ReviewEventDto,
+) -> Result<dto::SubmissionDto, dto::SessionFailureDto> {
+    let mut guard = lock(model);
+    match guard.phase() {
+        SessionPhase::Ready(_) => {}
+        SessionPhase::Loading { .. } | SessionPhase::Failed(_) => {
+            return Err(dto::command_failure("the session is not ready"));
+        }
+    }
+    guard.request_submission(event.into());
+    Ok(dto::project_submission(&guard))
+}
+
+/// Puts the confirmation away, leaving every draft and the summary as they were.
+fn cancel_submission_on_model(
+    model: &Mutex<app::SessionModel>,
+) -> Result<dto::SubmissionDto, dto::SessionFailureDto> {
+    let mut guard = lock(model);
+    match guard.phase() {
+        SessionPhase::Ready(_) => {}
+        SessionPhase::Loading { .. } | SessionPhase::Failed(_) => {
+            return Err(dto::command_failure("the session is not ready"));
+        }
+    }
+    guard.cancel_submission();
+    Ok(dto::project_submission(&guard))
+}
+
+/// Posts the confirmed review, then records what the forge said.
+///
+/// The model refuses to post for itself, so this is where the hop happens. No
+/// lock is held across the send: the forge takes as long as it takes, and
+/// nothing else about the Session may stall behind it. Local drafts are
+/// forgotten only once the review has landed, because until then the local copy
+/// is the only copy.
+///
+/// A call with nothing confirmed, or one arriving while a send is already in
+/// flight, posts nothing and answers with the state that says so.
+fn send_submission_on_model(
+    model: &Mutex<app::SessionModel>,
+) -> Result<dto::SendOutcomeDto, dto::SessionFailureDto> {
+    let pending = {
+        let mut guard = lock(model);
+        match guard.phase() {
+            SessionPhase::Ready(_) => {}
+            SessionPhase::Loading { .. } | SessionPhase::Failed(_) => {
+                return Err(dto::command_failure("the session is not ready"));
+            }
+        }
+        guard.begin_send()
+    };
+    let Some(app::PendingSend {
+        submission,
+        submitter,
+    }) = pending
+    else {
+        return Ok(send_outcome(&lock(model)));
+    };
+
+    let posted = submitter.submit(&submission);
+
+    let mut guard = lock(model);
+    guard.complete_send(&submission, posted);
+    Ok(send_outcome(&guard))
+}
+
+/// How far the submission has got, with what the Session must redraw after it.
+///
+/// # Panics
+///
+/// Panics if the model is not `Ready`. Every caller has just checked that under
+/// the same lock, and the phase cannot regress.
+fn send_outcome(model: &app::SessionModel) -> dto::SendOutcomeDto {
+    let SessionPhase::Ready(review) = model.phase() else {
+        unreachable!("checked Ready under the same lock")
+    };
+    let selected = review.session().selected_file_index();
+    let summary = review.session().summary().to_owned();
+    dto::SendOutcomeDto {
+        submission: dto::project_submission(model),
+        drafts: drafts_snapshot(model, selected),
+        summary,
+    }
+}
+
 /// Publishes a run's progress into the model and out to whoever asked for it, and
 /// tells the backend when the reviewer has abandoned the run.
 struct RunEvents<'a> {
@@ -779,7 +874,10 @@ pub async fn open_session(
 
     let guard = lock(&model);
     match guard.phase() {
-        SessionPhase::Ready(review) => Ok(dto::project_snapshot(review.session())),
+        SessionPhase::Ready(review) => Ok(dto::project_snapshot(
+            review.session(),
+            guard.is_submittable(),
+        )),
         SessionPhase::Failed(failure) => Err(failure.into()),
         SessionPhase::Loading { .. } => {
             unreachable!("finish() always leaves the model Ready or Failed")
@@ -1378,6 +1476,83 @@ pub fn select_next_finding(
     Ok(select_next_finding_on_model(&model))
 }
 
+/// Stores the review summary, keyed by pull request and head.
+///
+/// Called on every keystroke, like a draft edit. That is what makes the text
+/// survive a crash, and what a later Session restores it from.
+///
+/// # Errors
+///
+/// Returns a failure when no session is open, or the session is not ready.
+#[tauri::command]
+#[specta::specta]
+#[allow(clippy::needless_pass_by_value)]
+pub fn edit_summary(
+    state: tauri::State<'_, AppRoot>,
+    body: String,
+) -> Result<(), dto::SessionFailureDto> {
+    let model = session_model(&state)?;
+    edit_summary_on_model(&model, body)
+}
+
+/// Assembles what submitting would post and holds it for approval.
+///
+/// Posts nothing. What comes back is the exact request that would be sent, so
+/// what the reviewer approves is what leaves the machine.
+///
+/// # Errors
+///
+/// Returns a failure when no session is open, or the session is not ready.
+#[tauri::command]
+#[specta::specta]
+#[allow(clippy::needless_pass_by_value)]
+pub fn request_submission(
+    state: tauri::State<'_, AppRoot>,
+    event: dto::ReviewEventDto,
+) -> Result<dto::SubmissionDto, dto::SessionFailureDto> {
+    let model = session_model(&state)?;
+    request_submission_on_model(&model, event)
+}
+
+/// Puts the confirmation away, leaving every draft and the summary as they were.
+///
+/// # Errors
+///
+/// Returns a failure when no session is open, or the session is not ready.
+#[tauri::command]
+#[specta::specta]
+#[allow(clippy::needless_pass_by_value)]
+pub fn cancel_submission(
+    state: tauri::State<'_, AppRoot>,
+) -> Result<dto::SubmissionDto, dto::SessionFailureDto> {
+    let model = session_model(&state)?;
+    cancel_submission_on_model(&model)
+}
+
+/// Posts the confirmed review on a background thread, then reports what the
+/// forge said.
+///
+/// The model is taken out of the window as its own handle, so a Session dropped
+/// or a window closed mid-send leaves the post finishing into a model nobody
+/// reads rather than panicking. A second call while the first is in flight posts
+/// nothing more.
+///
+/// # Errors
+///
+/// Returns a failure when no session is open, the session is not ready, or the
+/// task doing the posting does not finish.
+#[tauri::command]
+#[specta::specta]
+#[allow(clippy::needless_pass_by_value)]
+pub async fn send_submission(
+    state: tauri::State<'_, AppRoot>,
+) -> Result<dto::SendOutcomeDto, dto::SessionFailureDto> {
+    let model = session_model(&state)?;
+    tauri::async_runtime::spawn_blocking(move || send_submission_on_model(&model))
+        .await
+        .map_err(|error| dto::command_failure(format!("the review was not sent: {error}")))?
+}
+
 #[cfg(test)]
 mod tests {
     use std::{ffi::OsStr, path::Path, process::Command, sync::Arc, thread};
@@ -1405,6 +1580,81 @@ mod tests {
         fn failure(&self) -> Option<String> {
             Some("disk is full".to_owned())
         }
+    }
+
+    /// Records every submission attempt, so a test can prove one did not happen.
+    ///
+    /// Nothing in this module's tests ever reaches GitHub; this stands in for the
+    /// real submitter everywhere a send is exercised.
+    #[derive(Clone, Default)]
+    struct RecordingSubmitter {
+        posted: Arc<Mutex<Vec<domain::ReviewSubmission>>>,
+        failure: Option<domain::SessionFailure>,
+    }
+
+    impl RecordingSubmitter {
+        fn posted(&self) -> Vec<domain::ReviewSubmission> {
+            lock(&self.posted).clone()
+        }
+    }
+
+    impl domain::ReviewSubmitter for RecordingSubmitter {
+        fn submit(
+            &self,
+            submission: &domain::ReviewSubmission,
+        ) -> Result<domain::SubmissionOutcome, domain::SessionFailure> {
+            lock(&self.posted).push(submission.clone());
+            self.failure.clone().map_or_else(
+                || {
+                    Ok(domain::SubmissionOutcome {
+                        state: "COMMENTED".to_owned(),
+                        url: "https://github.com/acme/widgets/pull/42".to_owned(),
+                        comment_count: submission.comments.len(),
+                    })
+                },
+                Err,
+            )
+        }
+    }
+
+    /// A local comparison with a fake submitter attached, which is the one thing
+    /// a local comparison never has of its own.
+    fn submittable_model(
+        request: &SessionRequest,
+        storage: &ReviewStorage,
+        submitter: Arc<dyn domain::ReviewSubmitter>,
+    ) -> Mutex<app::SessionModel> {
+        let model = Mutex::new(app::SessionModel::loading(request.description()));
+        let loaded = session::load(request, storage, &|_stage| {}).expect("the comparison loads");
+        lock(&model).finish(Ok(domain::LoadedSession {
+            submitter: Some(submitter),
+            ..loaded
+        }));
+        model
+    }
+
+    /// A session holding one draft and a summary, ready to be submitted.
+    fn model_with_a_review(
+        repository: &TempDir,
+        submitter: &RecordingSubmitter,
+    ) -> Mutex<app::SessionModel> {
+        let model = submittable_model(
+            &local_request(repository),
+            &ReviewStorage::Disabled,
+            Arc::new(submitter.clone()),
+        );
+        edit_draft_on_model(&model, 0, 1, 1, "needs a test".to_owned()).expect("session is ready");
+        edit_summary_on_model(&model, "Two notes.".to_owned()).expect("session is ready");
+        model
+    }
+
+    /// The confirmation a submission is waiting on, or a panic saying what it
+    /// was showing instead.
+    fn confirmation(submission: &dto::SubmissionDto) -> &dto::SubmissionRequestDto {
+        let dto::SubmissionPhaseDto::Confirming { request } = &submission.phase else {
+            panic!("expected a confirmation, got {:?}", submission.phase);
+        };
+        request
     }
 
     fn loaded_model() -> Mutex<app::SessionModel> {
@@ -3514,6 +3764,229 @@ mod tests {
             .note
             .expect("the failure is what the panel has to say");
         assert_eq!(note.heading, "claude is not installed");
+    }
+
+    /// The property the whole design turns on: choosing an action posts nothing.
+    #[test]
+    fn each_action_opens_a_confirmation_holding_what_would_be_posted() {
+        let repository = temporary_repository();
+        let submitter = RecordingSubmitter::default();
+        let model = model_with_a_review(&repository, &submitter);
+
+        for (event, verdict) in [
+            (dto::ReviewEventDto::Comment, "Comment"),
+            (dto::ReviewEventDto::Approve, "Approve"),
+            (dto::ReviewEventDto::RequestChanges, "Request changes"),
+        ] {
+            let submission = request_submission_on_model(&model, event).expect("session is ready");
+            let request = confirmation(&submission);
+
+            assert_eq!(request.heading, format!("{verdict} with 1 inline comment"));
+            assert_eq!(request.body, "Two notes.");
+            assert_eq!(request.comments.len(), 1);
+            assert_eq!(request.comments[0].position, "feature.txt RIGHT line 2");
+            assert_eq!(request.comments[0].body, "needs a test");
+            assert!(request.excluded.is_empty());
+            assert!(request.excluded_heading.is_none());
+            assert!(request.pinned.starts_with("pinned to "));
+        }
+
+        assert!(
+            submitter.posted().is_empty(),
+            "nothing may be posted before confirmation",
+        );
+    }
+
+    /// Every draft that will not be posted is named, with why, or a reviewer
+    /// would believe they had submitted something they had not.
+    #[test]
+    fn a_confirmation_names_every_draft_it_would_leave_behind() {
+        let repository = temporary_repository();
+        let data = TempDir::new().unwrap();
+        let storage = ReviewStorage::At(data.path().join("review-data.sqlite3"));
+        {
+            let model = local_model(&local_request(&repository), &storage);
+            edit_draft_on_model(&model, 0, 0, 0, "about the old head".to_owned()).unwrap();
+        }
+        let path = repository.path();
+        git(path, ["checkout", "--quiet", "feature"]);
+        std::fs::write(path.join("other.txt"), "unrelated\n").unwrap();
+        git(path, ["add", "."]);
+        git(path, ["commit", "--quiet", "-m", "advance"]);
+        git(path, ["checkout", "--quiet", "main"]);
+
+        let submitter = RecordingSubmitter::default();
+        let model = submittable_model(
+            &local_request(&repository),
+            &storage,
+            Arc::new(submitter.clone()),
+        );
+        edit_summary_on_model(&model, "Two notes.".to_owned()).expect("session is ready");
+
+        let submission = request_submission_on_model(&model, dto::ReviewEventDto::Comment)
+            .expect("session is ready");
+        let request = confirmation(&submission);
+
+        assert_eq!(request.excluded.len(), 1);
+        assert_eq!(request.excluded[0].body, "about the old head");
+        assert_eq!(
+            request.excluded[0].reason,
+            "not on a line in the current diff",
+        );
+        assert_eq!(
+            request.excluded_heading.as_deref(),
+            Some("1 draft will NOT be posted"),
+        );
+        assert!(submitter.posted().is_empty());
+    }
+
+    /// Cancelling returns the Session exactly as it was, drafts and summary and
+    /// all, and posts nothing.
+    #[test]
+    fn cancelling_a_confirmation_posts_nothing_and_keeps_everything() {
+        let repository = temporary_repository();
+        let submitter = RecordingSubmitter::default();
+        let model = model_with_a_review(&repository, &submitter);
+        request_submission_on_model(&model, dto::ReviewEventDto::Approve)
+            .expect("session is ready");
+
+        let submission = cancel_submission_on_model(&model).expect("session is ready");
+
+        assert!(matches!(submission.phase, dto::SubmissionPhaseDto::Idle));
+        assert!(submitter.posted().is_empty());
+        let guard = lock(&model);
+        let SessionPhase::Ready(review) = guard.phase() else {
+            panic!("session should be ready");
+        };
+        assert_eq!(review.session().summary(), "Two notes.");
+        assert_eq!(review.session().drafts().len(), 1);
+    }
+
+    /// A review that cannot be assembled says why, in the place the confirmation
+    /// would have been, and still posts nothing.
+    #[test]
+    fn a_review_that_cannot_be_assembled_explains_itself_without_posting() {
+        let repository = temporary_repository();
+        let submitter = RecordingSubmitter::default();
+        // A comment review with a draft but no summary: GitHub requires a body.
+        let model = submittable_model(
+            &local_request(&repository),
+            &ReviewStorage::Disabled,
+            Arc::new(submitter.clone()),
+        );
+        edit_draft_on_model(&model, 0, 1, 1, "needs a test".to_owned()).expect("session is ready");
+
+        let submission = request_submission_on_model(&model, dto::ReviewEventDto::Comment)
+            .expect("session is ready");
+
+        let dto::SubmissionPhaseDto::Failed { failure } = submission.phase else {
+            panic!("the review should be refused");
+        };
+        assert!(
+            failure
+                .remediation
+                .as_deref()
+                .is_some_and(|text| text.contains("needs a summary")),
+            "unexpected remediation: {:?}",
+            failure.remediation,
+        );
+        assert!(submitter.posted().is_empty());
+    }
+
+    #[test]
+    fn confirming_posts_the_review_once_and_forgets_what_it_sent() {
+        let repository = temporary_repository();
+        let submitter = RecordingSubmitter::default();
+        let model = model_with_a_review(&repository, &submitter);
+        request_submission_on_model(&model, dto::ReviewEventDto::Comment)
+            .expect("session is ready");
+
+        let sent = send_submission_on_model(&model).expect("session is ready");
+
+        let posted = submitter.posted();
+        assert_eq!(posted.len(), 1, "posted exactly once");
+        assert_eq!(posted[0].comments.len(), 1);
+        assert_eq!(posted[0].body, "Two notes.");
+        let dto::SubmissionPhaseDto::Sent { outcome } = &sent.submission.phase else {
+            panic!("expected a sent outcome, got {:?}", sent.submission.phase);
+        };
+        assert_eq!(
+            outcome.heading,
+            "Submitted as COMMENTED with 1 inline comment",
+        );
+        assert_eq!(outcome.url, "https://github.com/acme/widgets/pull/42");
+        // Forgotten only once the forge had accepted them.
+        assert_eq!(sent.summary, "");
+        assert!(sent.drafts.anchored.is_empty());
+        assert_eq!(sent.drafts.ready_count, 0);
+    }
+
+    /// A double click must not post twice, and neither must anything after a
+    /// review has already landed.
+    #[test]
+    fn a_second_confirmation_posts_nothing_more() {
+        let repository = temporary_repository();
+        let submitter = RecordingSubmitter::default();
+        let model = model_with_a_review(&repository, &submitter);
+        request_submission_on_model(&model, dto::ReviewEventDto::Comment)
+            .expect("session is ready");
+        send_submission_on_model(&model).expect("session is ready");
+
+        let again = send_submission_on_model(&model).expect("session is ready");
+
+        assert_eq!(submitter.posted().len(), 1, "still posted exactly once");
+        assert!(
+            matches!(again.submission.phase, dto::SubmissionPhaseDto::Sent { .. }),
+            "a session that has sent cannot silently resend, got {:?}",
+            again.submission.phase,
+        );
+    }
+
+    /// Sending without a confirmation posts nothing at all.
+    #[test]
+    fn sending_with_nothing_confirmed_posts_nothing() {
+        let repository = temporary_repository();
+        let submitter = RecordingSubmitter::default();
+        let model = model_with_a_review(&repository, &submitter);
+
+        let sent = send_submission_on_model(&model).expect("session is ready");
+
+        assert!(submitter.posted().is_empty());
+        assert!(matches!(
+            sent.submission.phase,
+            dto::SubmissionPhaseDto::Idle
+        ));
+        assert_eq!(sent.summary, "Two notes.");
+    }
+
+    /// A failed send must leave every draft and every word exactly where it was.
+    #[test]
+    fn a_failed_send_keeps_every_draft_and_the_summary() {
+        let repository = temporary_repository();
+        let submitter = RecordingSubmitter {
+            failure: Some(
+                domain::SessionFailure::new("The pull request moved on")
+                    .with_remediation("Your drafts are unchanged."),
+            ),
+            ..RecordingSubmitter::default()
+        };
+        let model = model_with_a_review(&repository, &submitter);
+        request_submission_on_model(&model, dto::ReviewEventDto::Comment)
+            .expect("session is ready");
+
+        let sent = send_submission_on_model(&model).expect("session is ready");
+
+        let dto::SubmissionPhaseDto::Failed { failure } = &sent.submission.phase else {
+            panic!("expected a failure, got {:?}", sent.submission.phase);
+        };
+        assert_eq!(failure.summary, "The pull request moved on");
+        assert_eq!(
+            failure.remediation.as_deref(),
+            Some("Your drafts are unchanged.")
+        );
+        assert_eq!(sent.summary, "Two notes.", "the summary is still here");
+        assert_eq!(sent.drafts.anchored.len(), 1, "so is the draft");
+        assert_eq!(sent.drafts.ready_count, 1);
     }
 
     /// A raw finding on `line` of feature.txt, which `temporary_repository` makes
