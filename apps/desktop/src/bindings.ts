@@ -395,17 +395,18 @@ export const commands = {
 	 *  Posts the confirmed review on a background thread, then reports what the
 	 *  forge said.
 	 * 
-	 *  The model is taken out of the window as its own handle, so a Session dropped
-	 *  or a window closed mid-send leaves the post finishing into a model nobody
-	 *  reads rather than panicking. A second call while the first is in flight posts
-	 *  nothing more.
+	 *  The sending state goes to `on_sending` before the post starts, so the panel
+	 *  stops offering a confirmation the moment one is acted on. The model is taken
+	 *  out of the window as its own handle, so a Session dropped or a window closed
+	 *  mid-send leaves the post finishing into a model nobody reads rather than
+	 *  panicking. A second call while the first is in flight posts nothing more.
 	 * 
 	 *  # Errors
 	 * 
 	 *  Returns a failure when no session is open, the session is not ready, or the
 	 *  task doing the posting does not finish.
 	 */
-	sendSubmission: () => typedError<SendOutcomeDto, SessionFailureDto>(__TAURI_INVOKE("send_submission")),
+	sendSubmission: (onSending: Channel<SubmissionDto>) => typedError<SendOutcomeDto, SessionFailureDto>(__TAURI_INVOKE("send_submission", { onSending })),
 };
 
 /* Types */

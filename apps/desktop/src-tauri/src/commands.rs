@@ -535,10 +535,16 @@ fn cancel_submission_on_model(
 ///
 /// A call with nothing confirmed, or one arriving while a send is already in
 /// flight, posts nothing and answers with the state that says so.
+///
+/// `report` is handed the sending state before the post starts, so the panel
+/// says so at once rather than holding a live confirmation for the whole of a
+/// network call. Taken as a plain callback so it can be tested without a Tauri
+/// channel.
 fn send_submission_on_model(
     model: &Mutex<app::SessionModel>,
+    report: &dyn Fn(dto::SubmissionDto),
 ) -> Result<dto::SendOutcomeDto, dto::SessionFailureDto> {
-    let pending = {
+    let (pending, started) = {
         let mut guard = lock(model);
         match guard.phase() {
             SessionPhase::Ready(_) => {}
@@ -546,7 +552,8 @@ fn send_submission_on_model(
                 return Err(dto::command_failure("the session is not ready"));
             }
         }
-        guard.begin_send()
+        let pending = guard.begin_send();
+        (pending, dto::project_submission(&guard))
     };
     let Some(app::PendingSend {
         submission,
@@ -555,6 +562,7 @@ fn send_submission_on_model(
     else {
         return Ok(send_outcome(&lock(model)));
     };
+    report(started);
 
     let posted = submitter.submit(&submission);
 
@@ -1532,10 +1540,11 @@ pub fn cancel_submission(
 /// Posts the confirmed review on a background thread, then reports what the
 /// forge said.
 ///
-/// The model is taken out of the window as its own handle, so a Session dropped
-/// or a window closed mid-send leaves the post finishing into a model nobody
-/// reads rather than panicking. A second call while the first is in flight posts
-/// nothing more.
+/// The sending state goes to `on_sending` before the post starts, so the panel
+/// stops offering a confirmation the moment one is acted on. The model is taken
+/// out of the window as its own handle, so a Session dropped or a window closed
+/// mid-send leaves the post finishing into a model nobody reads rather than
+/// panicking. A second call while the first is in flight posts nothing more.
 ///
 /// # Errors
 ///
@@ -1546,11 +1555,16 @@ pub fn cancel_submission(
 #[allow(clippy::needless_pass_by_value)]
 pub async fn send_submission(
     state: tauri::State<'_, AppRoot>,
+    on_sending: Channel<dto::SubmissionDto>,
 ) -> Result<dto::SendOutcomeDto, dto::SessionFailureDto> {
     let model = session_model(&state)?;
-    tauri::async_runtime::spawn_blocking(move || send_submission_on_model(&model))
-        .await
-        .map_err(|error| dto::command_failure(format!("the review was not sent: {error}")))?
+    tauri::async_runtime::spawn_blocking(move || {
+        send_submission_on_model(&model, &|submission| {
+            let _ = on_sending.send(submission);
+        })
+    })
+    .await
+    .map_err(|error| dto::command_failure(format!("the review was not sent: {error}")))?
 }
 
 #[cfg(test)]
@@ -3901,7 +3915,7 @@ mod tests {
         request_submission_on_model(&model, dto::ReviewEventDto::Comment)
             .expect("session is ready");
 
-        let sent = send_submission_on_model(&model).expect("session is ready");
+        let sent = send_submission_on_model(&model, &|_sending| {}).expect("session is ready");
 
         let posted = submitter.posted();
         assert_eq!(posted.len(), 1, "posted exactly once");
@@ -3930,9 +3944,9 @@ mod tests {
         let model = model_with_a_review(&repository, &submitter);
         request_submission_on_model(&model, dto::ReviewEventDto::Comment)
             .expect("session is ready");
-        send_submission_on_model(&model).expect("session is ready");
+        send_submission_on_model(&model, &|_sending| {}).expect("session is ready");
 
-        let again = send_submission_on_model(&model).expect("session is ready");
+        let again = send_submission_on_model(&model, &|_sending| {}).expect("session is ready");
 
         assert_eq!(submitter.posted().len(), 1, "still posted exactly once");
         assert!(
@@ -3949,7 +3963,7 @@ mod tests {
         let submitter = RecordingSubmitter::default();
         let model = model_with_a_review(&repository, &submitter);
 
-        let sent = send_submission_on_model(&model).expect("session is ready");
+        let sent = send_submission_on_model(&model, &|_sending| {}).expect("session is ready");
 
         assert!(submitter.posted().is_empty());
         assert!(matches!(
@@ -3974,7 +3988,7 @@ mod tests {
         request_submission_on_model(&model, dto::ReviewEventDto::Comment)
             .expect("session is ready");
 
-        let sent = send_submission_on_model(&model).expect("session is ready");
+        let sent = send_submission_on_model(&model, &|_sending| {}).expect("session is ready");
 
         let dto::SubmissionPhaseDto::Failed { failure } = &sent.submission.phase else {
             panic!("expected a failure, got {:?}", sent.submission.phase);

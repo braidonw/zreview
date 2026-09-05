@@ -46,6 +46,9 @@ export function useSession(
   // Held here rather than read off the panel, because a second trigger can arrive
   // before the first run's own "Running" panel has come back over the channel.
   const isRunning = useRef(false);
+  // The same, for the send. A double press must not reach the backend twice,
+  // even though the backend refuses the second one anyway.
+  const isSending = useRef(false);
 
   const isReviewRunning = state.status === "ready" && state.panel?.run.state === "Running";
   useEffect(() => {
@@ -366,21 +369,39 @@ export function useSession(
    * it. A failure keeps every draft and the summary exactly where they were.
    */
   const sendSubmission = useCallback(() => {
-    commands
-      .sendSubmission()
-      .then((sent) => {
-        if (sent.status === "error") {
-          dispatch({ type: "panelNotice", notice: toFailure(sent.error).summary });
-          return;
-        }
-        dispatch({ type: "submission", submission: sent.data.submission });
-        dispatch({ type: "drafts", drafts: sent.data.drafts });
-        // Only now is it safe for the editor to forget what was posted.
-        dispatch({ type: "summary", body: sent.data.summary });
-      })
-      .catch((error: unknown) => {
-        dispatch({ type: "panelNotice", notice: toFailure(error).summary });
-      });
+    if (isSending.current) {
+      return;
+    }
+    isSending.current = true;
+
+    try {
+      const channel = new Channel<SubmissionDto>();
+      channel.onmessage = (submission) => dispatch({ type: "submission", submission });
+
+      commands
+        .sendSubmission(channel)
+        .then((sent) => {
+          if (sent.status === "error") {
+            dispatch({ type: "panelNotice", notice: toFailure(sent.error).summary });
+            return;
+          }
+          dispatch({ type: "submission", submission: sent.data.submission });
+          dispatch({ type: "drafts", drafts: sent.data.drafts });
+          // Only now is it safe for the editor to forget what was posted.
+          dispatch({ type: "summary", body: sent.data.summary });
+        })
+        .catch((error: unknown) => {
+          dispatch({ type: "panelNotice", notice: toFailure(error).summary });
+        })
+        .finally(() => {
+          isSending.current = false;
+        });
+    } catch (error: unknown) {
+      // A throw before the promise exists would otherwise leave the flag set and
+      // nothing sendable for the rest of the sitting.
+      isSending.current = false;
+      dispatch({ type: "panelNotice", notice: toFailure(error).summary });
+    }
   }, []);
 
   const clickRow = useCallback((index: number) => dispatch({ type: "click", index }), []);
