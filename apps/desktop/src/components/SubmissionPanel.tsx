@@ -51,6 +51,13 @@ export function SubmissionPanel({
 
     case "Confirming":
       return <Confirmation request={phase.request} onCancel={onCancel} onSend={onSend} />;
+
+    default: {
+      // A submission state the backend grew that nothing here can draw. Drawing
+      // nothing would hide a review that may be in flight or may have failed.
+      const unknown: never = phase;
+      throw new Error(`the submission is in an unknown state ${JSON.stringify(unknown)}`);
+    }
   }
 }
 
