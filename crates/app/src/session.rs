@@ -68,6 +68,16 @@ pub struct SessionModel {
     /// request, in which case submitting is not offered at all.
     submitter: Option<Arc<dyn ReviewSubmitter>>,
     submission: SubmissionState,
+    /// How many times the submission has changed.
+    ///
+    /// A front end learns about this through whole-state snapshots, from several
+    /// commands running at once. One read before a change can be delivered after
+    /// a snapshot that carries it, which would show a confirmation for a verdict
+    /// the model is no longer holding. This is how the receiver tells which of
+    /// two snapshots is older.
+    ///
+    /// Saturating rather than wrapping, so it can never go backwards.
+    submission_revision: u32,
 }
 
 impl SessionModel {
@@ -82,6 +92,7 @@ impl SessionModel {
             review_sink: None,
             submitter: None,
             submission: SubmissionState::Idle,
+            submission_revision: 0,
         }
     }
 
@@ -514,17 +525,18 @@ impl SessionModel {
         let SessionPhase::Ready(review) = &self.phase else {
             return;
         };
-        self.submission = match review.session.prepare_submission(event) {
+        let next = match review.session.prepare_submission(event) {
             Ok(submission) => SubmissionState::Confirming(Box::new(submission)),
             Err(refused) => SubmissionState::Failed(
                 SessionFailure::new("This review cannot be submitted yet")
                     .with_remediation(refused.to_string()),
             ),
         };
+        self.set_submission(next);
     }
 
     pub fn cancel_submission(&mut self) {
-        self.submission = SubmissionState::Idle;
+        self.set_submission(SubmissionState::Idle);
     }
 
     /// Takes the confirmed review, so it can be posted away from the UI thread.
@@ -540,7 +552,7 @@ impl SessionModel {
             return None;
         };
         let submission = (**submission).clone();
-        self.submission = SubmissionState::Sending;
+        self.set_submission(SubmissionState::Sending);
         Some(PendingSend {
             submission,
             submitter,
@@ -565,7 +577,7 @@ impl SessionModel {
             Ok(outcome) => outcome,
             // Nothing local was touched, so every draft is still there.
             Err(failure) => {
-                self.submission = SubmissionState::Failed(failure);
+                self.set_submission(SubmissionState::Failed(failure));
                 return;
             }
         };
@@ -583,13 +595,35 @@ impl SessionModel {
         {
             sink.clear_submitted(head_sha, &anchors);
         }
-        self.submission = SubmissionState::Sent(outcome);
+        self.set_submission(SubmissionState::Sent(outcome));
     }
 
     /// How far a submission has got.
     #[must_use]
     pub const fn submission(&self) -> &SubmissionState {
         &self.submission
+    }
+
+    /// How many times the submission has changed, so a snapshot read before a
+    /// change can be told from one that carries it.
+    #[must_use]
+    pub const fn submission_revision(&self) -> u32 {
+        self.submission_revision
+    }
+
+    /// Whether this session has somewhere to post a review.
+    ///
+    /// False for the generated fixture and a local comparison, neither of which
+    /// is offered submission at all.
+    #[must_use]
+    pub const fn is_submittable(&self) -> bool {
+        self.submitter.is_some()
+    }
+
+    /// Moves the submission on, recording that it moved.
+    fn set_submission(&mut self, state: SubmissionState) {
+        self.submission = state;
+        self.submission_revision = self.submission_revision.saturating_add(1);
     }
 
     /// Tells storage what now sits at an anchor, which may be nothing.
@@ -1739,6 +1773,53 @@ mod tests {
         assert_eq!(
             sink.calls(),
             ["summary o".to_owned(), "summary ok".to_owned()],
+        );
+    }
+
+    /// Only a session with somewhere to post is offered submission at all.
+    #[test]
+    fn a_session_with_no_submitter_cannot_be_submitted() {
+        let with_submitter = loaded_model(
+            submittable_session(),
+            None,
+            Some(Arc::new(RecordingSubmitter::default())),
+        );
+        assert!(with_submitter.is_submittable());
+
+        let without = loaded_model(submittable_session(), None, None);
+        assert!(!without.is_submittable());
+        // A local comparison has a head commit but nowhere to post to.
+        assert!(!ready_model(None).is_submittable());
+    }
+
+    /// Two submission commands can be in flight at once, so a receiver has to be
+    /// able to tell which of two answers was read later.
+    #[test]
+    fn every_submission_change_carries_a_higher_revision() {
+        let mut session = submittable_session();
+        session.set_summary("Two notes.");
+        let mut model = loaded_model(session, None, Some(Arc::new(RecordingSubmitter::default())));
+        let idle = model.submission_revision();
+
+        model.request_submission(ReviewEvent::Comment);
+        let confirming = model.submission_revision();
+        assert!(confirming > idle, "confirming is later than idle");
+
+        let pending = model.begin_send().expect("the review is confirmed");
+        let sending = model.submission_revision();
+        assert!(sending > confirming, "sending is later than confirming");
+
+        let posted = pending.submitter.submit(&pending.submission);
+        model.complete_send(&pending.submission, posted);
+        assert!(
+            model.submission_revision() > sending,
+            "the outcome is later than sending",
+        );
+
+        model.cancel_submission();
+        assert!(
+            model.submission_revision() > sending,
+            "cancelling is later still",
         );
     }
 
