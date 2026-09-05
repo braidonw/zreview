@@ -7,12 +7,15 @@ export function SessionApp({
   description,
   isShowing,
   onBack,
+  onRunningChange,
 }: {
   description: string;
   /** False while Home is in front, which is when this Session yields the keyboard. */
   isShowing: boolean;
   /** Absent for a Session with no Home behind it, which offers no way back. */
   onBack: (() => void) | null;
+  /** Told whenever the review run's state changes, shown or hidden. */
+  onRunningChange: (running: boolean) => void;
 }) {
   const {
     state,
@@ -32,7 +35,7 @@ export function SessionApp({
     dismissFinding,
     replaceFinding,
     keepFinding,
-  } = useSession(description, isShowing);
+  } = useSession(description, isShowing, onRunningChange);
 
   switch (state.status) {
     case "loading":

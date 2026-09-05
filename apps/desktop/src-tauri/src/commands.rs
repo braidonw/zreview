@@ -33,6 +33,7 @@ pub fn specta_builder() -> tauri_specta::Builder<tauri::Wry> {
         remove_repository,
         toggle_repositories_footer,
         open_row,
+        open_row_cancelling_run,
         return_to_home,
         return_to_session,
         open_session,
@@ -916,7 +917,7 @@ pub fn open_row(
     state: tauri::State<'_, AppRoot>,
     repository: String,
     number: u32,
-) -> Result<dto::WindowDto, dto::SessionFailureDto> {
+) -> Result<dto::OpenRowOutcomeDto, dto::SessionFailureDto> {
     open_row_on_root(&state, &repository, u64::from(number))
 }
 
@@ -924,7 +925,7 @@ fn open_row_on_root(
     root: &AppRoot,
     repository: &str,
     number: u64,
-) -> Result<dto::WindowDto, dto::SessionFailureDto> {
+) -> Result<dto::OpenRowOutcomeDto, dto::SessionFailureDto> {
     // Looked up before the window is touched, so a row that cannot be opened
     // costs the reviewer nothing of the Session they were reading.
     let clone_root = configured_clone(&root.home, repository)?;
@@ -934,7 +935,50 @@ fn open_row_on_root(
         number,
     };
     match window.open(pull_request, clone_root) {
-        Opened::Returned | Opened::Loading => Ok(describe(&window)),
+        Opened::Returned | Opened::Loading => Ok(dto::OpenRowOutcomeDto::Opened {
+            window: describe(&window),
+        }),
+        Opened::Blocked => Ok(dto::OpenRowOutcomeDto::Blocked),
+        Opened::Refused => Err(dto::command_failure(
+            "this window has no Home to open a row from",
+        )),
+    }
+}
+
+/// Opens the pull request a Home row names, first cancelling the run the
+/// Session alive was running.
+///
+/// Reached only once the reviewer has answered the confirmation `open_row`
+/// asked for by answering [`dto::OpenRowOutcomeDto::Blocked`].
+///
+/// # Errors
+///
+/// Returns a failure when no configured clone resolves to `repository`, which
+/// leaves the Session that was alive exactly as it was.
+#[tauri::command]
+#[specta::specta]
+#[allow(clippy::needless_pass_by_value)]
+pub fn open_row_cancelling_run(
+    state: tauri::State<'_, AppRoot>,
+    repository: String,
+    number: u32,
+) -> Result<dto::WindowDto, dto::SessionFailureDto> {
+    open_row_cancelling_run_on_root(&state, &repository, u64::from(number))
+}
+
+fn open_row_cancelling_run_on_root(
+    root: &AppRoot,
+    repository: &str,
+    number: u64,
+) -> Result<dto::WindowDto, dto::SessionFailureDto> {
+    let clone_root = configured_clone(&root.home, repository)?;
+    let mut window = lock(&root.window);
+    let pull_request = PullRequestId {
+        repository: repository.to_owned(),
+        number,
+    };
+    match window.open_cancelling_run(pull_request, clone_root) {
+        Opened::Returned | Opened::Loading | Opened::Blocked => Ok(describe(&window)),
         Opened::Refused => Err(dto::command_failure(
             "this window has no Home to open a row from",
         )),
@@ -1648,6 +1692,17 @@ mod tests {
         home_root(home)
     }
 
+    /// The window `open_row_on_root` showed, panicking if it asked for a
+    /// confirmation instead.
+    fn opened_window(root: &AppRoot, repository: &str, number: u64) -> dto::WindowDto {
+        match open_row_on_root(root, repository, number).expect("the clone is configured") {
+            dto::OpenRowOutcomeDto::Opened { window } => window,
+            dto::OpenRowOutcomeDto::Blocked => {
+                panic!("no live run was expected to block this open")
+            }
+        }
+    }
+
     /// Writes `stage` on the Session the window holds.
     ///
     /// A Session kept alive keeps whatever it had reached; one loaded in its
@@ -1692,7 +1747,7 @@ mod tests {
         let settings_path = directory.path().join("settings.toml");
         let root = home_root_listing(&clone, &settings_path);
 
-        let shown = open_row_on_root(&root, "acme/widgets", 412).expect("the clone is configured");
+        let shown = opened_window(&root, "acme/widgets", 412);
 
         assert_eq!(
             shown,
@@ -1763,6 +1818,78 @@ mod tests {
         );
     }
 
+    /// Puts the Session the window holds into a running review, with no coding
+    /// agent behind it, and hands back the flag that would cancel it.
+    fn start_a_run(root: &AppRoot) -> Arc<AtomicBool> {
+        let window = lock(&root.window);
+        let session = window.session.as_ref().expect("a session is open");
+        let mut guard = lock(&session.model);
+        guard.finish(Ok(domain::LoadedSession {
+            session: domain::ReviewSession::new(
+                domain::SessionSource::Demo,
+                vec![domain::DiffFile::demo(8)].into(),
+            )
+            .expect("the fixture has files"),
+            review_sink: None,
+            submitter: None,
+        }));
+        let cancel = Arc::new(AtomicBool::new(false));
+        guard.review_started(Arc::clone(&cancel));
+        cancel
+    }
+
+    /// A live run is in the way of dropping the Session silently, so opening a
+    /// different row asks for confirmation and starts nothing.
+    #[test]
+    fn opening_another_row_with_a_live_run_is_blocked() {
+        let clone = clone_of("acme/widgets");
+        let directory = TempDir::new().unwrap();
+        let settings_path = directory.path().join("settings.toml");
+        let root = home_root_listing(&clone, &settings_path);
+        open_row_on_root(&root, "acme/widgets", 412).expect("the clone is configured");
+        start_a_run(&root);
+
+        let outcome =
+            open_row_on_root(&root, "acme/widgets", 398).expect("the clone is configured");
+
+        assert_eq!(outcome, dto::OpenRowOutcomeDto::Blocked);
+        assert_eq!(
+            open_request(&root),
+            SessionRequest::PullRequest {
+                repository: clone.path().canonicalize().unwrap(),
+                selector: github::PullRequestSelector::Number(412),
+            },
+            "the Session with the live run is still the one alive",
+        );
+    }
+
+    /// Confirming past the block cancels the run in the way and opens the row.
+    #[test]
+    fn opening_another_row_cancelling_the_run_ends_it_and_opens_the_new_session() {
+        let clone = clone_of("acme/widgets");
+        let directory = TempDir::new().unwrap();
+        let settings_path = directory.path().join("settings.toml");
+        let root = home_root_listing(&clone, &settings_path);
+        open_row_on_root(&root, "acme/widgets", 412).expect("the clone is configured");
+        let cancel = start_a_run(&root);
+
+        open_row_cancelling_run_on_root(&root, "acme/widgets", 398)
+            .expect("the clone is configured");
+
+        assert!(
+            cancel.load(Ordering::Relaxed),
+            "the run in the way was cancelled"
+        );
+        assert_eq!(
+            open_request(&root),
+            SessionRequest::PullRequest {
+                repository: clone.path().canonicalize().unwrap(),
+                selector: github::PullRequestSelector::Number(398),
+            },
+            "the new row's Session is the one alive now",
+        );
+    }
+
     #[test]
     fn going_back_shows_home_and_reports_the_session_still_alive_behind_it() {
         let clone = clone_of("acme/widgets");
@@ -1799,7 +1926,7 @@ mod tests {
         let directory = TempDir::new().unwrap();
         let settings_path = directory.path().join("settings.toml");
         let root = home_root_listing(&clone, &settings_path);
-        let opened = open_row_on_root(&root, "acme/widgets", 412).expect("the clone is configured");
+        let opened = opened_window(&root, "acme/widgets", 412);
         return_to_home_on_root(&root).expect("there is a Home behind it");
 
         let shown = return_to_session_on_root(&root).expect("a session is alive");

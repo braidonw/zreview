@@ -5,7 +5,7 @@ use std::{
     sync::{Arc, Mutex, atomic::AtomicBool},
 };
 
-use app::{HomeModel, Opened, PullRequestId, SessionModel, SessionSlot};
+use app::{HomeModel, Opened, PullRequestId, SessionModel, SessionSlot, lock};
 use github::{GithubClient, PullRequestSelector};
 use session::{ReviewStorage, SessionRequest};
 
@@ -113,14 +113,44 @@ impl Window {
     /// Opens `pull_request` from a Home row, out of the clone at `clone_root`.
     ///
     /// The Session already alive on this pull request is shown again rather
-    /// than loaded a second time, which is what makes coming back instant. Any
-    /// other Session is dropped, silently, because Drafts already persist. A
-    /// window with no Home refuses the row and keeps what it holds.
+    /// than loaded a second time, which is what makes coming back instant. A
+    /// different Session with no live run is dropped, silently, because Drafts
+    /// already persist. A different Session with a live run is left alone and
+    /// answered with [`Opened::Blocked`], so the caller can ask the reviewer
+    /// before touching it; [`Self::open_cancelling_run`] is the confirmed path
+    /// past that. A window with no Home refuses the row and keeps what it holds.
     pub(crate) fn open(&mut self, pull_request: PullRequestId, clone_root: PathBuf) -> Opened {
+        let run_is_live = self.hidden_run_is_live();
+        self.open_asking(pull_request, clone_root, run_is_live)
+    }
+
+    /// Opens `pull_request`, cancelling the run the Session alive was running
+    /// first.
+    ///
+    /// Only reached once the reviewer has answered the confirmation
+    /// [`Opened::Blocked`] asked, so the live run is no longer in the way of
+    /// dropping that Session.
+    pub(crate) fn open_cancelling_run(
+        &mut self,
+        pull_request: PullRequestId,
+        clone_root: PathBuf,
+    ) -> Opened {
+        if let Some(session) = &self.session {
+            lock(&session.model).cancel_review();
+        }
+        self.open_asking(pull_request, clone_root, false)
+    }
+
+    fn open_asking(
+        &mut self,
+        pull_request: PullRequestId,
+        clone_root: PathBuf,
+        run_is_live: bool,
+    ) -> Opened {
         let number = pull_request.number;
-        let opened = self.slot.open(pull_request);
+        let opened = self.slot.open(pull_request, run_is_live);
         match opened {
-            Opened::Returned | Opened::Refused => {}
+            Opened::Returned | Opened::Refused | Opened::Blocked => {}
             Opened::Loading => {
                 self.session = Some(ManagedSession::new(
                     SessionRequest::PullRequest {
@@ -132,6 +162,16 @@ impl Window {
             }
         }
         opened
+    }
+
+    /// Whether the Session alive behind Home, if there is one, has a review run
+    /// in flight.
+    fn hidden_run_is_live(&self) -> bool {
+        self.session.as_ref().is_some_and(|session| {
+            lock(&session.model)
+                .review()
+                .is_some_and(|review| review.run().is_running())
+        })
     }
 }
 

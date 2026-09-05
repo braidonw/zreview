@@ -64,6 +64,40 @@
   color: var(--accent-text);
 }
 
+/* Shown beside the slot's identity while that Session's review is running. */
+.home__slot-status {
+  padding-left: 6px;
+  border-left: 1px solid var(--accent-base);
+  font-family: var(--font-mono);
+  font-size: var(--size-label);
+  color: var(--accent-text);
+}
+
+/* The confirmation opening a different row asks for while a live run behind
+   Home is in the way. */
+.home__confirm {
+  flex-shrink: 0;
+  padding: 10px 20px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  border-bottom: 1px solid var(--border-default);
+  background: var(--surface-raised);
+}
+
+.home__confirm-text {
+  font-family: var(--font-sans);
+  font-size: var(--size-body);
+  color: var(--text-primary);
+}
+
+.home__confirm-actions {
+  flex-shrink: 0;
+  display: flex;
+  gap: 8px;
+}
+
 .home__stamp {
   display: flex;
   align-items: center;

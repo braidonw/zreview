@@ -78,6 +78,18 @@ pub enum WindowDto {
     Session { session: OpenSessionDto },
 }
 
+/// What opening a row answered with.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, specta::Type)]
+#[serde(tag = "outcome")]
+pub enum OpenRowOutcomeDto {
+    /// The row opened, or the Session already alive on it was shown again.
+    Opened { window: WindowDto },
+    /// The Session alive behind Home has a live run in the way. Nothing was
+    /// touched; the frontend asks the reviewer to cancel the run and continue,
+    /// or stay.
+    Blocked,
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, specta::Type)]
 pub enum DiffSideDto {
     Left,

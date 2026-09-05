@@ -67,7 +67,20 @@ export const commands = {
 	 *  Returns a failure when no configured clone resolves to `repository`, which
 	 *  leaves the Session that was alive exactly as it was.
 	 */
-	openRow: (repository: string, number: number) => typedError<WindowDto, SessionFailureDto>(__TAURI_INVOKE("open_row", { repository, number })),
+	openRow: (repository: string, number: number) => typedError<OpenRowOutcomeDto, SessionFailureDto>(__TAURI_INVOKE("open_row", { repository, number })),
+	/**
+	 *  Opens the pull request a Home row names, first cancelling the run the
+	 *  Session alive was running.
+	 * 
+	 *  Reached only once the reviewer has answered the confirmation `open_row`
+	 *  asked for by answering [`dto::OpenRowOutcomeDto::Blocked`].
+	 * 
+	 *  # Errors
+	 * 
+	 *  Returns a failure when no configured clone resolves to `repository`, which
+	 *  leaves the Session that was alive exactly as it was.
+	 */
+	openRowCancellingRun: (repository: string, number: number) => typedError<WindowDto, SessionFailureDto>(__TAURI_INVOKE("open_row_cancelling_run", { repository, number })),
 	/**
 	 *  Shows Home again, leaving the Session alive behind it.
 	 * 
@@ -577,6 +590,17 @@ export type HomeSnapshotDto = {
 	 */
 	drafts_failure: SessionFailureDto | null,
 };
+
+/**  What opening a row answered with. */
+export type OpenRowOutcomeDto = 
+/**  The row opened, or the Session already alive on it was shown again. */
+{ outcome: "Opened"; window: WindowDto } | 
+/**
+ *  The Session alive behind Home has a live run in the way. Nothing was
+ *  touched; the frontend asks the reviewer to cancel the run and continue,
+ *  or stay.
+ */
+{ outcome: "Blocked" };
 
 /**  The one Session the window holds, in front of Home or alive behind it. */
 export type OpenSessionDto = {

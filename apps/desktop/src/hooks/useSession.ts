@@ -18,9 +18,15 @@ type PanelResult = CommandResult<ReviewPanelDto>;
  * Loads one session and exposes every action the UI can take on it.
  *
  * `isShowing` is false while Home is in front of this session, which keeps its
- * hidden tree from answering keystrokes meant for the list.
+ * hidden tree from answering keystrokes meant for the list. `onRunningChange`
+ * is told whenever the review run's state changes, whether or not this session
+ * is showing, which is how Home's header slot follows a run it cannot see.
  */
-export function useSession(description: string, isShowing: boolean) {
+export function useSession(
+  description: string,
+  isShowing: boolean,
+  onRunningChange: (running: boolean) => void,
+) {
   const [state, dispatch] = useReducer(sessionReducer, initialState);
   const stateRef = useRef(state);
   stateRef.current = state;
@@ -29,6 +35,11 @@ export function useSession(description: string, isShowing: boolean) {
   // Held here rather than read off the panel, because a second trigger can arrive
   // before the first run's own "Running" panel has come back over the channel.
   const isRunning = useRef(false);
+
+  const isReviewRunning = state.status === "ready" && state.panel?.run.state === "Running";
+  useEffect(() => {
+    onRunningChange(isReviewRunning);
+  }, [isReviewRunning, onRunningChange]);
 
   useEffect(() => {
     if (hasOpened.current) {
