@@ -4051,6 +4051,40 @@ mod tests {
         assert!(draft.is_proposed);
     }
 
+    /// A finding about the change as a whole has nowhere to anchor, so it belongs
+    /// in the summary, joined onto whatever the reviewer had already written.
+    #[test]
+    fn accepting_a_whole_change_finding_lands_in_the_summary_and_retires_it() {
+        let repository = temporary_repository();
+        let model = local_model(&local_request(&repository), &ReviewStorage::Disabled);
+        edit_summary_on_model(&model, "Mostly good.".to_owned()).expect("session is ready");
+        let backend = FakeBackend::new(
+            Vec::new(),
+            Ok(vec![domain::RawFinding {
+                location: None,
+                ..raw_finding_on(2, "no tests at all")
+            }]),
+        );
+        let (finished, _) = run_with(&model, &backend);
+        let id = finished.expect("the session can be reviewed").findings[0].id;
+
+        let outcome = accept_finding_on_model(&model, id).expect("the session can be reviewed");
+
+        let dto::AcceptDispositionDto::Summary { body } = outcome.disposition else {
+            panic!(
+                "a whole-change finding belongs in the summary, got {:?}",
+                outcome.disposition
+            );
+        };
+        assert_eq!(body, "Mostly good.\n\nHandle the failure here.");
+        assert!(outcome.panel.findings.is_empty(), "the finding retires");
+        let guard = lock(&model);
+        let SessionPhase::Ready(review) = guard.phase() else {
+            panic!("session should be ready");
+        };
+        assert_eq!(review.session().summary(), body);
+    }
+
     /// Acceptance must never overwrite; the panel is asked instead.
     #[test]
     fn accepting_onto_an_occupied_line_asks_before_overwriting() {
