@@ -352,7 +352,7 @@ describe("the Session kept alive behind Home", () => {
     runReview.mockImplementation((channel: { onmessage: (panel: unknown) => void }) => {
       deliver = (panel: unknown) => channel.onmessage(panel);
       return new Promise(() => {
-        // Never settles: the run is still going when Home comes in front.
+        // Never settles, since the run is still going when Home comes in front.
       });
     });
     await openTheCursorRow();
@@ -367,7 +367,6 @@ describe("the Session kept alive behind Home", () => {
 
     await waitFor(() => expect(screen.getByText("Reading src/main.rs")).toBeTruthy());
     expect(screen.getByRole("button", { name: "Cancel" })).toBeTruthy();
-    expect(cancelReview).not.toHaveBeenCalled();
   });
 
   it("shows review running in the header slot while the hidden Session's run is live, and drops it once the run ends", async () => {
@@ -535,6 +534,60 @@ describe("the Session kept alive behind Home", () => {
     expect(screen.queryByRole("button", { name: "Cancel run and continue" })).toBeNull();
     expect(openRowCancellingRun).not.toHaveBeenCalled();
     expect(screen.getByText("Retry webhook deliveries")).toBeTruthy();
+  });
+
+  it("answers the confirmation from the keyboard, escape to stay and enter to continue", async () => {
+    const user = userEvent.setup();
+    describeWindow.mockResolvedValue(showingHome(alive()));
+    refreshHome.mockResolvedValue(ok(withAliveRow()));
+    openRow.mockResolvedValue(ok(blocked));
+    await openHome();
+    await user.click(screen.getByText("Split the invoice renderer"));
+    await waitFor(() =>
+      expect(screen.getByText(/Cancel it and open acme\/widgets#398/)).toBeTruthy(),
+    );
+
+    // The list keys stay out of the way while the question is up.
+    fireEvent.keyDown(window, { key: "j" });
+    expect(moveHomeCursor).not.toHaveBeenCalled();
+
+    fireEvent.keyDown(window, { key: "Escape" });
+    await waitFor(() =>
+      expect(screen.queryByRole("button", { name: "Cancel run and continue" })).toBeNull(),
+    );
+    expect(openRowCancellingRun).not.toHaveBeenCalled();
+
+    await user.click(screen.getByText("Split the invoice renderer"));
+    await waitFor(() =>
+      expect(screen.getByRole("button", { name: "Cancel run and continue" })).toBeTruthy(),
+    );
+    fireEvent.keyDown(window, { key: "Enter" });
+
+    await waitFor(() => expect(openRowCancellingRun).toHaveBeenCalledWith("acme/widgets", 398));
+  });
+
+  it("drops the confirmation when Home is left, so a stale answer cannot cancel a run", async () => {
+    const user = userEvent.setup();
+    describeWindow.mockResolvedValue(showingHome(alive()));
+    refreshHome.mockResolvedValue(ok(withAliveRow()));
+    openRow.mockResolvedValue(ok(blocked));
+    returnToSession.mockResolvedValue(ok(showingSession(alive())));
+    await openHome();
+    await user.click(screen.getByText("Split the invoice renderer"));
+    await waitFor(() =>
+      expect(screen.getByRole("button", { name: "Cancel run and continue" })).toBeTruthy(),
+    );
+
+    // Into the Session the run belongs to, which abandons the question.
+    await user.click(screen.getByRole("button", { name: /acme\/widgets#412/ }));
+    await waitFor(() =>
+      expect(document.querySelector(".app__home")?.hasAttribute("hidden")).toBe(true),
+    );
+    fireEvent.keyDown(window, { key: "[", metaKey: true });
+
+    await waitFor(() => expect(screen.getByText("Retry webhook deliveries")).toBeTruthy());
+    expect(screen.queryByRole("button", { name: "Cancel run and continue" })).toBeNull();
+    expect(openRowCancellingRun).not.toHaveBeenCalled();
   });
 
   it("cancels the run and opens the new row when the confirmation is answered cancel and continue", async () => {

@@ -65,7 +65,7 @@ export default function App() {
    * Opens `repository#number`, answering with whether it opened, whether a
    * live run behind Home blocked it, or a refusal.
    *
-   * A block is not a failure and is not shown here: Home renders the
+   * A block is not a failure and is not shown here. Home renders the
    * confirmation and asks again through `cancelRunAndOpenRow`.
    */
   const openRow = useCallback((repository: string, number: number): Promise<OpenRowResult> => {

@@ -120,7 +120,7 @@ impl SessionSlot {
     /// Opens `pull_request` from a row, showing its Session.
     ///
     /// The Session already alive on this pull request is shown again rather
-    /// than loaded a second time, whether or not it has a live run: returning
+    /// than loaded a second time, whether or not it has a live run. Returning
     /// to a Session's own row never asks anything. A different Session with no
     /// live run (`run_is_live` false) is dropped silently, because Drafts
     /// already persist. A different Session with a live run is left alone and
@@ -253,6 +253,9 @@ mod tests {
     fn opening_a_different_pull_request_with_a_live_run_is_blocked() {
         let mut slot = SessionSlot::home();
         let _opened = slot.open(pull_request(412), false);
+        // Back on Home, which is where a row is opened from, so the assertion
+        // below says something about the path a reviewer actually walks.
+        assert!(slot.back_to_home());
 
         assert_eq!(slot.open(pull_request(398), true), Opened::Blocked);
 
@@ -261,7 +264,11 @@ mod tests {
             Some(&OpenSession::FromRow(pull_request(412))),
             "the Session with the live run is still the one alive",
         );
-        assert_eq!(slot.showing(), Showing::Session);
+        assert_eq!(
+            slot.showing(),
+            Showing::Home,
+            "a blocked open leaves Home in front to ask the question",
+        );
     }
 
     /// Returning to the Session's own row never asks anything, live run or not.
