@@ -36,11 +36,13 @@ function isTyping(target: EventTarget | null): boolean {
  */
 export function useHome({
   isShowing,
+  isReviewRunning,
   onOpenRow,
   onCancelRunAndOpenRow,
   onReturnToSession,
 }: {
   isShowing: boolean;
+  isReviewRunning: boolean;
   onOpenRow: (repository: string, number: number) => Promise<OpenRowResult>;
   onCancelRunAndOpenRow: (repository: string, number: number) => Promise<SessionFailureDto | null>;
   onReturnToSession: () => Promise<SessionFailureDto | null>;
@@ -109,6 +111,11 @@ export function useHome({
       return;
     }
     showed.current = isShowing;
+    if (!isShowing) {
+      // The question was about opening a row from Home. Leaving Home abandons
+      // it, and answering a stale one would cancel a run nobody asked about.
+      setRunConfirmation(null);
+    }
     if (isShowing) {
       refresh();
     }
@@ -242,6 +249,14 @@ export function useHome({
   /** Leaves the run and the Session it belongs to exactly as they were. */
   const stayOnHome = useCallback(() => setRunConfirmation(null), []);
 
+  // A run that ended answers the question itself, so the confirmation goes
+  // rather than offering to cancel something that is already over.
+  useEffect(() => {
+    if (!isReviewRunning) {
+      setRunConfirmation(null);
+    }
+  }, [isReviewRunning]);
+
   const openCursorRow = useCallback(() => {
     const listed = shown.current;
     if (listed === null) {
@@ -270,6 +285,19 @@ export function useHome({
         return;
       }
       const key = event.key.toLowerCase();
+      // The confirmation is the only question on screen while it is up, so it
+      // answers first and the list keys stay out of its way.
+      if (runConfirmation !== null) {
+        if (key === "enter") {
+          event.preventDefault();
+          cancelRunAndOpenRow();
+        }
+        if (key === "escape") {
+          event.preventDefault();
+          stayOnHome();
+        }
+        return;
+      }
       if (key === "enter") {
         event.preventDefault();
         openCursorRow();
@@ -298,7 +326,16 @@ export function useHome({
 
     window.addEventListener("keydown", handleKeydown);
     return () => window.removeEventListener("keydown", handleKeydown);
-  }, [isShowing, moveCursor, openCursorRow, refresh, toggleFooter]);
+  }, [
+    cancelRunAndOpenRow,
+    isShowing,
+    moveCursor,
+    openCursorRow,
+    refresh,
+    runConfirmation,
+    stayOnHome,
+    toggleFooter,
+  ]);
 
   return {
     snapshot,

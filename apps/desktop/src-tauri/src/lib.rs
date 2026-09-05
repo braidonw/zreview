@@ -5,7 +5,7 @@ use std::{
     sync::{Arc, Mutex, atomic::AtomicBool},
 };
 
-use app::{HomeModel, Opened, PullRequestId, SessionModel, SessionSlot, lock};
+use app::{HomeModel, OpenSession, Opened, PullRequestId, SessionModel, SessionSlot, lock};
 use github::{GithubClient, PullRequestSelector};
 use session::{ReviewStorage, SessionRequest};
 
@@ -135,6 +135,11 @@ impl Window {
         pull_request: PullRequestId,
         clone_root: PathBuf,
     ) -> Opened {
+        // Refused first, so a window with no Home never cancels a run it then
+        // refuses to replace.
+        if matches!(self.slot.session(), Some(OpenSession::FromCommandLine)) {
+            return Opened::Refused;
+        }
         if let Some(session) = &self.session {
             lock(&session.model).cancel_review();
         }

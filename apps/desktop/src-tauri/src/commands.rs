@@ -978,10 +978,13 @@ fn open_row_cancelling_run_on_root(
         number,
     };
     match window.open_cancelling_run(pull_request, clone_root) {
-        Opened::Returned | Opened::Loading | Opened::Blocked => Ok(describe(&window)),
+        Opened::Returned | Opened::Loading => Ok(describe(&window)),
         Opened::Refused => Err(dto::command_failure(
             "this window has no Home to open a row from",
         )),
+        // The run in the way was cancelled before the slot was asked, so
+        // nothing can still be blocking it.
+        Opened::Blocked => unreachable!("the run was cancelled before this open"),
     }
 }
 

@@ -53,7 +53,13 @@ export function HomeScreen({
     runConfirmation,
     cancelRunAndOpenRow,
     stayOnHome,
-  } = useHome({ isShowing, onOpenRow, onCancelRunAndOpenRow, onReturnToSession });
+  } = useHome({
+    isShowing,
+    isReviewRunning,
+    onOpenRow,
+    onCancelRunAndOpenRow,
+    onReturnToSession,
+  });
   const nowMs = useNow();
 
   // A command that never answered leaves nothing worth trusting on screen.
