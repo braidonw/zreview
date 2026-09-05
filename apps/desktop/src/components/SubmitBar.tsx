@@ -1,4 +1,5 @@
 import type { ReviewEventDto } from "../bindings";
+import type { SummaryState } from "../hooks/sessionReducer";
 import { SummaryEditor } from "./SummaryEditor";
 import "./SubmitBar.css";
 
@@ -26,8 +27,8 @@ export function SubmitBar({
 }: {
   readyCount: number;
   notAnchoredCount: number;
-  /** What the editor should hold, which moves only when the backend says so. */
-  summary: string;
+  /** What the editor holds, and how many times the backend has replaced it. */
+  summary: SummaryState;
   /** True while a review is in flight, when no other submission may be started. */
   isSending: boolean;
   onSummaryChange: (body: string) => void;
@@ -41,7 +42,7 @@ export function SubmitBar({
           <span className="submit-bar__stale">{notAnchoredCount} not anchored</span>
         )}
       </div>
-      <SummaryEditor summary={summary} onChange={onSummaryChange} />
+      <SummaryEditor body={summary.body} loads={summary.loads} onChange={onSummaryChange} />
       <div className="submit-bar__actions">
         {ACTIONS.map(({ event, label, tone }) => (
           <button

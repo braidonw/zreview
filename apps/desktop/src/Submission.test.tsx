@@ -171,6 +171,17 @@ describe("the summary editor", () => {
     expect(document.querySelector("[data-composer]")).toBeNull();
   });
 
+  it("says so when the summary is not reaching storage, with no draft to carry it", async () => {
+    const user = userEvent.setup();
+    editSummary.mockResolvedValue({ status: "ok", data: "disk is full" });
+    await openSubmitBar();
+
+    await user.click(await summaryField());
+    await user.keyboard("ok");
+
+    await waitFor(() => expect(screen.getByText(/disk is full/)).toBeTruthy());
+  });
+
   it("restores what the snapshot brought back from storage", async () => {
     openSession.mockResolvedValue({
       status: "ok",
@@ -323,6 +334,50 @@ describe("sending the review", () => {
     // The editor is emptied only once the forge has accepted it.
     const field = await summaryField();
     expect(field.textContent).toBe("");
+  });
+
+  it("empties the editor once the review has landed, so nothing writes it back", async () => {
+    const user = userEvent.setup();
+    requestSubmission.mockResolvedValue({
+      status: "ok",
+      data: makeSubmission({ state: "Confirming", request: makeSubmissionRequest() }),
+    });
+    sendSubmission.mockResolvedValue({
+      status: "ok",
+      data: {
+        submission: makeSubmission(
+          {
+            state: "Sent",
+            outcome: {
+              heading: "Submitted as COMMENTED with 1 inline comment",
+              url: "https://github.com/acme/widgets/pull/42",
+            },
+          },
+          3,
+        ),
+        drafts: makeDrafts({ ready_count: 0, not_anchored_count: 0 }),
+        summary: "",
+      },
+    });
+    await openSubmitBar();
+    await user.click(await summaryField());
+    await user.keyboard("Two notes.");
+    await waitFor(() => expect(editSummary).toHaveBeenCalledWith("Two notes."));
+
+    await confirm(user, "Comment");
+    await user.click(screen.getByRole("button", { name: "Post this review to GitHub" }));
+    await waitFor(() =>
+      expect(screen.getByText("Submitted as COMMENTED with 1 inline comment")).toBeTruthy(),
+    );
+
+    expect((await summaryField()).textContent).toBe("");
+    // A keystroke now must not write the posted summary back into the store,
+    // which would restore a review already on GitHub the next time this opens.
+    editSummary.mockClear();
+    await user.click(await summaryField());
+    await user.keyboard("x");
+    await waitFor(() => expect(editSummary).toHaveBeenCalledWith("x"));
+    expect(editSummary).not.toHaveBeenCalledWith(expect.stringContaining("Two notes."));
   });
 
   it("keeps every draft and the summary when the send fails", async () => {

@@ -8,6 +8,7 @@ import {
   makePanel,
   makeRow,
   makeSnapshot,
+  makeSubmission,
 } from "../test/fixtures";
 import {
   type ReadyState,
@@ -38,8 +39,8 @@ function readyState(rowCount: number, cursor = 0, anchor = 0): ReadyState {
     panel: null,
     panelNotice: null,
     findingConflict: null,
-    submission: { revision: 0, phase: { state: "Idle" } },
-    summary: "",
+    submission: makeSubmission({ state: "Idle" }, 0),
+    summary: { body: "", loads: 0 },
   };
 }
 

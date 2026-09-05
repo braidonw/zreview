@@ -5,24 +5,28 @@ import "./SummaryEditor.css";
 /**
  * The review summary, in the same Markdown editor the comment composer uses.
  *
- * Seeded once on mount from whatever storage restored, and written through on
- * every keystroke. `summary` is reloaded into it only when it moves, which the
- * backend does after a whole-change finding lands in it or a successful send
- * empties it. Typing never moves it, so the reviewer's cursor is left alone.
+ * Seeded once on mount from whatever storage restored, and reported on every
+ * keystroke. `body` is taken back into it only when `loads` moves, which the
+ * backend does after a whole-change finding is merged in or a landed review
+ * empties it. Typing never moves `loads`, so the reviewer's caret is never reset
+ * by their own keystrokes.
  */
 export function SummaryEditor({
-  summary,
+  body,
+  loads,
   onChange,
 }: {
-  summary: string;
+  body: string;
+  /** How many times the backend has replaced the text. */
+  loads: number;
   onChange: (body: string) => void;
 }) {
   const containerRef = useRef<HTMLDivElement>(null);
   const editorRef = useRef<MarkdownEditorHandle | null>(null);
   const onChangeRef = useRef(onChange);
   onChangeRef.current = onChange;
-  const loadedRef = useRef(summary);
-  const seedRef = useRef(summary);
+  const loadedRef = useRef(loads);
+  const seedRef = useRef(body);
 
   useEffect(() => {
     const container = containerRef.current;
@@ -32,7 +36,7 @@ export function SummaryEditor({
     const handle = createMarkdownEditor({
       parent: container,
       initialText: seedRef.current,
-      onChange: (body) => onChangeRef.current(body),
+      onChange: (typed) => onChangeRef.current(typed),
       // The summary has nothing to close; Escape and Mod-Enter do nothing here.
       onClose: () => {},
     });
@@ -44,12 +48,12 @@ export function SummaryEditor({
   }, []);
 
   useEffect(() => {
-    if (summary === loadedRef.current) {
+    if (loads === loadedRef.current) {
       return;
     }
-    loadedRef.current = summary;
-    editorRef.current?.load(summary);
-  }, [summary]);
+    loadedRef.current = loads;
+    editorRef.current?.load(body);
+  }, [loads, body]);
 
   return (
     <div className="summary-editor" data-summary-editor>

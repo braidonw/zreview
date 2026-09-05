@@ -14,6 +14,9 @@ import { clamp } from "../lib/clamp";
 /** Shown under the composer when a span was refused rather than saved. */
 const REJECTED_NOTICE = "This selection cannot hold a comment";
 
+/** What the summary editor holds, with a count that moves only on a backend replacement. */
+export type SummaryState = { body: string; loads: number };
+
 /** The composer's frozen span and any notice it is showing, or absent when closed. */
 export type ComposerState = { rows: [number, number]; notice: string | null } | null;
 
@@ -54,14 +57,18 @@ export type SessionState =
        */
       submission: SubmissionDto;
       /**
-       * The text the backend last said the summary editor should hold.
+       * What the summary editor holds, and how many times the backend has
+       * replaced it.
        *
-       * Typing does not change this. It moves only when the backend hands back
-       * text of its own, which is a whole-change finding accepted into the
-       * summary or a successful send emptying it, and that is what tells the
-       * editor to reload rather than fighting the reviewer's cursor.
+       * `body` moves with every keystroke, so this is never a stale copy of what
+       * is on screen. `loads` moves only when the backend replaces the text,
+       * which is a whole-change finding merged in or a landed review emptying
+       * it, and is what tells the editor to take the new text. Comparing the
+       * text itself cannot do that job, because React state trails the editor by
+       * a keystroke and an equality check ends up loading an older document over
+       * a newer one, eating what was just typed.
        */
-      summary: string;
+      summary: SummaryState;
     };
 
 export type ReadyState = Extract<SessionState, { status: "ready" }>;
@@ -85,6 +92,7 @@ export type SessionAction =
   | { type: "panel"; panel: ReviewPanelDto | null }
   | { type: "submission"; submission: SubmissionDto }
   | { type: "summary"; body: string }
+  | { type: "summaryLoaded"; body: string }
   | { type: "panelNotice"; notice: string }
   | { type: "findingConflict"; conflict: FindingConflict }
   | { type: "file"; file: FileDetailDto }
@@ -95,6 +103,7 @@ export type SessionAction =
   | { type: "openComposer"; index: number }
   | { type: "closeComposer" }
   | { type: "drafts"; drafts: DraftsDto }
+  | { type: "writeFailure"; failure: string | null }
   | { type: "editRejected" };
 
 /** Clamps a cursor into a row range, or to zero when the file has no rows. */
@@ -132,7 +141,7 @@ export function sessionReducer(state: SessionState, action: SessionAction): Sess
         panelNotice: null,
         findingConflict: null,
         submission: { revision: 0, phase: { state: "Idle" } },
-        summary: action.snapshot.summary,
+        summary: { body: action.snapshot.summary, loads: 0 },
       };
 
     case "submission": {
@@ -153,7 +162,18 @@ export function sessionReducer(state: SessionState, action: SessionAction): Sess
       if (state.status !== "ready") {
         return state;
       }
-      return { ...state, summary: action.body };
+      // Typed, so the editor already shows it and must not be handed it back.
+      return { ...state, summary: { ...state.summary, body: action.body } };
+
+    case "summaryLoaded":
+      if (state.status !== "ready") {
+        return state;
+      }
+      // Replaced by the backend, so the editor is told to take it.
+      return {
+        ...state,
+        summary: { body: action.body, loads: state.summary.loads + 1 },
+      };
 
     case "panel": {
       if (state.status !== "ready") {
@@ -258,6 +278,15 @@ export function sessionReducer(state: SessionState, action: SessionAction): Sess
         drafts: action.drafts,
         composer: state.composer ? { ...state.composer, notice: null } : null,
       };
+
+    case "writeFailure": {
+      if (state.status !== "ready" || state.drafts.write_failure === action.failure) {
+        return state;
+      }
+      // The same session-wide reason a drafts answer carries, from the one
+      // command a reviewer writing only a summary ever calls.
+      return { ...state, drafts: { ...state.drafts, write_failure: action.failure } };
+    }
 
     case "editRejected":
       if (state.status !== "ready" || !state.composer) {

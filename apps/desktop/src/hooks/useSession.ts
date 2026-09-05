@@ -274,7 +274,7 @@ export function useSession(
         // A finding about the change as a whole has nowhere to anchor, so its
         // proposal goes into the summary editor for the reviewer to edit or clear.
         if (disposition.outcome === "Summary") {
-          dispatch({ type: "summary", body: disposition.body });
+          dispatch({ type: "summaryLoaded", body: disposition.body });
         }
       });
     },
@@ -315,8 +315,19 @@ export function useSession(
   /** Leaves the reviewer's draft and the finding both exactly as they were. */
   const keepFinding = useCallback(() => dispatch({ type: "findingConflict", conflict: null }), []);
 
-  /** Persists the summary, on the same queue the drafts use, on every keystroke. */
-  const summaryChange = useCallback((body: string) => draftQueue.editSummary(body), [draftQueue]);
+  /**
+   * Persists the summary on every keystroke, on the same queue the drafts use.
+   *
+   * Held in state as well as sent, so what the editor holds is never guessed at
+   * from an older answer.
+   */
+  const summaryChange = useCallback(
+    (body: string) => {
+      dispatch({ type: "summary", body });
+      draftQueue.editSummary(body);
+    },
+    [draftQueue],
+  );
 
   /**
    * Runs a submission command, showing a refusal in the panel.
@@ -386,7 +397,7 @@ export function useSession(
           // it alone, because the backend's copy of the summary can be a
           // keystroke behind what the reviewer is still typing.
           if (sent.data.submission.phase.state === "Sent") {
-            dispatch({ type: "summary", body: sent.data.summary });
+            dispatch({ type: "summaryLoaded", body: sent.data.summary });
           }
         })
         .catch((error: unknown) => {

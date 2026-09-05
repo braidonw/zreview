@@ -28,8 +28,11 @@ function send(command: DraftCommand) {
   }
 }
 
-/** Whichever `DraftsDto` a settled command hands back, and whether it was accepted. */
-function outcome(command: DraftCommand, data: DraftsDto | { accepted: boolean; drafts: DraftsDto }) {
+/** Whatever a settled command hands back, before it is narrowed by its kind. */
+type CommandData = DraftsDto | { accepted: boolean; drafts: DraftsDto } | string | null;
+
+/** Whichever `DraftsDto` a settled draft command hands back, and whether it was accepted. */
+function outcome(command: DraftCommand, data: CommandData) {
   return command.kind === "edit"
     ? (data as { accepted: boolean; drafts: DraftsDto })
     : { accepted: true, drafts: data as DraftsDto };
@@ -52,9 +55,15 @@ export function useDraftQueue(dispatch: (action: SessionAction) => void) {
   const pending = useRef<DraftCommand[]>([]);
 
   const settle = useCallback(
-    (command: DraftCommand, data: DraftsDto | { accepted: boolean; drafts: DraftsDto } | null) => {
-      // The summary answers with nothing. The editor already holds what it sent.
-      if (command.kind === "summary" || data === null) {
+    (command: DraftCommand, data: CommandData) => {
+      // A summary write does not echo the text back, because the editor already
+      // holds it. What it answers with is whatever is stopping writes landing,
+      // which for a reviewer touching no draft is the only way they are told.
+      if (command.kind === "summary") {
+        dispatch({ type: "writeFailure", failure: data as string | null });
+        return;
+      }
+      if (data === null) {
         return;
       }
       const { accepted, drafts } = outcome(command, data);
