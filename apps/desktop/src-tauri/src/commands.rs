@@ -580,18 +580,21 @@ fn send_submission_on_model(
 /// Reached only when the blocking task did not finish, which leaves the model
 /// on its sending state with nothing left to move it off. Ignored by the model
 /// if the outcome was in fact recorded before the task died.
-///
-/// # Panics
-///
-/// Panics if the model is not `Ready`. Only a model that reached `Ready` can
-/// have had a send handed out of it, and the phase cannot regress.
 fn abandon_send_on_model(
     model: &Mutex<app::SessionModel>,
     failure: domain::SessionFailure,
-) -> dto::SendOutcomeDto {
+) -> Result<dto::SendOutcomeDto, dto::SessionFailureDto> {
     let mut guard = lock(model);
+    match guard.phase() {
+        SessionPhase::Ready(_) => {}
+        // A task that died before the session was ready never held a send, so
+        // there is no submission to put back and nothing to draw around it.
+        SessionPhase::Loading { .. } | SessionPhase::Failed(_) => {
+            return Err((&failure).into());
+        }
+    }
     guard.abandon_send(failure);
-    send_outcome(&guard)
+    Ok(send_outcome(&guard))
 }
 
 /// How far the submission has got, with what the Session must redraw after it.
@@ -1599,13 +1602,13 @@ pub async fn send_submission(
         // submission would sit on sending for the rest of the sitting, refusing
         // every retry. Whether the review reached GitHub is genuinely unknown
         // here, and the reviewer is told exactly that.
-        Err(error) => Ok(abandon_send_on_model(
+        Err(error) => abandon_send_on_model(
             &abandoned,
             domain::SessionFailure::from_error("The review was not sent", &error)
                 .with_remediation(
                     "ZReview could not tell whether it reached GitHub. Check the pull request there before submitting again.",
                 ),
-        )),
+        ),
     }
 }
 
@@ -4087,7 +4090,8 @@ mod tests {
             &model,
             domain::SessionFailure::new("The review was not sent")
                 .with_remediation("Check the pull request on GitHub before submitting again."),
-        );
+        )
+        .expect("session is ready");
 
         let dto::SubmissionPhaseDto::Failed { failure } = &abandoned.submission.phase else {
             panic!(
