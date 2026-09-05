@@ -365,13 +365,15 @@ export const commands = {
 	 *  Stores the review summary, keyed by pull request and head.
 	 * 
 	 *  Called on every keystroke, like a draft edit. That is what makes the text
-	 *  survive a crash, and what a later Session restores it from.
+	 *  survive a crash, and what a later Session restores it from. Answers with
+	 *  what is stopping writes landing, if anything is, which for a reviewer
+	 *  writing only a summary is the one place that can say so.
 	 * 
 	 *  # Errors
 	 * 
 	 *  Returns a failure when no session is open, or the session is not ready.
 	 */
-	editSummary: (body: string) => typedError<null, SessionFailureDto>(__TAURI_INVOKE("edit_summary", { body })),
+	editSummary: (body: string) => typedError<string | null, SessionFailureDto>(__TAURI_INVOKE("edit_summary", { body })),
 	/**
 	 *  Assembles what submitting would post and holds it for approval.
 	 * 
@@ -399,7 +401,8 @@ export const commands = {
 	 *  stops offering a confirmation the moment one is acted on. The model is taken
 	 *  out of the window as its own handle, so a Session dropped or a window closed
 	 *  mid-send leaves the post finishing into a model nobody reads rather than
-	 *  panicking. A second call while the first is in flight posts nothing more.
+	 *  panicking. A second call while the first is in flight posts nothing more, and
+	 *  a task that dies without reporting leaves a submission that can be retried.
 	 * 
 	 *  # Errors
 	 * 
@@ -898,7 +901,7 @@ export type SubmissionRequestDto = {
 	pinned: string,
 	body: string,
 	comments: SubmittableCommentDto[],
-	/**  Shown, never hidden: a reviewer must not believe these were posted. */
+	/**  Always shown. A reviewer must not believe these were posted. */
 	excluded: ExcludedDraftDto[],
 	/**  "1 draft will NOT be posted", absent when nothing is excluded. */
 	excluded_heading: string | null,

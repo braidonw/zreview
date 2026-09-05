@@ -521,7 +521,14 @@ impl SessionModel {
     /// Deliberately stops here. PLAN requires that nothing is ever posted without
     /// an explicit human submission action, so building the request and sending it
     /// are two separate steps with a person in between.
+    ///
+    /// Refused outright while a send is in flight. A review already on its way to
+    /// the forge cannot be re-aimed, and holding a fresh confirmation over one
+    /// would let a second review be posted on top of the first.
     pub fn request_submission(&mut self, event: ReviewEvent) {
+        if self.is_sending() {
+            return;
+        }
         let SessionPhase::Ready(review) = &self.phase else {
             return;
         };
@@ -535,8 +542,25 @@ impl SessionModel {
         self.set_submission(next);
     }
 
+    /// Puts the confirmation away, leaving every draft and the summary as they were.
+    ///
+    /// Refused while a send is in flight. Cancelling cannot call a review back
+    /// once it has left, so it must not say it did.
     pub fn cancel_submission(&mut self) {
+        if self.is_sending() {
+            return;
+        }
         self.set_submission(SubmissionState::Idle);
+    }
+
+    /// Records a send that never reported an outcome, so one can be tried again.
+    ///
+    /// Ignored unless a send is in flight, so a caller that died after the
+    /// outcome was recorded cannot overwrite it.
+    pub fn abandon_send(&mut self, failure: SessionFailure) {
+        if self.is_sending() {
+            self.set_submission(SubmissionState::Failed(failure));
+        }
     }
 
     /// Takes the confirmed review, so it can be posted away from the UI thread.
@@ -566,13 +590,18 @@ impl SessionModel {
     ///
     /// # Panics
     ///
-    /// Panics if the phase is not `Ready`. `begin_send` only ever hands out a
-    /// submission while it is, and the phase cannot regress.
+    /// Panics if no send is in flight, or if the phase is not `Ready`.
+    /// `begin_send` only ever hands out a submission while both hold, and
+    /// neither can regress.
     pub fn complete_send(
         &mut self,
         submission: &ReviewSubmission,
         posted: Result<SubmissionOutcome, SessionFailure>,
     ) {
+        assert!(
+            self.is_sending(),
+            "a submission completed while none was being sent",
+        );
         let outcome = match posted {
             Ok(outcome) => outcome,
             // Nothing local was touched, so every draft is still there.
@@ -609,6 +638,17 @@ impl SessionModel {
     #[must_use]
     pub const fn submission_revision(&self) -> u32 {
         self.submission_revision
+    }
+
+    /// Whether a confirmed review is on its way to the forge.
+    const fn is_sending(&self) -> bool {
+        match self.submission {
+            SubmissionState::Sending => true,
+            SubmissionState::Idle
+            | SubmissionState::Confirming(_)
+            | SubmissionState::Sent(_)
+            | SubmissionState::Failed(_) => false,
+        }
     }
 
     /// Whether this session has somewhere to post a review.
@@ -890,6 +930,29 @@ mod tests {
             review_sink,
             None,
         )
+    }
+
+    /// A model that has handed out a send and is waiting on it, which is where
+    /// the submission spends the whole of a network call.
+    fn sending_model(submitter: &RecordingSubmitter) -> SessionModel {
+        let mut session = submittable_session();
+        session.set_draft(0, 6, "needs a test");
+        session.set_summary("Two notes.");
+        let mut model = loaded_model(session, None, Some(Arc::new(submitter.clone())));
+        model.request_submission(ReviewEvent::Comment);
+        let pending = model.begin_send().expect("the review is confirmed");
+        // Deliberately dropped without completing, which is what a caller holding
+        // it across a network call looks like from here.
+        drop(pending);
+        model
+    }
+
+    /// The request a sending model is waiting on, rebuilt from the same session.
+    fn only_confirmed(model: &SessionModel) -> ReviewSubmission {
+        review(model)
+            .session()
+            .prepare_submission(ReviewEvent::Comment)
+            .expect("the session assembled one already")
     }
 
     /// The loaded review, which every one of these tests has.
@@ -1792,34 +1855,70 @@ mod tests {
         assert!(!ready_model(None).is_submittable());
     }
 
-    /// Two submission commands can be in flight at once, so a receiver has to be
-    /// able to tell which of two answers was read later.
+    /// A review already on its way to the forge cannot be re-aimed. Without this
+    /// the reviewer could pick a second verdict mid-send and confirm it, posting
+    /// twice.
     #[test]
-    fn every_submission_change_carries_a_higher_revision() {
-        let mut session = submittable_session();
-        session.set_summary("Two notes.");
-        let mut model = loaded_model(session, None, Some(Arc::new(RecordingSubmitter::default())));
-        let idle = model.submission_revision();
+    fn a_verdict_cannot_be_chosen_while_the_review_is_being_sent() {
+        let submitter = RecordingSubmitter::default();
+        let mut model = sending_model(&submitter);
 
-        model.request_submission(ReviewEvent::Comment);
-        let confirming = model.submission_revision();
-        assert!(confirming > idle, "confirming is later than idle");
+        model.request_submission(ReviewEvent::Approve);
 
-        let pending = model.begin_send().expect("the review is confirmed");
-        let sending = model.submission_revision();
-        assert!(sending > confirming, "sending is later than confirming");
-
-        let posted = pending.submitter.submit(&pending.submission);
-        model.complete_send(&pending.submission, posted);
         assert!(
-            model.submission_revision() > sending,
-            "the outcome is later than sending",
+            matches!(model.submission(), SubmissionState::Sending),
+            "a send in flight outranks a new verdict",
         );
+        assert!(model.begin_send().is_none(), "nothing new to confirm");
+        assert!(submitter.posted().is_empty());
+    }
+
+    /// Cancelling cannot call a review back once it has left, and must not say it
+    /// did.
+    #[test]
+    fn a_send_in_flight_cannot_be_cancelled() {
+        let submitter = RecordingSubmitter::default();
+        let mut model = sending_model(&submitter);
 
         model.cancel_submission();
+
         assert!(
-            model.submission_revision() > sending,
-            "cancelling is later still",
+            matches!(model.submission(), SubmissionState::Sending),
+            "cancelling must not claim a send was called back",
+        );
+    }
+
+    /// A send whose task died never reported an outcome, and would otherwise
+    /// leave the submission stuck on sending, refusing every retry.
+    #[test]
+    fn a_send_that_never_reported_back_leaves_something_that_can_be_retried() {
+        let submitter = RecordingSubmitter::default();
+        let mut model = sending_model(&submitter);
+
+        model.abandon_send(SessionFailure::new("The review was not sent"));
+
+        let SubmissionState::Failed(failure) = model.submission() else {
+            panic!("an abandoned send should be shown as failed");
+        };
+        assert_eq!(failure.summary, "The review was not sent");
+        // Retrying is exactly what the reviewer is now free to do.
+        model.request_submission(ReviewEvent::Comment);
+        assert!(matches!(model.submission(), SubmissionState::Confirming(_)));
+    }
+
+    /// A task that died after recording its outcome must not overwrite it.
+    #[test]
+    fn abandoning_a_send_that_already_landed_leaves_the_outcome_alone() {
+        let submitter = RecordingSubmitter::default();
+        let mut model = sending_model(&submitter);
+        let posted = submitter.submit(&only_confirmed(&model));
+        model.complete_send(&only_confirmed(&model), posted);
+
+        model.abandon_send(SessionFailure::new("The review was not sent"));
+
+        assert!(
+            matches!(model.submission(), SubmissionState::Sent(_)),
+            "a landed review stays landed",
         );
     }
 

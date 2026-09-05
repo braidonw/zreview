@@ -507,7 +507,7 @@ pub struct SubmissionRequestDto {
     pub pinned: String,
     pub body: String,
     pub comments: Vec<SubmittableCommentDto>,
-    /// Shown, never hidden: a reviewer must not believe these were posted.
+    /// Always shown. A reviewer must not believe these were posted.
     pub excluded: Vec<ExcludedDraftDto>,
     /// "1 draft will NOT be posted", absent when nothing is excluded.
     pub excluded_heading: Option<String>,
