@@ -387,8 +387,12 @@ export function useSession(
           }
           dispatch({ type: "submission", submission: sent.data.submission });
           dispatch({ type: "drafts", drafts: sent.data.drafts });
-          // Only now is it safe for the editor to forget what was posted.
-          dispatch({ type: "summary", body: sent.data.summary });
+          // Only a review that landed empties the editor. A failed send must
+          // leave it alone: its text is the reviewer's, and the backend's copy
+          // can be a keystroke behind what they are still typing.
+          if (sent.data.submission.phase.state === "Sent") {
+            dispatch({ type: "summary", body: sent.data.summary });
+          }
         })
         .catch((error: unknown) => {
           dispatch({ type: "panelNotice", notice: toFailure(error).summary });

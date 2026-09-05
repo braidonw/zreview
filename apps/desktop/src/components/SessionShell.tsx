@@ -64,9 +64,11 @@ export function SessionShell({
   const { empty_reason: emptyReason, rows } = state.file;
   const isEmpty = emptyReason !== null || rows.length === 0;
   const { phase } = state.submission;
-  // Only an idle submission may start another, so a double press cannot post
-  // twice and a landed review cannot silently resend.
-  const isSubmitting = phase.state !== "Idle";
+  // Nothing new may be asked for while one is in flight, which is what stops a
+  // second confirmation being built over a send that has not come back. A
+  // failure leaves the actions live, because retrying is exactly what it asks
+  // the reviewer to do.
+  const isSending = phase.state === "Sending";
 
   return (
     <div className="session-shell">
@@ -118,7 +120,7 @@ export function SessionShell({
             readyCount={state.drafts.ready_count}
             notAnchoredCount={state.drafts.not_anchored_count}
             summary={state.summary}
-            isSubmitting={isSubmitting}
+            isSending={isSending}
             onSummaryChange={onSummaryChange}
             onSubmit={onSubmit}
           />

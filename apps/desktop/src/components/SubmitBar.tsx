@@ -20,7 +20,7 @@ export function SubmitBar({
   readyCount,
   notAnchoredCount,
   summary,
-  isSubmitting,
+  isSending,
   onSummaryChange,
   onSubmit,
 }: {
@@ -28,8 +28,8 @@ export function SubmitBar({
   notAnchoredCount: number;
   /** What the editor should hold, which moves only when the backend says so. */
   summary: string;
-  /** True while a submission is confirming or in flight, when no new one may start. */
-  isSubmitting: boolean;
+  /** True while a review is in flight, when no other submission may be started. */
+  isSending: boolean;
   onSummaryChange: (body: string) => void;
   onSubmit: (event: ReviewEventDto) => void;
 }) {
@@ -48,7 +48,7 @@ export function SubmitBar({
             key={event}
             type="button"
             className={`submit-bar__action submit-bar__action--${tone}`}
-            disabled={isSubmitting}
+            disabled={isSending}
             onClick={() => onSubmit(event)}
           >
             {label}

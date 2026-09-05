@@ -158,6 +158,19 @@ describe("the summary editor", () => {
     await waitFor(() => expect(editSummary).toHaveBeenCalledWith("ok"));
   });
 
+  it("keeps the diff shortcuts out of the editor while it has focus", async () => {
+    const user = userEvent.setup();
+    await openSubmitBar();
+    const field = await summaryField();
+
+    await user.click(field);
+    // c opens a composer, j and k move the cursor, when the diff has the keyboard.
+    await user.keyboard("cjk");
+
+    await waitFor(() => expect(editSummary).toHaveBeenCalledWith("cjk"));
+    expect(document.querySelector("[data-composer]")).toBeNull();
+  });
+
   it("restores what the snapshot brought back from storage", async () => {
     openSession.mockResolvedValue({
       status: "ok",
