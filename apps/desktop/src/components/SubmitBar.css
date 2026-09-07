@@ -1,0 +1,63 @@
+.submit-bar {
+  flex-shrink: 0;
+  height: 92px;
+  padding: 8px 12px;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  border-top: 1px solid var(--border-default);
+  background: var(--surface-base);
+  font-family: var(--font-mono);
+  font-size: var(--size-body);
+}
+
+.submit-bar__counts {
+  width: 150px;
+  flex-shrink: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.submit-bar__ready {
+  color: var(--text-primary);
+  font-weight: 600;
+}
+
+.submit-bar__stale {
+  color: var(--severity-error-text);
+  font-size: var(--size-label);
+}
+
+.submit-bar__actions {
+  flex-shrink: 0;
+  display: flex;
+  gap: 8px;
+}
+
+.submit-bar__action {
+  padding: 8px 12px;
+  border: none;
+  border-radius: 6px;
+  color: var(--text-on-accent);
+  font-family: inherit;
+  font-size: var(--size-label);
+  cursor: pointer;
+}
+
+.submit-bar__action:disabled {
+  opacity: var(--viewed-opacity);
+  cursor: default;
+}
+
+.submit-bar__action--comment {
+  background: var(--accent-base);
+}
+
+.submit-bar__action--approve {
+  background: var(--severity-success);
+}
+
+.submit-bar__action--changes {
+  background: var(--severity-error);
+}

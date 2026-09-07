@@ -1,0 +1,14 @@
+.summary-editor {
+  flex: 1;
+  min-width: 0;
+}
+
+.summary-editor__field .cm-editor {
+  height: 76px;
+  border-radius: 6px;
+  border: 1px solid var(--border-default);
+}
+
+.summary-editor__field .cm-scroller {
+  overflow: auto;
+}

@@ -1,10 +1,12 @@
-import type { DiffSideDto } from "../bindings";
+import type { DiffSideDto, ReviewEventDto } from "../bindings";
 import type { ReadyState } from "../hooks/sessionReducer";
 import { composerPrefill, selectionRange } from "../hooks/sessionReducer";
 import { DiffList } from "./DiffList";
 import { EmptyDiffPane } from "./EmptyDiffPane";
 import { FileSidebar } from "./FileSidebar";
 import { ReviewPanel } from "./ReviewPanel";
+import { SubmissionPanel } from "./SubmissionPanel";
+import { SubmitBar } from "./SubmitBar";
 import "./SessionShell.css";
 
 export function SessionShell({
@@ -27,6 +29,10 @@ export function SessionShell({
   onDismissFinding,
   onReplaceFinding,
   onKeepFinding,
+  onSummaryChange,
+  onSubmit,
+  onCancelSubmission,
+  onSendSubmission,
 }: {
   state: ReadyState;
   /** False while Home is in front, which is when this Session has no screen. */
@@ -49,65 +55,87 @@ export function SessionShell({
   onDismissFinding: (id: number) => void;
   onReplaceFinding: (id: number) => void;
   onKeepFinding: () => void;
+  onSummaryChange: (body: string) => void;
+  onSubmit: (event: ReviewEventDto) => void;
+  onCancelSubmission: () => void;
+  onSendSubmission: () => void;
 }) {
   const [selectionStart, selectionEnd] = selectionRange(state);
   const { empty_reason: emptyReason, rows } = state.file;
   const isEmpty = emptyReason !== null || rows.length === 0;
+  const { phase } = state.submission;
+  // Nothing new may be started over a send that has not come back. A failure
+  // leaves the actions live, because retrying is what it asks the reviewer to do.
+  const isSending = phase.state === "Sending";
 
   return (
     <div className="session-shell">
-      <FileSidebar
-        onBack={onBack}
-        title={state.snapshot.title}
-        subtitle={state.snapshot.subtitle}
-        sidebar={state.snapshot.sidebar}
-        warnings={state.snapshot.warnings}
-        writeFailure={state.drafts.write_failure}
-        fileDraftCount={state.drafts.file_draft_count}
-        staleDrafts={state.drafts.stale}
-        cursor={state.cursor}
-        onSelect={onSelectFile}
-        onReanchorDraft={onReanchorDraft}
-      />
-      {isEmpty ? (
-        <EmptyDiffPane
-          label={emptyReason?.label ?? "No lines to show"}
-          detail={emptyReason?.detail ?? "This file has nothing to display."}
-        />
-      ) : (
-        <DiffList
-          rows={rows}
-          isShowing={isShowing}
-          fileIndex={state.file.index}
+      <SubmissionPanel phase={phase} onCancel={onCancelSubmission} onSend={onSendSubmission} />
+      <div className="session-shell__body">
+        <FileSidebar
+          onBack={onBack}
+          title={state.snapshot.title}
+          subtitle={state.snapshot.subtitle}
+          sidebar={state.snapshot.sidebar}
+          warnings={state.snapshot.warnings}
+          writeFailure={state.drafts.write_failure}
+          fileDraftCount={state.drafts.file_draft_count}
+          staleDrafts={state.drafts.stale}
           cursor={state.cursor}
-          selectionStart={selectionStart}
-          selectionEnd={selectionEnd}
-          drafts={state.drafts}
-          composer={state.composer}
-          composerPrefill={composerPrefill(state)}
-          onRowClick={onRowClick}
-          onOpenComposer={onOpenComposer}
-          onComposerChange={onComposerChange}
-          onComposerClose={onComposerClose}
-          onComposerDiscard={onComposerDiscard}
+          onSelect={onSelectFile}
+          onReanchorDraft={onReanchorDraft}
         />
-      )}
-      {state.panel !== null && (
-        <ReviewPanel
-          panel={state.panel}
-          notice={state.panelNotice}
-          findingConflict={state.findingConflict}
-          onRunReview={onRunReview}
-          onCancelReview={onCancelReview}
-          onToggleGuidanceSection={onToggleGuidanceSection}
-          onToggleGuidanceFile={onToggleGuidanceFile}
-          onRevealFinding={onRevealFinding}
-          onAcceptFinding={onAcceptFinding}
-          onDismissFinding={onDismissFinding}
-          onReplaceFinding={onReplaceFinding}
-          onKeepFinding={onKeepFinding}
-        />
-      )}
+        <div className="session-shell__main">
+          {isEmpty ? (
+            <EmptyDiffPane
+              label={emptyReason?.label ?? "No lines to show"}
+              detail={emptyReason?.detail ?? "This file has nothing to display."}
+            />
+          ) : (
+            <DiffList
+              rows={rows}
+              isShowing={isShowing}
+              fileIndex={state.file.index}
+              cursor={state.cursor}
+              selectionStart={selectionStart}
+              selectionEnd={selectionEnd}
+              drafts={state.drafts}
+              composer={state.composer}
+              composerPrefill={composerPrefill(state)}
+              onRowClick={onRowClick}
+              onOpenComposer={onOpenComposer}
+              onComposerChange={onComposerChange}
+              onComposerClose={onComposerClose}
+              onComposerDiscard={onComposerDiscard}
+            />
+          )}
+          <SubmitBar
+            readyCount={state.drafts.ready_count}
+            notAnchoredCount={state.drafts.not_anchored_count}
+            summary={state.summary}
+            canSubmit={state.snapshot.can_submit}
+            isSending={isSending}
+            onSummaryChange={onSummaryChange}
+            onSubmit={onSubmit}
+          />
+        </div>
+        {state.panel !== null && (
+          <ReviewPanel
+            panel={state.panel}
+            notice={state.panelNotice}
+            findingConflict={state.findingConflict}
+            onRunReview={onRunReview}
+            onCancelReview={onCancelReview}
+            onToggleGuidanceSection={onToggleGuidanceSection}
+            onToggleGuidanceFile={onToggleGuidanceFile}
+            onRevealFinding={onRevealFinding}
+            onAcceptFinding={onAcceptFinding}
+            onDismissFinding={onDismissFinding}
+            onReplaceFinding={onReplaceFinding}
+            onKeepFinding={onKeepFinding}
+          />
+        )}
+      </div>
     </div>
   );
 }

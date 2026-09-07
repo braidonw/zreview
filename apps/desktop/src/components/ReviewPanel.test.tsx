@@ -244,7 +244,7 @@ describe("ReviewPanel", () => {
     expect(screen.queryByText("No review has been run.")).toBeNull();
   });
 
-  it("shows a finding about the whole change as such, offering no Accept", () => {
+  it("shows a finding about the whole change as such, and offers Accept for it", () => {
     render(
       <ReviewPanel
         panel={makePanel({ findings: [makeFinding({ position: null, title: "no tests anywhere" })] })}
@@ -253,9 +253,8 @@ describe("ReviewPanel", () => {
     );
 
     expect(screen.getByText("whole change")).toBeTruthy();
-    // The desktop has no summary editor yet, so accepting a whole-change
-    // finding would write to storage the reviewer would never see.
-    expect(screen.queryByRole("button", { name: "Accept" })).toBeNull();
+    // There is a summary editor now, so its proposal has somewhere to land.
+    expect(screen.getByRole("button", { name: "Accept" })).toBeTruthy();
     expect(screen.getByRole("button", { name: "Dismiss" })).toBeTruthy();
   });
 

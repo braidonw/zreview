@@ -6,9 +6,15 @@ import type { SessionAction } from "./sessionReducer";
 type DraftCommand =
   | { kind: "edit"; fileIndex: number; start: number; end: number; body: string }
   | { kind: "discard"; fileIndex: number; row: number }
-  | { kind: "reanchor"; fileIndex: number; path: string; side: DiffSideDto; line: number; row: number };
+  | { kind: "reanchor"; fileIndex: number; path: string; side: DiffSideDto; line: number; row: number }
+  | { kind: "summary"; body: string }
+  /** Work that must not be overtaken by the writes above, reporting for itself. */
+  | { kind: "job"; run: () => Promise<unknown> };
 
-function send(command: DraftCommand) {
+/** Everything but a job, which the queue runs rather than sends. */
+type SentCommand = Exclude<DraftCommand, { kind: "job" }>;
+
+function send(command: SentCommand) {
   switch (command.kind) {
     case "edit":
       return commands.editDraft(command.fileIndex, command.start, command.end, command.body);
@@ -22,23 +28,49 @@ function send(command: DraftCommand) {
         command.line,
         command.row,
       );
+    case "summary":
+      return commands.editSummary(command.body);
   }
 }
 
-/** Whichever `DraftsDto` a settled command hands back, and whether it was accepted. */
-function outcome(command: DraftCommand, data: DraftsDto | { accepted: boolean; drafts: DraftsDto }) {
+/** Whatever a settled command hands back, before it is narrowed by its kind. */
+type CommandData = DraftsDto | { accepted: boolean; drafts: DraftsDto } | string | null;
+
+/** Whichever `DraftsDto` a settled draft command hands back, and whether it was accepted. */
+function outcome(command: SentCommand, data: CommandData) {
   return command.kind === "edit"
     ? (data as { accepted: boolean; drafts: DraftsDto })
     : { accepted: true, drafts: data as DraftsDto };
 }
 
-/** Serialises draft edits, discards, and reanchors, at most one in flight, consecutive edits coalescing while a discard or reanchor is always sent in order. */
+/** Whether two consecutive commands may collapse into the later one, which only per-keystroke writes of the same text may. */
+function coalesces(command: DraftCommand, previous: DraftCommand | undefined): boolean {
+  if (command.kind === "edit") {
+    return previous?.kind === "edit";
+  }
+  if (command.kind === "summary") {
+    return previous?.kind === "summary";
+  }
+  return false;
+}
+
+/** Serialises draft edits, discards, reanchors, summary writes, and any job that must not be overtaken by them, at most one in flight, consecutive writes of one text coalescing while everything else is sent in order. */
 export function useDraftQueue(dispatch: (action: SessionAction) => void) {
   const inFlight = useRef(false);
   const pending = useRef<DraftCommand[]>([]);
 
   const settle = useCallback(
-    (command: DraftCommand, data: DraftsDto | { accepted: boolean; drafts: DraftsDto }) => {
+    (command: SentCommand, data: CommandData) => {
+      // A summary write does not echo the text back, because the editor already
+      // holds it. What it answers with is whatever is stopping writes landing,
+      // which for a reviewer touching no draft is the only way they are told.
+      if (command.kind === "summary") {
+        dispatch({ type: "writeFailure", failure: data as string | null });
+        return;
+      }
+      if (data === null) {
+        return;
+      }
       const { accepted, drafts } = outcome(command, data);
       dispatch({ type: "drafts", drafts });
       if (!accepted) {
@@ -58,6 +90,12 @@ export function useDraftQueue(dispatch: (action: SessionAction) => void) {
         }
       };
       inFlight.current = true;
+      if (command.kind === "job") {
+        // The job answers to its caller; the queue only holds the slot so no
+        // write it was meant to follow can land on top of it.
+        command.run().then(advance, advance);
+        return;
+      }
       send(command).then((result) => {
         if (result.status === "ok") {
           settle(command, result.data);
@@ -76,8 +114,7 @@ export function useDraftQueue(dispatch: (action: SessionAction) => void) {
         return;
       }
       const queue = pending.current;
-      const last = queue[queue.length - 1];
-      if (command.kind === "edit" && last?.kind === "edit") {
+      if (coalesces(command, queue[queue.length - 1])) {
         queue[queue.length - 1] = command;
       } else {
         queue.push(command);
@@ -103,5 +140,13 @@ export function useDraftQueue(dispatch: (action: SessionAction) => void) {
     [enqueue],
   );
 
-  return { editDraft, discardDraft, reanchorDraft };
+  const editSummary = useCallback((body: string) => enqueue({ kind: "summary", body }), [enqueue]);
+
+  /** Runs `work` once every write queued before it has landed, holding the queue while it does. */
+  const runInOrder = useCallback(
+    (work: () => Promise<unknown>) => enqueue({ kind: "job", run: work }),
+    [enqueue],
+  );
+
+  return { editDraft, discardDraft, reanchorDraft, editSummary, runInOrder };
 }
