@@ -1,9 +1,9 @@
 /* This file is the design system, as CSS custom properties.
 
-   Two rules matter more than any individual value. Step down in colour before
-   you step down in size, the four text levels are the primary hierarchy
-   device. Surfaces are an ordered ramp, not a set of greys, if two things
-   must differ, they differ by one step.
+   Two rules matter more than any individual value. Step down in colour
+   before you step down in size. The four text levels are the primary
+   hierarchy device. Surfaces are an ordered ramp, not a set of greys. If
+   two things must differ, they differ by one step.
 
    Hue is reserved. Accent is interaction only, used for focus, selection,
    the primary button, and links, and never for status. Violet belongs
