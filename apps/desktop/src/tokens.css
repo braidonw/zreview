@@ -1,5 +1,18 @@
-/* Transcribed from crates/ui/src/theme.rs. Keep the two files in step. A token
-   renamed or added there should be renamed or added here the same day. */
+/* This file is the design system, as CSS custom properties.
+
+   Two rules matter more than any individual value. Step down in colour before
+   you step down in size, the four text levels are the primary hierarchy
+   device. Surfaces are an ordered ramp, not a set of greys, if two things
+   must differ, they differ by one step.
+
+   Hue is reserved. Accent is interaction only, used for focus, selection,
+   the primary button, and links, and never for status. Violet belongs
+   entirely to "a model proposed this" and nothing else in the application
+   may use it.
+
+   Monospace is confined to content where column alignment is load-bearing,
+   such as diff rows, paths, and keybindings. Everything else reads as prose
+   in the system sans face. */
 
 :root {
   /* Background levels, deepest first. */
@@ -70,7 +83,7 @@
   --marker-width: 20px;
   --viewed-opacity: 0.55;
 
-  /* Type. */
+  /* Type. SF Mono is kept over the design's JetBrains Mono since it ships with macOS. */
   --size-code: 12.5px;
   --size-body: 13px;
   --size-meta: 12px;
