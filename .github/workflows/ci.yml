@@ -17,7 +17,7 @@ env:
 
 jobs:
   check:
-    # ZReview is macOS-only and GPUI needs a macOS platform layer, so this is the
+    # ZReview is macOS-only, and the Tauri shell links WKWebView, so this is the
     # only host the workspace can actually be built and tested on.
     runs-on: macos-latest
     steps:
