@@ -1,3 +1,4 @@
+> docs/adr/0001-tauri-replaces-gpui.md supersedes this plan's stack, directory layout, and reading-list sections.
 # ZReview product and implementation plan
 
 ## 1. Product goal
