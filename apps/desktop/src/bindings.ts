@@ -420,7 +420,7 @@ export type AcceptDispositionDto =
 /**
  *  The anchor already held the reviewer's own draft. Neither text was
  *  written; the panel asks whether to replace it. `location` is where
- *  accepting it should first reveal, as the GPUI composer path does.
+ *  accepting it should first reveal.
  */
 { outcome: "Occupied"; existing: string; proposed: string; location: FindingLocationDto } | 
 /**
@@ -885,8 +885,8 @@ export type SubmissionPhaseDto = { state: "Idle" } |
 /**
  *  The exact request a confirmed submission would post.
  * 
- *  Mirrors the GPUI confirmation in `crates/ui`: what the reviewer approves is
- *  what leaves the machine, so every part of it is shown rather than summarised.
+ *  What the reviewer approves is what leaves the machine, so every part of it
+ *  is shown rather than summarised.
  */
 export type SubmissionRequestDto = {
 	/**

@@ -89,9 +89,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # Enforces the licensing boundary PLAN section 3 depends on: ZReview must
-      # stay dual MIT/Apache-2.0, and Zed's GPL `ui` crate must never arrive as a
-      # dependency. Also covers security advisories, yanked crates, and sources.
+      # Enforces the licensing boundary PLAN section 3 depends on. ZReview must
+      # stay dual MIT/Apache-2.0, so a strong-copyleft crate must never arrive as
+      # a dependency. Also covers security advisories, yanked crates, and sources.
       - uses: EmbarkStudios/cargo-deny-action@v2
         with:
           command: check

@@ -395,7 +395,7 @@ pub enum AcceptDispositionDto {
     Drafted,
     /// The anchor already held the reviewer's own draft. Neither text was
     /// written; the panel asks whether to replace it. `location` is where
-    /// accepting it should first reveal, as the GPUI composer path does.
+    /// accepting it should first reveal.
     Occupied {
         existing: String,
         proposed: String,
@@ -413,9 +413,8 @@ pub enum AcceptDispositionDto {
 ///
 /// `occupied` is the reviewer's own text, the finding's proposal, and where it
 /// sits, read off the session by the caller; present exactly when
-/// `disposition` is [`FindingDisposition::Composer`], which the GPUI composer
-/// opens pre-filled with and the desktop panel asks a plain replace-or-keep
-/// question about instead.
+/// `disposition` is [`FindingDisposition::Composer`], so the panel can ask a
+/// plain replace-or-keep question.
 #[must_use]
 pub fn project_disposition(
     disposition: &FindingDisposition,
@@ -495,8 +494,8 @@ pub struct ExcludedDraftDto {
 
 /// The exact request a confirmed submission would post.
 ///
-/// Mirrors the GPUI confirmation in `crates/ui`: what the reviewer approves is
-/// what leaves the machine, so every part of it is shown rather than summarised.
+/// What the reviewer approves is what leaves the machine, so every part of it
+/// is shown rather than summarised.
 #[derive(Clone, Debug, Serialize, specta::Type)]
 pub struct SubmissionRequestDto {
     /// The verdict and how many inline comments go with it, e.g. "Comment with
@@ -924,9 +923,6 @@ fn as_u32(value: usize) -> u32 {
 }
 
 /// The label and title a session's source shows in the sidebar header.
-///
-/// Mirrors the GPUI sidebar header so both front ends describe a session the
-/// same way.
 fn source_header(source: &SessionSource) -> (String, String) {
     match source {
         SessionSource::Demo => (
@@ -1084,9 +1080,8 @@ pub fn project_drafts(session: &ReviewSession, file_index: usize) -> DraftsDto {
 /// The Session's review panel, or `None` when this session has nothing to put one
 /// on.
 ///
-/// Mirrors `crates/ui/src/findings.rs` for the guidance, run, and footer copy,
-/// read off the same model in the same order. The finding card goes further,
-/// adding the rationale and the proposing backend that the GPUI list omits.
+/// The guidance, run, and footer copy are read off the model in that order.
+/// The finding card adds the rationale and the proposing backend.
 #[must_use]
 pub fn project_panel(review: &ReviewModel) -> Option<ReviewPanelDto> {
     if !review.findings_panel_visible() {
@@ -1136,7 +1131,7 @@ fn project_finding(finding: &Finding, selected: Option<domain::FindingId>) -> Fi
     }
 }
 
-/// A finding's confidence as a whole percentage, mirroring the GPUI panel.
+/// A finding's confidence as a whole percentage.
 fn confidence_percent(confidence: f32) -> u32 {
     #[expect(
         clippy::cast_possible_truncation,

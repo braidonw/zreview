@@ -6,9 +6,12 @@
    two things must differ, they differ by one step.
 
    Hue is reserved. Accent is interaction only, used for focus, selection,
-   the primary button, and links, and never for status. Violet belongs
-   entirely to "a model proposed this" and nothing else in the application
-   may use it.
+   the primary button, and links, and never for status. Severity colours are
+   high-chroma and used a handful of times per screen. The diff fills share
+   no hue with severity on purpose, because an added line is not a success
+   and a removed line is not an error. Violet belongs entirely to "a model
+   proposed this" and nothing else in the application may use it. That
+   exclusivity is what makes the provenance mark readable at eight pixels.
 
    Monospace is confined to content where column alignment is load-bearing,
    such as diff rows, paths, and keybindings. Everything else reads as prose

@@ -98,6 +98,6 @@ It does not yet show the guidance panel, persist anything besides drafts and the
 
 Licensed under either Apache-2.0 or MIT, at your option.
 
-`deny.toml` enforces that boundary in CI: every dependency licence must be on an explicit allow list, so a strong-copyleft crate cannot arrive unnoticed.
+`deny.toml` enforces that boundary in CI. Every dependency licence must be on an explicit allow list, so a strong-copyleft crate cannot arrive unnoticed.
 
-One deliberate exception is recorded there: `option-ext` is MPL-2.0 and reaches the binary through Tauri's own `dirs` dependency, and `cssparser` and `selectors` reach it the same way through `dom_query`. MPL-2.0 is file-level copyleft that does not extend to code merely linking it, but it is not strictly permissive, and it is one of the items PLAN wants confirmed by legal review before distribution.
+The one licence exception recorded there is MPL-2.0. `option-ext` reaches the binary through Tauri's own `dirs` dependency, and `cssparser` and `selectors` through `dom_query`. MPL-2.0 is file-level copyleft that does not extend to code merely linking it, but it is not strictly permissive, and it is one of the items PLAN wants confirmed by legal review before distribution.

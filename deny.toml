@@ -1,8 +1,7 @@
 # Enforces the licensing boundary PLAN section 3 depends on.
 #
-# ZReview is dual MIT/Apache-2.0 and must stay linkable that way. Zed's `gpui` is
-# Apache-2.0 and fine to depend on, but Zed's `ui` crate is GPL-3.0-or-later, so
-# a strong-copyleft dependency appearing here is the specific failure this guards
+# ZReview is dual MIT/Apache-2.0 and must stay linkable that way, so a
+# strong-copyleft dependency appearing here is the specific failure this guards
 # against. `cargo deny check` in CI is what makes that boundary enforced rather
 # than merely intended.
 

@@ -701,7 +701,7 @@ fn run_review_on_model(
     panel_of(&guard)
 }
 
-/// The backend a run uses, which is the Claude coding agent the GPUI binary runs.
+/// The backend a run uses, which is the Claude coding agent.
 ///
 /// `root` is the clone the session was opened out of, so relative paths in the
 /// diff resolve. Nothing here may invent one.
@@ -780,9 +780,8 @@ fn overwrite_finding_on_model(
 /// The reviewer's own text, the finding's proposal, and where it sits, when
 /// accepting answered with [`app::FindingDisposition::Composer`].
 ///
-/// The GPUI composer merges the two texts into one seed string to open
-/// pre-filled; the desktop panel needs them apart to ask its replace-or-keep
-/// question, so they are read straight off the session instead.
+/// The panel needs the two texts apart to ask its replace-or-keep question, so
+/// they are read straight off the session.
 fn occupied_texts(
     model: &app::SessionModel,
     disposition: &app::FindingDisposition,
