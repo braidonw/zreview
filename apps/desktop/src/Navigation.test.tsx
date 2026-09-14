@@ -1,7 +1,8 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import type { HomeSnapshotDto, OpenSessionDto, WindowDto } from "./bindings";
+import type { Channel } from "@tauri-apps/api/core";
+import type { HomeSnapshotDto, OpenSessionDto, SubmissionDto, WindowDto } from "./bindings";
 import App from "./App";
 import {
   makeAnchoredDraft,
@@ -17,6 +18,8 @@ import {
   makeFinding,
   makePanel,
   makeSnapshot,
+  makeSubmission,
+  makeSubmissionRequest,
 } from "./test/fixtures";
 
 const describeWindow = vi.fn();
@@ -41,6 +44,10 @@ const cancelReview = vi.fn();
 const selectNextFinding = vi.fn();
 const acceptFinding = vi.fn();
 const dismissFinding = vi.fn();
+const editSummary = vi.fn();
+const requestSubmission = vi.fn();
+const cancelSubmission = vi.fn();
+const sendSubmission = vi.fn();
 
 vi.mock("./bindings", () => ({
   commands: {
@@ -67,6 +74,10 @@ vi.mock("./bindings", () => ({
     selectNextFinding: () => selectNextFinding(),
     acceptFinding: (id: unknown) => acceptFinding(id),
     dismissFinding: (id: unknown) => dismissFinding(id),
+    editSummary: (body: unknown) => editSummary(body),
+    requestSubmission: (event: unknown) => requestSubmission(event),
+    cancelSubmission: () => cancelSubmission(),
+    sendSubmission: (channel: unknown) => sendSubmission(channel),
   },
 }));
 
@@ -206,6 +217,11 @@ beforeEach(() => {
   dismissFinding.mockReset();
   reviewPanel.mockResolvedValue({ status: "ok", data: null });
   runReview.mockReset();
+  editSummary.mockReset();
+  editSummary.mockResolvedValue(ok(null));
+  requestSubmission.mockReset();
+  cancelSubmission.mockReset();
+  sendSubmission.mockReset();
 });
 
 /** Home, listed and settled, with the cursor on its first row. */
@@ -629,6 +645,121 @@ describe("the Session kept alive behind Home", () => {
     await user.click(screen.getByRole("button", { name: /acme\/billing#7/ }));
 
     await waitFor(() => expect(returnToSession).toHaveBeenCalled());
+  });
+});
+
+describe("the confirmation behind Home", () => {
+  /** A Session that can be submitted, with its confirmation ready to open. */
+  function submittable() {
+    openSession.mockResolvedValue(
+      ok(
+        makeSnapshot({
+          sidebar: makeSidebar([makeFileSummary({ index: 0 }), makeFileSummary({ index: 1 })]),
+          can_submit: true,
+        }),
+      ),
+    );
+    requestSubmission.mockResolvedValue(
+      ok(makeSubmission({ state: "Confirming", request: makeSubmissionRequest() })),
+    );
+  }
+
+  /** The submit bar's own actions, told from a diff row's Comment button. */
+  function submitBar() {
+    const bar = document.querySelector(".submit-bar");
+    if (!bar) {
+      throw new Error("the submit bar is not on screen");
+    }
+    return within(bar as HTMLElement);
+  }
+
+  /** The Session open from the cursor row with its confirmation showing. */
+  async function openTheConfirmation(user: ReturnType<typeof userEvent.setup>) {
+    submittable();
+    await openTheCursorRow();
+    await user.click(submitBar().getByRole("button", { name: "Comment" }));
+    await waitFor(() =>
+      expect(screen.getByRole("button", { name: "Post this review to GitHub" })).toBeTruthy(),
+    );
+  }
+
+  async function goBack() {
+    fireEvent.keyDown(window, { key: "[", metaKey: true });
+    await waitFor(() => expect(screen.getByText("Retry webhook deliveries")).toBeTruthy());
+  }
+
+  async function returnThroughTheSlot(user: ReturnType<typeof userEvent.setup>) {
+    await user.click(screen.getByRole("button", { name: /acme\/widgets#412/ }));
+    await waitFor(() => expect(screen.getByText("first")).toBeTruthy());
+  }
+
+  it("is still open with the same request after back and return", async () => {
+    const user = userEvent.setup();
+    await openTheConfirmation(user);
+
+    await goBack();
+    await returnThroughTheSlot(user);
+
+    expect(screen.getByRole("button", { name: "Post this review to GitHub" })).toBeTruthy();
+    expect(screen.getByText("Comment with 1 inline comment")).toBeTruthy();
+    expect(screen.getByText("needs a test")).toBeTruthy();
+    expect(requestSubmission).toHaveBeenCalledTimes(1);
+    expect(cancelSubmission).not.toHaveBeenCalled();
+  });
+
+  it("shows the sent outcome on return when the send landed while Home was in front", async () => {
+    const user = userEvent.setup();
+    let channel: Channel<SubmissionDto> | undefined;
+    let landed: (sent: unknown) => void = () => {};
+    sendSubmission.mockImplementation((given: Channel<SubmissionDto>) => {
+      channel = given;
+      return new Promise((resolve) => {
+        landed = resolve;
+      });
+    });
+    await openTheConfirmation(user);
+    await user.click(screen.getByRole("button", { name: "Post this review to GitHub" }));
+    act(() => channel?.onmessage(makeSubmission({ state: "Sending" }, 2)));
+    await waitFor(() => expect(screen.getByText("Submitting the review...")).toBeTruthy());
+
+    await goBack();
+    await act(async () => {
+      landed(
+        ok({
+          submission: makeSubmission(
+            {
+              state: "Sent",
+              outcome: {
+                heading: "Submitted as COMMENTED with 1 inline comment",
+                url: "https://github.com/acme/widgets/pull/412",
+              },
+            },
+            3,
+          ),
+          drafts: makeDrafts({ ready_count: 0, not_anchored_count: 0 }),
+          summary: "",
+        }),
+      );
+    });
+    await returnThroughTheSlot(user);
+
+    expect(screen.getByText("Submitted as COMMENTED with 1 inline comment")).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Post this review to GitHub" })).toBeNull();
+    expect(sendSubmission).toHaveBeenCalledTimes(1);
+  });
+
+  it("never carries over to a different row's fresh Session", async () => {
+    const user = userEvent.setup();
+    await openTheConfirmation(user);
+    await goBack();
+    openRow.mockResolvedValue(ok(opened(showingSession(alive("acme/widgets#398")))));
+
+    await user.click(rowFor("acme/widgets#398"));
+    await waitFor(() => expect(screen.getByText("first")).toBeTruthy());
+
+    expect(openSession).toHaveBeenCalledTimes(2);
+    expect(screen.queryByRole("button", { name: "Post this review to GitHub" })).toBeNull();
+    expect(submitBar().getByRole("button", { name: "Comment" })).toBeTruthy();
   });
 });
 
