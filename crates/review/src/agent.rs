@@ -204,7 +204,12 @@ impl CodingAgent {
         )
     }
 
-    fn run(&self, body: &str, schema: &str) -> Result<Output, ReviewError> {
+    fn run(
+        &self,
+        body: &str,
+        schema: &str,
+        events: &dyn ReviewEventSink,
+    ) -> Result<Output, ReviewError> {
         let program = self.program();
         let mut child = Command::new(&self.executable)
             .current_dir(&self.working_directory)
@@ -237,7 +242,7 @@ impl CodingAgent {
             });
         }
 
-        self.wait_with_timeout(child, &program)
+        self.wait_with_timeout(child, &program, events)
     }
 
     /// Waits for the child, killing it if it outlives the timeout.
@@ -254,6 +259,7 @@ impl CodingAgent {
         &self,
         mut child: Child,
         program: &Arc<str>,
+        events: &dyn ReviewEventSink,
     ) -> Result<Output, ReviewError> {
         // The pipes are drained on their own threads: a child that fills a pipe
         // buffer blocks until someone reads it, and it would block there long
@@ -275,6 +281,11 @@ impl CodingAgent {
                         message: source.to_string(),
                     });
                 }
+            }
+            if events.is_cancelled() {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(ReviewError::Cancelled);
             }
             if std::time::Instant::now() >= deadline {
                 let _ = child.kill();
@@ -349,7 +360,7 @@ impl ReviewBackend for CodingAgent {
             )),
         });
 
-        let output = self.run(&body, &schema)?;
+        let output = self.run(&body, &schema, events)?;
         if events.is_cancelled() {
             return Err(ReviewError::Cancelled);
         }
@@ -656,7 +667,15 @@ fn launch_error(program: &Arc<str>, executable: &OsStr, source: &std::io::Error)
 
 #[cfg(test)]
 mod tests {
-    use std::{fs, os::unix::fs::PermissionsExt, sync::Arc};
+    use std::{
+        fs,
+        os::unix::fs::PermissionsExt,
+        sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        },
+        time::Instant,
+    };
 
     use domain::{
         ChangeCounts, DiffFile, DiffHunk, DiffLine, DiffLineKind, FileStatus, IgnoreProgress,
@@ -720,6 +739,32 @@ mod tests {
     fn agent(directory: &Path, script: &str) -> CodingAgent {
         let executable = stub(directory, "claude", script);
         CodingAgent::new(Agent::ClaudeCode, directory).with_executable(executable)
+    }
+
+    /// A sink whose cancellation the test flips from another thread.
+    struct CancelFlag(Arc<AtomicBool>);
+
+    impl ReviewEventSink for CancelFlag {
+        fn progress(&self, _progress: ReviewProgress) {}
+        fn is_cancelled(&self) -> bool {
+            self.0.load(Ordering::SeqCst)
+        }
+    }
+
+    /// Polls until a file the stub writes exists, returning its content.
+    fn wait_for_file(path: &Path) -> String {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Ok(content) = fs::read_to_string(path) {
+                return content;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the stub never wrote {}",
+                path.display()
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
     }
 
     #[test]
@@ -975,6 +1020,34 @@ mod tests {
 
         assert!(matches!(error, ReviewError::TimedOut { seconds: 0, .. }));
         assert!(error.is_retryable());
+    }
+
+    #[test]
+    fn cancelling_mid_run_stops_the_agent_promptly() {
+        let directory = tempfile::tempdir().expect("a temporary directory");
+        let running = directory.path().join("running");
+        let backend = agent(
+            directory.path(),
+            &format!(
+                "cat >/dev/null\ntouch {}\nsleep 30",
+                running.to_string_lossy()
+            ),
+        )
+        .with_timeout(Duration::from_secs(30));
+        let cancel = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&cancel);
+        std::thread::spawn(move || {
+            wait_for_file(&running);
+            flag.store(true, Ordering::SeqCst);
+        });
+
+        let started = Instant::now();
+        let error = backend
+            .review(&request(), &CancelFlag(cancel))
+            .expect_err("the review was cancelled");
+
+        assert!(matches!(error, ReviewError::Cancelled));
+        assert!(started.elapsed() < Duration::from_secs(5));
     }
 
     #[test]
