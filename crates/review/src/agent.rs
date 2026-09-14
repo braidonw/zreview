@@ -737,6 +737,18 @@ mod tests {
         }
     }
 
+    /// A request whose prompt overfills the stdin pipe.
+    ///
+    /// `run` writes the whole prompt before it starts the clock, so with this
+    /// request the timeout cannot begin until the stub is reading its stdin.
+    fn request_larger_than_the_stdin_pipe() -> ReviewRequest {
+        let mut request = request();
+        request.title = Some("A large change".to_owned());
+        // A pipe holds at most 64 KiB.
+        request.description = Some("x".repeat(256 * 1024));
+        request
+    }
+
     /// One finding, in the envelope `claude --print --output-format json` returns.
     fn print_envelope(findings_json: &str) -> String {
         let result = serde_json::to_string(findings_json).expect("the reply is quotable");
@@ -764,10 +776,13 @@ mod tests {
 
     /// A stub that launches a child of its own, records its pid, and waits on it.
     ///
-    /// The rename makes the pidfile complete the moment it exists.
+    /// The pid is recorded before stdin is read, so once the stub is reading, its
+    /// child exists.
     fn stub_with_grandchild(pidfile: &Path) -> String {
-        let path = pidfile.to_string_lossy();
-        format!("cat >/dev/null\nsleep 30 &\necho $! >{path}.tmp\nmv {path}.tmp {path}\nwait")
+        format!(
+            "sleep 30 &\necho $! >{}\ncat >/dev/null\nwait",
+            pidfile.to_string_lossy()
+        )
     }
 
     /// Whether a process with this pid still exists.
@@ -792,12 +807,16 @@ mod tests {
         true
     }
 
-    /// Polls until a file the stub writes exists, returning its content.
-    fn wait_for_file(path: &Path) -> String {
-        let deadline = Instant::now() + Duration::from_secs(5);
+    /// Polls until the stub has written a whole line to the file, returning it.
+    ///
+    /// Generous, because a burst of process starts can stall for seconds.
+    fn wait_for_line(path: &Path) -> String {
+        let deadline = Instant::now() + Duration::from_secs(20);
         loop {
-            if let Ok(content) = fs::read_to_string(path) {
-                return content;
+            if let Ok(content) = fs::read_to_string(path)
+                && content.ends_with('\n')
+            {
+                return content.trim_end().to_owned();
             }
             assert!(
                 Instant::now() < deadline,
@@ -1070,25 +1089,26 @@ mod tests {
         let backend = agent(
             directory.path(),
             &format!(
-                "cat >/dev/null\ntouch {}\nsleep 30",
+                "cat >/dev/null\necho running >{}\nsleep 30",
                 running.to_string_lossy()
             ),
         )
         .with_timeout(Duration::from_secs(30));
         let cancel = Arc::new(AtomicBool::new(false));
         let flag = Arc::clone(&cancel);
-        std::thread::spawn(move || {
-            wait_for_file(&running);
+        let cancelled = std::thread::spawn(move || {
+            wait_for_line(&running);
             flag.store(true, Ordering::SeqCst);
+            Instant::now()
         });
 
-        let started = Instant::now();
         let error = backend
             .review(&request(), &CancelFlag(cancel))
             .expect_err("the review was cancelled");
 
         assert!(matches!(error, ReviewError::Cancelled));
-        assert!(started.elapsed() < Duration::from_secs(5));
+        let cancelled_at = cancelled.join().expect("the flag was set");
+        assert!(cancelled_at.elapsed() < Duration::from_secs(5));
     }
 
     #[test]
@@ -1100,7 +1120,7 @@ mod tests {
         let cancel = Arc::new(AtomicBool::new(false));
         let flag = Arc::clone(&cancel);
         let grandchild = std::thread::spawn(move || {
-            let pid = wait_for_file(&pidfile).trim().to_owned();
+            let pid = wait_for_line(&pidfile);
             flag.store(true, Ordering::SeqCst);
             pid
         });
@@ -1125,11 +1145,11 @@ mod tests {
             .with_timeout(Duration::from_millis(250));
 
         let error = backend
-            .review(&request(), &IgnoreProgress)
+            .review(&request_larger_than_the_stdin_pipe(), &IgnoreProgress)
             .expect_err("the stub hangs");
 
         assert!(matches!(error, ReviewError::TimedOut { .. }));
-        let pid = wait_for_file(&pidfile).trim().to_owned();
+        let pid = wait_for_line(&pidfile);
         assert!(
             is_dead_within(&pid, Duration::from_secs(2)),
             "the agent's child {pid} outlived the timeout"
