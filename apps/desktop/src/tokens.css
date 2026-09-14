@@ -76,6 +76,20 @@
   --proposed-dim: #241a32;
   --proposed-text: #d6bdf0;
 
+  /* Spacing. Named by pixel count, so the unit lives in the name. */
+  --space-2: 2px;
+  --space-4: 4px;
+  --space-6: 6px;
+  --space-8: 8px;
+  --space-12: 12px;
+  --space-16: 16px;
+  --space-20: 20px;
+  --space-24: 24px;
+  --space-48: 48px;
+  --radius-small: 3px;
+  --radius-medium: 4px;
+  --radius-large: 6px;
+
   /* Layout. */
   --row-height: 20px;
   --gutter-width: 46px;

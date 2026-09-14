@@ -19,6 +19,17 @@
   overflow: auto;
 }
 
+/* The focus target is the scrollable content, clipped by the scroller. Ring
+   the editor's own box instead of double-ringing the clipped content. */
+.comment-composer__editor .cm-content:focus-visible {
+  outline: none;
+}
+
+.comment-composer__editor .cm-editor.cm-focused {
+  outline: 2px solid var(--border-focus);
+  outline-offset: 2px;
+}
+
 .comment-composer__actions {
   display: flex;
   gap: 8px;
