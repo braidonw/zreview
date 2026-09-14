@@ -745,7 +745,7 @@ mod tests {
     ///
     /// `run` writes the whole prompt before it starts the clock, so with this
     /// request the timeout cannot begin until the stub is reading its stdin.
-    fn request_larger_than_the_stdin_pipe() -> ReviewRequest {
+    fn request_that_blocks_run_until_the_stub_reads_stdin() -> ReviewRequest {
         let mut request = request();
         request.title = Some("A large change".to_owned());
         // A pipe holds at most 64 KiB.
@@ -1149,7 +1149,10 @@ mod tests {
             .with_timeout(Duration::from_millis(250));
 
         let error = backend
-            .review(&request_larger_than_the_stdin_pipe(), &IgnoreProgress)
+            .review(
+                &request_that_blocks_run_until_the_stub_reads_stdin(),
+                &IgnoreProgress,
+            )
             .expect_err("the stub hangs");
 
         assert!(matches!(error, ReviewError::TimedOut { .. }));
