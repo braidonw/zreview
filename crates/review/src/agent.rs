@@ -237,8 +237,7 @@ impl CodingAgent {
         // Closing stdin is what tells the agent the prompt is complete.
         drop(stdin);
         if let Err(source) = written {
-            let _ = child.kill();
-            let _ = child.wait();
+            kill_group(&mut child);
             return Err(ReviewError::Launch {
                 program,
                 message: format!("could not send the review material: {source}"),
@@ -278,7 +277,7 @@ impl CodingAgent {
                 Ok(Some(status)) => break status,
                 Ok(None) => {}
                 Err(source) => {
-                    let _ = child.kill();
+                    kill_group(&mut child);
                     return Err(ReviewError::Launch {
                         program: Arc::clone(program),
                         message: source.to_string(),
@@ -290,9 +289,7 @@ impl CodingAgent {
                 return Err(ReviewError::Cancelled);
             }
             if std::time::Instant::now() >= deadline {
-                let _ = child.kill();
-                // Reap it, so the timed-out agent does not linger as a zombie.
-                let _ = child.wait();
+                kill_group(&mut child);
                 return Err(ReviewError::TimedOut {
                     program: Arc::clone(program),
                     seconds: self.timeout.as_secs(),
@@ -1117,6 +1114,25 @@ mod tests {
         assert!(
             is_dead_within(&pid, Duration::from_secs(2)),
             "the agent's child {pid} outlived the cancel"
+        );
+    }
+
+    #[test]
+    fn a_timeout_kills_the_agents_own_children() {
+        let directory = tempfile::tempdir().expect("a temporary directory");
+        let pidfile = directory.path().join("grandchild.pid");
+        let backend = agent(directory.path(), &stub_with_grandchild(&pidfile))
+            .with_timeout(Duration::from_millis(250));
+
+        let error = backend
+            .review(&request(), &IgnoreProgress)
+            .expect_err("the stub hangs");
+
+        assert!(matches!(error, ReviewError::TimedOut { .. }));
+        let pid = wait_for_file(&pidfile).trim().to_owned();
+        assert!(
+            is_dead_within(&pid, Duration::from_secs(2)),
+            "the agent's child {pid} outlived the timeout"
         );
     }
 
