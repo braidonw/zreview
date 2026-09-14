@@ -23,8 +23,8 @@
 //! - **No writable checkout.** The working directory is set so relative paths
 //!   resolve, and the agent has no tool with which to write to it.
 //!
-//! A run is bounded in time and in output size, and cancellation is checked before
-//! and after the wait, so abandoning a review stops paying for it.
+//! A run is bounded in time and in output size, and cancellation is checked
+//! before, during, and after the wait, so abandoning a review stops paying for it.
 
 use std::{
     ffi::{OsStr, OsString},
@@ -247,16 +247,16 @@ impl CodingAgent {
         self.wait_with_timeout(child, &program, events)
     }
 
-    /// Waits for the child, killing it if it outlives the timeout.
+    /// Waits for the child, killing it if it outlives the timeout or the review
+    /// is cancelled.
     ///
     /// The child handle stays here rather than moving onto a waiting thread, so a
-    /// timeout kills exactly the process this review started. An earlier version
+    /// kill hits exactly the process this review started. An earlier version
     /// signalled by name instead, which would have killed every `claude` on the
     /// machine — including the reviewer's own interactive session.
     ///
-    /// A coding agent may spawn children of its own, and killing the direct child
-    /// does not reap those. Doing better would need a process group, which needs
-    /// `unsafe` and is forbidden here, so the direct kill is the honest limit.
+    /// A coding agent may spawn children of its own, so it runs in its own process
+    /// group and a kill takes the whole group with it.
     fn wait_with_timeout(
         &self,
         mut child: Child,
@@ -913,7 +913,7 @@ mod tests {
     fn no_forge_credential_reaches_the_review_engine() {
         // Checked in a child process rather than by mutating this one's
         // environment: `set_var` is unsafe under edition 2024 and this workspace
-        // forbids unsafe code. The child inherits the tokens, so what it observes
+        // denies unsafe code. The child inherits the tokens, so what it observes
         // is what a real review would inherit.
         if std::env::var_os(SCRUB_CHILD).is_none() {
             let status = Command::new(std::env::current_exe().expect("the test binary's path"))
