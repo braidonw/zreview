@@ -5,7 +5,7 @@
 
 .summary-editor__field .cm-editor {
   height: 76px;
-  border-radius: 6px;
+  border-radius: var(--radius-large);
   border: 1px solid var(--border-default);
 }
 
