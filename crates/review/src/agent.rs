@@ -309,12 +309,13 @@ impl CodingAgent {
 
 /// Kills the agent and everything it spawned, then reaps it.
 ///
-/// The signal goes out before the wait: once the child is reaped its pid is free
+/// The signal goes out before the wait. Once the child is reaped its pid is free
 /// for reuse, and the group id would no longer be ours to signal.
-#[allow(unsafe_code)]
+#[expect(unsafe_code)]
 fn kill_group(child: &mut Child) {
     let pid = libc::pid_t::try_from(child.id()).expect("a pid fits in pid_t");
-    // SAFETY: process_group(0) made the pgid this pid, which is unwaited and so still ours.
+    // SAFETY: process_group(0) made the pgid this pid, which is unwaited and so
+    // still ours.
     let _ = unsafe { libc::kill(-pid, libc::SIGKILL) };
     // The leader directly too, in case it moved itself out of the group.
     let _ = child.kill();
