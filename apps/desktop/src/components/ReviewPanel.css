@@ -12,10 +12,10 @@
 
 .review-panel__header {
   flex-shrink: 0;
-  padding: 8px 12px;
+  padding: var(--space-8) var(--space-12);
   display: flex;
   flex-direction: column;
-  gap: 4px;
+  gap: var(--space-4);
   border-bottom: 1px solid var(--border-default);
 }
 
@@ -23,7 +23,7 @@
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 8px;
+  gap: var(--space-8);
 }
 
 .review-panel__heading {
@@ -32,9 +32,9 @@
 }
 
 .review-panel__run {
-  padding: 4px 8px;
+  padding: var(--space-4) var(--space-8);
   border: none;
-  border-radius: 6px;
+  border-radius: var(--radius-large);
   color: var(--text-on-accent);
   font-family: inherit;
   font-size: var(--size-label);
@@ -58,7 +58,7 @@
 .review-panel__notice {
   flex-shrink: 0;
   margin: 0;
-  padding: 8px 12px;
+  padding: var(--space-8) var(--space-12);
   border-bottom: 1px solid var(--border-default);
   background: var(--severity-error-dim);
   color: var(--severity-error-text);
@@ -74,17 +74,17 @@
 
 .review-panel__nothing-found {
   margin: 0;
-  padding: 8px 12px;
+  padding: var(--space-8) var(--space-12);
   color: var(--text-secondary);
   font-size: var(--size-label);
 }
 
 .review-panel__guidance-header {
-  padding: 8px 12px;
+  padding: var(--space-8) var(--space-12);
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 8px;
+  gap: var(--space-8);
   border: none;
   background: none;
   color: var(--text-primary);
@@ -100,10 +100,10 @@
 }
 
 .review-panel__entry {
-  padding: 4px 12px;
+  padding: var(--space-4) var(--space-12);
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: var(--space-8);
   border: none;
   background: none;
   font-family: inherit;
@@ -116,7 +116,7 @@
   width: 12px;
   height: 12px;
   flex-shrink: 0;
-  border-radius: 3px;
+  border-radius: var(--radius-small);
   border: 1px solid var(--border-strong);
 }
 
@@ -148,7 +148,7 @@
 }
 
 .review-panel__skipped {
-  padding: 4px 12px;
+  padding: var(--space-4) var(--space-12);
   display: flex;
   flex-direction: column;
   color: var(--text-tertiary);
@@ -160,7 +160,7 @@
 
 .review-panel__excluded {
   margin: 0;
-  padding: 4px 12px;
+  padding: var(--space-4) var(--space-12);
   color: var(--severity-warning);
   font-size: var(--size-label);
 }
@@ -174,10 +174,10 @@
 }
 
 .review-panel__note {
-  padding: 12px;
+  padding: var(--space-12);
   display: flex;
   flex-direction: column;
-  gap: 8px;
+  gap: var(--space-8);
 }
 
 .review-panel__note-heading {
@@ -198,10 +198,10 @@
 }
 
 .review-panel__finding {
-  padding: 8px 12px;
+  padding: var(--space-8) var(--space-12);
   display: flex;
   flex-direction: column;
-  gap: 4px;
+  gap: var(--space-4);
   border-bottom: 1px solid var(--border-default);
   cursor: pointer;
 }
@@ -213,7 +213,7 @@
 .review-panel__finding-meta {
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: var(--space-8);
 }
 
 .review-panel__severity {
@@ -275,14 +275,14 @@
 
 .review-panel__finding-actions {
   display: flex;
-  gap: 8px;
-  padding-top: 4px;
+  gap: var(--space-8);
+  padding-top: var(--space-4);
 }
 
 .review-panel__finding-actions button {
-  padding: 4px 8px;
+  padding: var(--space-4) var(--space-8);
   border: none;
-  border-radius: 6px;
+  border-radius: var(--radius-large);
   font-family: inherit;
   font-size: var(--size-label);
   cursor: pointer;
@@ -301,13 +301,13 @@
 }
 
 .review-panel__finding-conflict {
-  padding-top: 4px;
+  padding-top: var(--space-4);
   color: var(--text-secondary);
   font-size: var(--size-label);
 }
 
 .review-panel__finding-conflict p {
-  margin: 0 0 4px;
+  margin: 0 0 var(--space-4);
 }
 
 .review-panel__finding-conflict-intro {
@@ -317,9 +317,9 @@
 .review-panel__finding-conflict-text {
   display: flex;
   flex-direction: column;
-  gap: 2px;
-  padding: 4px 6px;
-  border-radius: 4px;
+  gap: var(--space-2);
+  padding: var(--space-4) var(--space-6);
+  border-radius: var(--radius-medium);
   background: var(--surface-overlay);
   white-space: pre-wrap;
 }
@@ -327,15 +327,15 @@
 .review-panel__finding-conflict-label {
   color: var(--text-tertiary);
   text-transform: uppercase;
-  font-size: 10px;
+  font-size: var(--size-label);
 }
 
 .review-panel__footer {
   flex-shrink: 0;
-  padding: 8px 12px;
+  padding: var(--space-8) var(--space-12);
   display: flex;
   flex-direction: column;
-  gap: 4px;
+  gap: var(--space-4);
   border-top: 1px solid var(--border-default);
   color: var(--text-secondary);
   font-size: var(--size-label);
@@ -351,6 +351,6 @@
 
 .review-panel__unreviewed {
   margin: 0;
-  padding-left: 16px;
+  padding-left: var(--space-16);
   list-style: disc;
 }
