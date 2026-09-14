@@ -34,7 +34,7 @@
   --text-on-accent: #08101c;
 
   /* Three weights of border. */
-  --border-subtle: #1a212a; /* reserved for a border lighter than --border-default, unused so far */
+  --border-subtle: #1a212a; /* Reserved for a border lighter than --border-default. */
   --border-default: #263039;
   --border-strong: #36424e;
   --border-focus: #4c8dff;
@@ -47,11 +47,11 @@
 
   /* Low-chroma diff fills. */
   --diff-add-bg: #0f2a1c;
-  --diff-add-bg-strong: #1b4a30; /* reserved for word-level diff highlighting, which is unbuilt */
+  --diff-add-bg-strong: #1b4a30; /* Reserved for word-level diff highlighting, which is unbuilt. */
   --diff-add-fg: #cde7d6;
   --diff-add-mark: #5fa97c;
   --diff-del-bg: #2c171c;
-  --diff-del-bg-strong: #58252f; /* reserved for word-level diff highlighting, which is unbuilt */
+  --diff-del-bg-strong: #58252f; /* Reserved for word-level diff highlighting, which is unbuilt. */
   --diff-del-fg: #edd2d7;
   --diff-del-mark: #c4737f;
   --diff-hunk-bg: #131a26;
@@ -65,15 +65,15 @@
   --severity-warning-dim: #322412;
   --severity-warning-text: #f3ce86;
   --severity-info: #7fa8d9;
-  --severity-info-dim: #16232f; /* reserved for an info background fill, matching --severity-error-dim, unused so far */
+  --severity-info-dim: #16232f; /* Reserved for an info fill, matching --severity-error-dim. */
   --severity-info-text: #b6cfe8;
   --severity-success: #46c08a;
-  --severity-success-dim: #0f2a20; /* reserved for a success background fill, matching --severity-error-dim, unused so far */
+  --severity-success-dim: #0f2a20; /* Reserved for a success fill, matching --severity-error-dim. */
   --severity-success-text: #93ddbb;
 
   /* One hue, reserved entirely for "a model proposed this". */
   --proposed-base: #b48ce0;
-  --proposed-dim: #241a32; /* reserved for a dim background fill of the proposed hue, unused so far */
+  --proposed-dim: #241a32; /* Reserved for a dim background fill of the proposed hue. */
   --proposed-text: #d6bdf0;
 
   /* Spacing. Named by pixel count, so the unit lives in the name. */
@@ -106,8 +106,8 @@
   --size-meta: 12px;
   --size-label: 11px;
   --size-heading: 17px;
-  --size-display: 24px; /* reserved for a heading larger than --size-heading, unused so far */
-  --body-line-height: 20px; /* reserved for prose line-height; no site writes a raw 20px today */
+  --size-display: 24px; /* Reserved for a heading larger than --size-heading. */
+  --body-line-height: 20px; /* Reserved for prose line-height. */
   --font-mono: ui-monospace, "SF Mono", Menlo, monospace;
   --font-sans: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
 }
