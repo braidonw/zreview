@@ -1,9 +1,9 @@
-import { readFileSync } from "node:fs";
-import { join } from "node:path";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import App from "./App";
+import indexCss from "./index.css?raw";
+import summaryEditorCss from "./components/SummaryEditor.css?raw";
 import {
   makeFile,
   makeFileSummary,
@@ -56,13 +56,10 @@ beforeEach(() => {
   });
 });
 
-// jsdom does not load imported stylesheets, so getComputedStyle can't see index.css.
-// It does implement the real :focus-visible heuristic (keyboard focus vs. mouse
-// focus) independent of any stylesheet, so that part is asserted behaviourally.
+// jsdom does not recompute :focus-visible-gated styles, so rules are asserted as text.
 describe("focus ring", () => {
   it("defines a :focus-visible rule built on --border-focus in index.css", () => {
-    const css = readFileSync(join(process.cwd(), "src/index.css"), "utf-8");
-    expect(css).toMatch(/:focus-visible\s*{[^}]*--border-focus/);
+    expect(indexCss).toMatch(/:focus-visible\s*{[^}]*--border-focus/);
   });
 
   it("shows a keyboard-focused submit bar button as :focus-visible, not a mouse-focused one", async () => {
@@ -70,10 +67,13 @@ describe("focus ring", () => {
     render(<App />);
     const approveButton = await screen.findByRole("button", { name: "Approve" });
 
-    for (let i = 0; i < 60 && document.activeElement !== approveButton; i++) {
+    const maxTabs = 40;
+    for (let i = 0; i < maxTabs && document.activeElement !== approveButton; i++) {
       await user.tab();
     }
-    expect(document.activeElement).toBe(approveButton);
+    if (document.activeElement !== approveButton) {
+      throw new Error(`could not tab to the Approve button within ${maxTabs} tabs`);
+    }
     expect(approveButton.matches(":focus-visible")).toBe(true);
 
     await user.click(approveButton);
@@ -85,16 +85,12 @@ describe("focus ring", () => {
     render(<App />);
     await screen.findByRole("button", { name: "Approve" });
 
-    const editorContent = document.querySelector(".summary-editor__field .cm-content");
-    if (!editorContent) {
-      throw new Error("summary editor did not mount");
-    }
+    const editorContent = screen.getByRole("textbox");
     await user.click(editorContent);
 
     const container = editorContent.closest(".cm-editor");
     expect(container?.classList.contains("cm-focused")).toBe(true);
 
-    const css = readFileSync(join(process.cwd(), "src/components/SummaryEditor.css"), "utf-8");
-    expect(css).toMatch(/cm-focused[^{]*{[^}]*--border-focus/);
+    expect(summaryEditorCss).toMatch(/cm-focused[^{]*{[^}]*--border-focus/);
   });
 });
