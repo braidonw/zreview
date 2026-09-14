@@ -277,7 +277,8 @@ impl CodingAgent {
                 Ok(Some(status)) => break status,
                 Ok(None) => {}
                 Err(source) => {
-                    kill_group(&mut child);
+                    // A failed wait means the child is already reaped and its pid
+                    // may have been reused, so there is nothing safe to signal.
                     return Err(ReviewError::Launch {
                         program: Arc::clone(program),
                         message: source.to_string(),
@@ -315,6 +316,8 @@ fn kill_group(child: &mut Child) {
     let pid = libc::pid_t::try_from(child.id()).expect("a pid fits in pid_t");
     // SAFETY: process_group(0) made the pgid this pid, which is unwaited and so still ours.
     let _ = unsafe { libc::kill(-pid, libc::SIGKILL) };
+    // The leader directly too, in case it moved itself out of the group.
+    let _ = child.kill();
     let _ = child.wait();
 }
 
