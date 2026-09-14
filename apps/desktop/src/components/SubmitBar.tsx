@@ -3,7 +3,7 @@ import type { SummaryState } from "../hooks/sessionReducer";
 import { SummaryEditor } from "./SummaryEditor";
 import "./SubmitBar.css";
 
-/** The three verdicts, in the order the GPUI bar offers them. */
+/** The three verdicts. */
 const ACTIONS: { event: ReviewEventDto; label: string; tone: string }[] = [
   { event: "Comment", label: "Comment", tone: "comment" },
   { event: "Approve", label: "Approve", tone: "approve" },

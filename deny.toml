@@ -1,8 +1,7 @@
 # Enforces the licensing boundary PLAN section 3 depends on.
 #
-# ZReview is dual MIT/Apache-2.0 and must stay linkable that way. Zed's `gpui` is
-# Apache-2.0 and fine to depend on, but Zed's `ui` crate is GPL-3.0-or-later, so
-# a strong-copyleft dependency appearing here is the specific failure this guards
+# ZReview is dual MIT/Apache-2.0 and must stay linkable that way, so a
+# strong-copyleft dependency appearing here is the specific failure this guards
 # against. `cargo deny check` in CI is what makes that boundary enforced rather
 # than merely intended.
 
@@ -31,12 +30,11 @@ allow = [
     "Unicode-3.0",
     "BSL-1.0",
     "NCSA",
-    # Weak, file-level copyleft. Reached through gpui's font discovery
-    # (option-ext, via dirs -> zed-font-kit) and, since the Tauri desktop shell,
-    # also through tauri-utils' CSS parsing (cssparser, selectors, via dom_query)
-    # and its own `dirs` dependency (option-ext again). None of it extends to
-    # code that merely links it. Recorded here as a deliberate decision, and one
-    # of the items PLAN wants confirmed by legal review before distribution.
+    # Weak, file-level copyleft. Reached through tauri-utils' CSS parsing
+    # (cssparser, selectors, via dom_query) and its own `dirs` dependency
+    # (option-ext). None of it extends to code that merely links it. Recorded
+    # here as a deliberate decision, and one of the items PLAN wants confirmed
+    # by legal review before distribution.
     "MPL-2.0",
 ]
 # Fail on a dependency whose licence cannot be determined at all.
@@ -44,29 +42,24 @@ unused-allowed-license = "allow"
 confidence-threshold = 0.9
 
 [bans]
-# GPUI's tree brings several versions of common crates. Enforcing one version
-# each would be a fight with an upstream we pin deliberately.
+# Tauri's own tree brings more than one version of common crates, such as toml
+# and winnow, through its build-time and runtime dependency graphs. Enforcing
+# one version each would be a fight with an upstream we do not control.
 multiple-versions = "allow"
 wildcards = "deny"
 # Workspace crates depend on each other by path with no version requirement,
 # which is not the unpinned-external-dependency problem this check is for.
 allow-wildcard-paths = true
 
-# GPUI is pre-1.0 and its own README warns that breaking changes are common, so
-# it is pinned exactly. Anything that quietly widened that would defeat the pin.
-[[bans.deny]]
-name = "gpui"
-wrappers = ["ui", "zreview"]
-
 [advisories]
 version = 2
 yanked = "deny"
 # Security advisories always fail. Unmaintained ones are scoped to crates this
-# workspace chose: GPUI's tree currently carries six (rustybuzz, ttf-parser,
-# async-std, paste, proc-macro-error2, rustls-pemfile), none of them
+# workspace chose. Tauri's tree currently carries six (paste, unic-char-property,
+# unic-char-range, unic-common, unic-ucd-ident, unic-ucd-version), none of them
 # vulnerabilities and none with a safe upgrade available to us. Failing CI on
 # those would make it permanently red over something only an upstream can fix,
-# while still leaving us blind to a crate we add ourselves — this way round, the
+# while still leaving us blind to a crate we add ourselves. This way round, the
 # check stays actionable.
 unmaintained = "workspace"
 

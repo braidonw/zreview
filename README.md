@@ -1,24 +1,33 @@
 # ZReview
 
-A native macOS GitHub pull-request review app built with Zed's GPUI framework.
+A native macOS GitHub pull-request review app built with Tauri and React.
 
 The current implementation includes a virtualized, keyboard-navigable unified diff, an inline comment editor, local Git comparisons, and GitHub PR loading through `gh`.
 
 ## Run
 
-Requirements: macOS, Xcode command-line tools, the pinned Rust toolchain, and an authenticated GitHub CLI (`gh auth login`) for PR loading.
+Requirements: macOS, Xcode command-line tools, the pinned Rust toolchain, Node.js, pnpm, and an authenticated GitHub CLI (`gh auth login`) for PR loading.
+
+Run the desktop app from `apps/desktop`:
+
+```bash
+pnpm install
+pnpm tauri dev
+```
+
+With no arguments it opens Home, the pull request list. Pass arguments after `--` to open a session directly.
 
 Run the generated 100,000-line fixture:
 
 ```bash
-cargo run -p zreview
+pnpm tauri dev -- demo
 ```
 
 Or review every changed file in a real local comparison. The head defaults to `HEAD`:
 
 ```bash
-cargo run -p zreview -- /path/to/repository main
-cargo run -p zreview -- /path/to/repository base-branch feature-branch
+pnpm tauri dev -- /path/to/repository main
+pnpm tauri dev -- /path/to/repository base-branch feature-branch
 ```
 
 The comparison uses merge-base semantics, equivalent to `base...head`.
@@ -26,9 +35,9 @@ The comparison uses merge-base semantics, equivalent to `base...head`.
 Load a GitHub PR using the current repository, or provide a local clone explicitly:
 
 ```bash
-cargo run -p zreview -- pr 123
-cargo run -p zreview -- pr /path/to/repository 123
-cargo run -p zreview -- pr /path/to/repository https://github.com/acme/widgets/pull/123
+pnpm tauri dev -- pr 123
+pnpm tauri dev -- pr /path/to/repository 123
+pnpm tauri dev -- pr /path/to/repository https://github.com/acme/widgets/pull/123
 ```
 
 ZReview reads metadata with `gh api`, fetches the base branch and `refs/pull/<number>/head` into `refs/zreview/...`, verifies the fetched head against the API response, and then renders the local merge-base comparison. User branches and `FETCH_HEAD` are not changed.
@@ -57,7 +66,15 @@ cargo test --workspace --locked
 cargo deny check
 ```
 
-CI runs the first three on macOS and `cargo deny check` on Linux. `cargo deny` needs `cargo install cargo-deny` locally.
+From `apps/desktop`:
+
+```bash
+pnpm typecheck
+pnpm test
+pnpm build
+```
+
+CI runs the first three cargo commands on macOS, `cargo deny check` on Linux, and the pnpm commands on Linux. `cargo deny` needs `cargo install cargo-deny` locally.
 
 ## Current scope
 
@@ -73,8 +90,6 @@ Comments you write become local drafts anchored to the line or range of lines th
 
 A review is submitted as one batch, verified end to end against a real pull request. The bottom bar holds the summary and the three events — comment, approve, request changes — each of which opens a confirmation showing every inline comment, the summary, the pinned head commit, and anything that will *not* be posted. Nothing reaches GitHub until you approve that panel. The head is re-read first and the submission refused if the pull request moved on, and a failure leaves every draft exactly where it was.
 
-The comment field is a real multi-line text editor: a caret you can move, selection, grapheme-aware movement and deletion, cut/copy/paste, and input-method composition for languages that need it. Positioning the caret with the mouse is not supported yet — use the keyboard.
-
 Repository review guidance is discovered when a snapshot opens — `AGENTS.md`, `CLAUDE.md`, `CONTRIBUTING.md`, style guides, `.github/copilot-instructions.md`, nested per-directory instructions, path-scoped `.github/instructions/*.instructions.md`, and anything named by `.zreview.toml`. Discovery is read-only: it reads files and never executes anything, because finding a repository's guidance is not consent to run its commands. Every file found is reported with its scope, and every file skipped with the reason.
 
 It does not yet show the guidance panel, persist anything besides drafts and the summary, provide syntax highlighting, or run an AI review backend.
@@ -83,6 +98,6 @@ It does not yet show the guidance panel, persist anything besides drafts and the
 
 Licensed under either Apache-2.0 or MIT, at your option.
 
-`deny.toml` enforces that boundary in CI: every dependency licence must be on an explicit allow list, so a strong-copyleft crate — Zed's GPL-3.0 `ui` crate being the specific one to keep out — cannot arrive unnoticed. Zed's `gpui` itself is Apache-2.0 and fine to depend on.
+`deny.toml` enforces that boundary in CI. Every dependency licence must be on an explicit allow list, so a strong-copyleft crate cannot arrive unnoticed.
 
-One deliberate exception is recorded there: `option-ext` is MPL-2.0 and reaches the binary through `gpui`'s font discovery. MPL-2.0 is file-level copyleft that does not extend to code merely linking it, but it is not strictly permissive, and it is one of the items PLAN wants confirmed by legal review before distribution.
+The one licence exception recorded there is MPL-2.0. `option-ext` reaches the binary through Tauri's own `dirs` dependency, and `cssparser` and `selectors` through `dom_query`. MPL-2.0 is file-level copyleft that does not extend to code merely linking it, but it is not strictly permissive, and it is one of the items PLAN wants confirmed by legal review before distribution.
