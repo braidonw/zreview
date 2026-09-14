@@ -133,9 +133,8 @@ mod tests {
     use std::process::Command;
     use tempfile::TempDir;
 
-    /// `remove_var`/`set_var` are unsafe under edition 2024 and this workspace
-    /// forbids unsafe code, so `HOME` is exercised in a re-exec'd child instead
-    /// of by mutating this process's environment.
+    /// Mutating this process's environment would race the other tests, which
+    /// share it, so `HOME` is exercised in a re-exec'd child instead.
     ///
     /// Asserts the child ran exactly one test and it passed, since a filter
     /// that matches nothing exits success with zero tests run.

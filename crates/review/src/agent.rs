@@ -916,9 +916,9 @@ mod tests {
     #[test]
     fn no_forge_credential_reaches_the_review_engine() {
         // Checked in a child process rather than by mutating this one's
-        // environment: `set_var` is unsafe under edition 2024 and this workspace
-        // denies unsafe code. The child inherits the tokens, so what it observes
-        // is what a real review would inherit.
+        // environment, which the other tests share and would race. The child
+        // inherits the tokens, so what it observes is what a real review would
+        // inherit.
         if std::env::var_os(SCRUB_CHILD).is_none() {
             let status = Command::new(std::env::current_exe().expect("the test binary's path"))
                 .args([
@@ -1340,8 +1340,8 @@ mod tests {
 
     #[test]
     fn an_out_of_credit_error_names_a_shadowing_api_key() {
-        // In a child process, because the parent's environment cannot be mutated
-        // safely under `forbid(unsafe_code)`.
+        // In a child process, because the parent's environment is shared with
+        // the other tests and mutating it would race them.
         const CHILD: &str = "ZREVIEW_SHADOW_CHILD";
         if std::env::var_os(CHILD).is_none() {
             let status = Command::new(std::env::current_exe().expect("the test binary's path"))
