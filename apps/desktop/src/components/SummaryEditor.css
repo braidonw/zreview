@@ -13,12 +13,7 @@
   overflow: auto;
 }
 
-/* The focus target is the scrollable content, clipped by the scroller. Ring
-   the editor's own box instead of double-ringing the clipped content. */
-.summary-editor__field .cm-content:focus-visible {
-  outline: none;
-}
-
+/* Rings the editor box, not the content, since the scroller clips it. */
 .summary-editor__field .cm-editor.cm-focused {
   outline: 2px solid var(--border-focus);
   outline-offset: 2px;
