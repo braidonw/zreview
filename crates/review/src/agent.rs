@@ -29,6 +29,7 @@
 use std::{
     ffi::{OsStr, OsString},
     io::Write as _,
+    os::unix::process::CommandExt as _,
     path::{Path, PathBuf},
     process::{Child, Command, Output, Stdio},
     sync::Arc,
@@ -218,6 +219,8 @@ impl CodingAgent {
             // needs for its own sign-in it reads for itself.
             .env_remove("GH_TOKEN")
             .env_remove("GITHUB_TOKEN")
+            // Its own group, so a kill takes the agent's children with it.
+            .process_group(0)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -283,8 +286,7 @@ impl CodingAgent {
                 }
             }
             if events.is_cancelled() {
-                let _ = child.kill();
-                let _ = child.wait();
+                kill_group(&mut child);
                 return Err(ReviewError::Cancelled);
             }
             if std::time::Instant::now() >= deadline {
@@ -305,6 +307,18 @@ impl CodingAgent {
             stderr: reading_stderr.join().unwrap_or_default(),
         })
     }
+}
+
+/// Kills the agent and everything it spawned, then reaps it.
+///
+/// The signal goes out before the wait: once the child is reaped its pid is free
+/// for reuse, and the group id would no longer be ours to signal.
+#[allow(unsafe_code)]
+fn kill_group(child: &mut Child) {
+    let pid = libc::pid_t::try_from(child.id()).expect("a pid fits in pid_t");
+    // SAFETY: process_group(0) made the pgid this pid, which is unwaited and so still ours.
+    let _ = unsafe { libc::kill(-pid, libc::SIGKILL) };
+    let _ = child.wait();
 }
 
 /// How often a running agent is checked for having finished.
@@ -751,6 +765,36 @@ mod tests {
         }
     }
 
+    /// A stub that launches a child of its own, records its pid, and waits on it.
+    ///
+    /// The rename makes the pidfile complete the moment it exists.
+    fn stub_with_grandchild(pidfile: &Path) -> String {
+        let path = pidfile.to_string_lossy();
+        format!("cat >/dev/null\nsleep 30 &\necho $! >{path}.tmp\nmv {path}.tmp {path}\nwait")
+    }
+
+    /// Whether a process with this pid still exists.
+    fn is_alive(pid: &str) -> bool {
+        Command::new("kill")
+            .args(["-0", pid])
+            .stderr(Stdio::null())
+            .status()
+            .expect("kill runs")
+            .success()
+    }
+
+    /// Polls until the process is gone, allowing time for its reaper.
+    fn is_dead_within(pid: &str, budget: Duration) -> bool {
+        let deadline = Instant::now() + budget;
+        while is_alive(pid) {
+            if Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        true
+    }
+
     /// Polls until a file the stub writes exists, returning its content.
     fn wait_for_file(path: &Path) -> String {
         let deadline = Instant::now() + Duration::from_secs(5);
@@ -1048,6 +1092,32 @@ mod tests {
 
         assert!(matches!(error, ReviewError::Cancelled));
         assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    #[test]
+    fn cancelling_kills_the_agents_own_children() {
+        let directory = tempfile::tempdir().expect("a temporary directory");
+        let pidfile = directory.path().join("grandchild.pid");
+        let backend = agent(directory.path(), &stub_with_grandchild(&pidfile))
+            .with_timeout(Duration::from_secs(30));
+        let cancel = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&cancel);
+        let grandchild = std::thread::spawn(move || {
+            let pid = wait_for_file(&pidfile).trim().to_owned();
+            flag.store(true, Ordering::SeqCst);
+            pid
+        });
+
+        let error = backend
+            .review(&request(), &CancelFlag(cancel))
+            .expect_err("the review was cancelled");
+
+        assert!(matches!(error, ReviewError::Cancelled));
+        let pid = grandchild.join().expect("the pid was read");
+        assert!(
+            is_dead_within(&pid, Duration::from_secs(2)),
+            "the agent's child {pid} outlived the cancel"
+        );
     }
 
     #[test]
