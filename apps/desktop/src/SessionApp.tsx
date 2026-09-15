@@ -30,6 +30,7 @@ export function SessionApp({
     cancelReview,
     toggleGuidanceSection,
     toggleGuidanceFile,
+    toggleRefusedClaims,
     revealFinding,
     acceptFinding,
     dismissFinding,
@@ -63,6 +64,7 @@ export function SessionApp({
           onCancelReview={cancelReview}
           onToggleGuidanceSection={toggleGuidanceSection}
           onToggleGuidanceFile={toggleGuidanceFile}
+          onToggleRefusedClaims={toggleRefusedClaims}
           onRevealFinding={revealFinding}
           onAcceptFinding={acceptFinding}
           onDismissFinding={dismissFinding}

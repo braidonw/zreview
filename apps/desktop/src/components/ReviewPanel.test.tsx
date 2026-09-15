@@ -1,7 +1,14 @@
 import { describe, expect, it, vi } from "vitest";
 import { render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { makeFinding, makeGuidance, makeGuidanceEntry, makePanel } from "../test/fixtures";
+import {
+  makeFinding,
+  makeFooter,
+  makeGuidance,
+  makeGuidanceEntry,
+  makePanel,
+  makeRefusedClaim,
+} from "../test/fixtures";
 import { ReviewPanel } from "./ReviewPanel";
 
 /** Every handler the panel needs beyond the one a test wants to watch. */
@@ -13,6 +20,7 @@ function baseHandlers() {
     onCancelReview: () => {},
     onToggleGuidanceSection: () => {},
     onToggleGuidanceFile: () => {},
+    onToggleRefusedClaims: () => {},
     onRevealFinding: () => {},
     onAcceptFinding: () => {},
     onDismissFinding: () => {},
@@ -193,11 +201,11 @@ describe("ReviewPanel", () => {
             heading: "Nothing to act on.",
             detail: "2 claim(s) did not check out and 1 were previously dismissed.",
           },
-          footer: {
+          footer: makeFooter({
             refused: "2 claim(s) refused",
             not_reviewed: "2 file(s) not reviewed",
             unreviewed: ["vendor/lib.rs", "huge.json"],
-          },
+          }),
         })}
         {...baseHandlers()}
       />,
@@ -372,11 +380,11 @@ describe("ReviewPanel", () => {
       <ReviewPanel
         panel={makePanel({
           findings: [makeFinding()],
-          footer: {
+          footer: makeFooter({
             refused: "1 claim(s) refused",
             not_reviewed: "1 file(s) not reviewed",
             unreviewed: ["vendor/lib.rs"],
-          },
+          }),
         })}
         {...baseHandlers()}
       />,
@@ -386,5 +394,68 @@ describe("ReviewPanel", () => {
     expect(screen.getByText("1 claim(s) refused")).toBeTruthy();
     expect(screen.getByText("1 file(s) not reviewed")).toBeTruthy();
     expect(screen.getByText("vendor/lib.rs")).toBeTruthy();
+  });
+
+  it("shows the refused claims heading as a collapsed disclosure with no list", () => {
+    render(
+      <ReviewPanel
+        panel={makePanel({
+          footer: makeFooter({
+            refused: "2 claim(s) refused",
+            refused_claims: [makeRefusedClaim(), makeRefusedClaim({ title: "second" })],
+          }),
+        })}
+        {...baseHandlers()}
+      />,
+    );
+
+    const toggle = screen.getByRole("button", { name: /2 claim\(s\) refused/ });
+    expect(toggle.getAttribute("aria-expanded")).toBe("false");
+    expect(screen.queryByText("impossible line")).toBeNull();
+  });
+
+  it("expands into each refused claim's title, location, and reason once the footer says so", async () => {
+    const onToggleRefusedClaims = vi.fn();
+    const { rerender } = render(
+      <ReviewPanel
+        panel={makePanel({
+          footer: makeFooter({
+            refused: "1 claim(s) refused",
+            refused_claims: [makeRefusedClaim()],
+          }),
+        })}
+        {...baseHandlers()}
+        onToggleRefusedClaims={onToggleRefusedClaims}
+      />,
+    );
+
+    await userEvent.click(screen.getByRole("button", { name: /1 claim\(s\) refused/ }));
+    expect(onToggleRefusedClaims).toHaveBeenCalledOnce();
+
+    rerender(
+      <ReviewPanel
+        panel={makePanel({
+          footer: makeFooter({
+            refused: "1 claim(s) refused",
+            refused_expanded: true,
+            refused_claims: [makeRefusedClaim()],
+          }),
+        })}
+        {...baseHandlers()}
+        onToggleRefusedClaims={onToggleRefusedClaims}
+      />,
+    );
+
+    expect(screen.getByText("impossible line")).toBeTruthy();
+    expect(
+      screen.getByText("src/review_fixture_00.rs RIGHT line 9999 is not a displayed diff line"),
+    ).toBeTruthy();
+    expect(screen.getAllByText("src/review_fixture_00.rs RIGHT line 9999")).toHaveLength(1);
+  });
+
+  it("shows no refused claims button when the run refused nothing", () => {
+    render(<ReviewPanel panel={makePanel({ footer: makeFooter() })} {...baseHandlers()} />);
+
+    expect(screen.queryByRole("button", { name: /claim\(s\) refused/ })).toBeNull();
   });
 });

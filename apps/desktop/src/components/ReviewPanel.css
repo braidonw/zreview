@@ -354,3 +354,50 @@
   padding-left: 16px;
   list-style: disc;
 }
+
+.review-panel__refused-header {
+  padding: 0;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  width: 100%;
+  border: none;
+  background: none;
+  color: var(--text-secondary);
+  font-family: inherit;
+  font-size: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.review-panel__refused {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.review-panel__refused li {
+  padding: 4px 6px;
+  border-radius: 4px;
+  background: var(--surface-overlay);
+}
+
+.review-panel__refused p {
+  margin: 0;
+}
+
+.review-panel__refused-title {
+  color: var(--text-primary);
+}
+
+.review-panel__refused-location {
+  color: var(--text-tertiary);
+}
+
+.review-panel__refused-reason {
+  color: var(--text-secondary);
+}

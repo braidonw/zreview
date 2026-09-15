@@ -27,6 +27,7 @@ function baseHandlers() {
     onCancelReview: () => {},
     onToggleGuidanceSection: () => {},
     onToggleGuidanceFile: () => {},
+    onToggleRefusedClaims: () => {},
     onRevealFinding: () => {},
     onAcceptFinding: () => {},
     onDismissFinding: () => {},

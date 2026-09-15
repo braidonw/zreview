@@ -185,6 +185,11 @@ export function useSession(
     [onPanel],
   );
 
+  const toggleRefusedClaims = useCallback(
+    () => onPanel(commands.toggleRefusedClaims()),
+    [onPanel],
+  );
+
   /**
    * Applies a finding command's answer: a refusal becomes a panel notice, and
    * an answer of `null` (nothing to review) is silently skipped. Only a real
@@ -576,6 +581,7 @@ export function useSession(
     cancelReview,
     toggleGuidanceSection,
     toggleGuidanceFile,
+    toggleRefusedClaims,
     revealFinding,
     acceptFinding,
     dismissFinding,

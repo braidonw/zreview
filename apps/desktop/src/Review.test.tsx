@@ -10,6 +10,7 @@ import {
   makeFile,
   makeFileSummary,
   makeFinding,
+  makeFooter,
   makeGuidance,
   makeGuidanceEntry,
   makePanel,
@@ -412,11 +413,11 @@ describe("the review panel in a Session", () => {
           heading: "Nothing to act on.",
           detail: "2 claim(s) did not check out and 1 were previously dismissed.",
         },
-        footer: {
+        footer: makeFooter({
           refused: "2 claim(s) refused",
           not_reviewed: "1 file(s) not reviewed",
           unreviewed: ["vendor/lib.rs"],
-        },
+        }),
       }),
     });
     await openPanel();
@@ -442,11 +443,11 @@ describe("the review panel in a Session", () => {
       data: makePanel({
         findings: [makeFinding({ id: 1 })],
         run: { state: "Complete", accepted: 1, rejected: 1, suppressed: 0 },
-        footer: {
+        footer: makeFooter({
           refused: "1 claim(s) refused",
           not_reviewed: "1 file(s) not reviewed",
           unreviewed: ["vendor/lib.rs"],
-        },
+        }),
       }),
     });
     await openPanel();

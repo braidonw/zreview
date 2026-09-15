@@ -10,6 +10,8 @@ import type {
   HomeRepositoryDto,
   HomeRowDto,
   HomeSnapshotDto,
+  PanelFooterDto,
+  RefusedClaimDto,
   ReviewPanelDto,
   RowDto,
   SessionSnapshotDto,
@@ -169,6 +171,26 @@ export function makeFinding(overrides: Partial<FindingDto> = {}): FindingDto {
     origin: "claude-code",
     position: "src/review_fixture_00.rs:2",
     is_selected: false,
+    ...overrides,
+  };
+}
+
+export function makeRefusedClaim(overrides: Partial<RefusedClaimDto> = {}): RefusedClaimDto {
+  return {
+    title: "impossible line",
+    location: "src/review_fixture_00.rs RIGHT line 9999",
+    reason: "src/review_fixture_00.rs RIGHT line 9999 is not a displayed diff line",
+    ...overrides,
+  };
+}
+
+export function makeFooter(overrides: Partial<PanelFooterDto> = {}): PanelFooterDto {
+  return {
+    refused: null,
+    refused_expanded: false,
+    refused_claims: [],
+    not_reviewed: null,
+    unreviewed: [],
     ...overrides,
   };
 }
