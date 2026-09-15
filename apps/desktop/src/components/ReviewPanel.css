@@ -360,7 +360,7 @@
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 8px;
+  gap: var(--space-8);
   width: 100%;
   border: none;
   background: none;
@@ -377,12 +377,12 @@
   list-style: none;
   display: flex;
   flex-direction: column;
-  gap: 6px;
+  gap: var(--space-6);
 }
 
 .review-panel__refused li {
-  padding: 4px 6px;
-  border-radius: 4px;
+  padding: var(--space-4) var(--space-6);
+  border-radius: var(--radius-medium);
   background: var(--surface-overlay);
 }
 
