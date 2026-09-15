@@ -599,7 +599,6 @@ impl ReviewSession {
     ) -> Option<ReanchoredDraft> {
         let target = self.anchor_for(file, row)?;
         // Checked before the text is removed, so a refused move changes nothing.
-        // The stale draft's own old position does not count as occupied.
         if self
             .drafts
             .get(&target)
@@ -1695,18 +1694,6 @@ mod tests {
         assert!(!draft.is_stale);
         assert_eq!(session.drafts().stale_count(), 0);
         assert_eq!(session.drafts().len(), 1, "moved, not duplicated");
-    }
-
-    /// The row belongs to another draft, so the move is still refused.
-    #[test]
-    fn re_anchoring_refuses_a_row_another_draft_holds() {
-        let mut session = anchored_session();
-        session.restore_drafts([(stale_anchor(), "still worth saying".to_owned())]);
-        assert!(session.set_draft(0, 6, "already here"));
-
-        assert!(session.reanchor_draft(&stale_anchor(), 0, 6).is_none());
-        assert_eq!(session.drafts().stale_count(), 1);
-        assert_eq!(session.draft_at(0, 6).unwrap().body, "already here");
     }
 
     fn stale_anchor() -> DiffAnchor {

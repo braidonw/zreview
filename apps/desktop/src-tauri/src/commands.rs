@@ -3375,8 +3375,17 @@ mod tests {
             panic!("session should be ready");
         };
         assert_eq!(review.session().drafts().stale_count(), 0);
-        assert_eq!(review.session().drafts().len(), 1, "moved, not duplicated");
         assert_eq!(review.session().draft_at(0, 0).unwrap().body, "stale note");
+        // Restoring collapses rows sharing a key, so only the store itself can
+        // show the old head's row is gone rather than merely outvoted.
+        let scope = review.session().source().draft_scope().unwrap();
+        let head = review.session().source().head_sha().unwrap();
+        let saved = store::ReviewStore::open_read_only(&data.path().join("review-data.sqlite3"))
+            .unwrap()
+            .load(&scope)
+            .unwrap();
+        assert_eq!(saved.len(), 1, "moved, not duplicated");
+        assert_eq!(saved[0].0.head_sha.as_ref(), head.as_ref());
     }
 
     #[test]
