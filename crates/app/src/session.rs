@@ -452,6 +452,7 @@ impl SessionModel {
         // The disclosure has served its purpose; the findings are what the reviewer
         // wants the space for now. The summary line stays visible either way.
         review.guidance_expanded = false;
+        review.refused_expanded = false;
         review.touch();
     }
 
@@ -482,6 +483,15 @@ impl SessionModel {
             return;
         };
         review.guidance_expanded = !review.guidance_expanded;
+        review.touch();
+    }
+
+    /// Opens or closes the refused claims list.
+    pub fn toggle_refused_claims(&mut self) {
+        let SessionPhase::Ready(review) = &mut self.phase else {
+            return;
+        };
+        review.refused_expanded = !review.refused_expanded;
         review.touch();
     }
 
@@ -1297,6 +1307,32 @@ mod tests {
         // And it can be reopened.
         model.toggle_guidance_panel();
         assert!(review(&model).guidance_expanded());
+    }
+
+    #[test]
+    fn the_refused_claims_list_starts_collapsed_and_toggling_bumps_the_revision() {
+        let mut model = ready_model(None);
+        assert!(!review(&model).refused_expanded());
+        let revision = review(&model).revision();
+
+        model.toggle_refused_claims();
+
+        assert!(review(&model).refused_expanded());
+        assert!(
+            review(&model).revision() > revision,
+            "toggling the refused claims list did not bump the revision"
+        );
+    }
+
+    #[test]
+    fn the_refused_claims_list_collapses_once_a_run_finishes() {
+        let mut model = ready_model(None);
+        model.toggle_refused_claims();
+        assert!(review(&model).refused_expanded());
+
+        model.review_finished(Findings::default(), Vec::new());
+
+        assert!(!review(&model).refused_expanded());
     }
 
     /// The panel carries the only Review button, so it must not depend on there

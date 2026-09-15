@@ -98,6 +98,11 @@ pub struct ReviewModel {
     /// Open before the first run, because PLAN wants what will be sent seen before
     /// it is sent; collapsed afterwards, when the findings are what matters.
     pub(crate) guidance_expanded: bool,
+    /// Whether the refused claims list is open.
+    ///
+    /// Collapsed by default, and reset on every run so a new run never opens on
+    /// the previous run's list.
+    pub(crate) refused_expanded: bool,
     /// How many times anything the review panel shows has changed.
     ///
     /// A front end learns about this model through whole-panel snapshots, from
@@ -119,6 +124,7 @@ impl ReviewModel {
             selected_finding: None,
             pending_replace: None,
             guidance_expanded: true,
+            refused_expanded: false,
             revision: 0,
         }
     }
@@ -151,6 +157,11 @@ impl ReviewModel {
     #[must_use]
     pub const fn guidance_expanded(&self) -> bool {
         self.guidance_expanded
+    }
+
+    #[must_use]
+    pub const fn refused_expanded(&self) -> bool {
+        self.refused_expanded
     }
 
     /// Whether the findings panel has anything worth the screen space.
