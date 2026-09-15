@@ -1283,9 +1283,7 @@ fn project_footer(
 ) -> Option<PanelFooterDto> {
     let rejected = session.findings().rejected();
     let refused = (!rejected.is_empty()).then(|| format!("{} claim(s) refused", rejected.len()));
-    // Rejected claims are uncapped, so a backend that returned thousands of them
-    // is cloned and serialised on every panel snapshot unless the list stays
-    // empty until a reviewer actually asks to see it.
+    // Uncapped, so the list is only built once a reviewer asks to see it.
     let refused_claims = if refused_expanded {
         project_refused_claims(rejected)
     } else {
