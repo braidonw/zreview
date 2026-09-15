@@ -46,6 +46,7 @@ pub fn specta_builder() -> tauri_specta::Builder<tauri::Wry> {
         run_review,
         cancel_review,
         toggle_guidance_panel,
+        toggle_refused_claims,
         toggle_guidance,
         accept_finding,
         overwrite_finding,
@@ -720,6 +721,13 @@ fn cancel_review_on_model(model: &Mutex<app::SessionModel>) -> Option<dto::Revie
 fn toggle_guidance_panel_on_model(model: &Mutex<app::SessionModel>) -> Option<dto::ReviewPanelDto> {
     let mut guard = lock(model);
     guard.toggle_guidance_panel();
+    panel_of(&guard)
+}
+
+/// Opens or closes the refused claims list.
+fn toggle_refused_claims_on_model(model: &Mutex<app::SessionModel>) -> Option<dto::ReviewPanelDto> {
+    let mut guard = lock(model);
+    guard.toggle_refused_claims();
     panel_of(&guard)
 }
 
@@ -1406,6 +1414,21 @@ pub fn toggle_guidance_panel(
 ) -> Result<Option<dto::ReviewPanelDto>, dto::SessionFailureDto> {
     let model = session_model(&state)?;
     Ok(toggle_guidance_panel_on_model(&model))
+}
+
+/// Opens or closes the refused claims list.
+///
+/// # Errors
+///
+/// Returns a failure when no session is open.
+#[tauri::command]
+#[specta::specta]
+#[allow(clippy::needless_pass_by_value)]
+pub fn toggle_refused_claims(
+    state: tauri::State<'_, AppRoot>,
+) -> Result<Option<dto::ReviewPanelDto>, dto::SessionFailureDto> {
+    let model = session_model(&state)?;
+    Ok(toggle_refused_claims_on_model(&model))
 }
 
 /// Turns one guidance file on or off for the next run.
@@ -4383,5 +4406,24 @@ mod tests {
         let footer = panel.footer.expect("a partial review says it was partial");
         assert_eq!(footer.refused, Some("1 claim(s) refused".to_owned()));
         assert_eq!(footer.unreviewed, vec!["vendor/lib.rs".to_owned()]);
+    }
+
+    #[test]
+    fn toggling_the_refused_claims_list_flips_the_flag_in_the_footer() {
+        let repository = guided_repository();
+        let model = local_model(&local_request(&repository), &ReviewStorage::Disabled);
+        let backend = FakeBackend::new(Vec::new(), Ok(vec![raw_finding_on(9999, "impossible")]));
+        run_with(&model, &backend);
+
+        let opened = toggle_refused_claims_on_model(&model).expect("the session can be reviewed");
+        let opened_footer = opened.footer.expect("a refused claim says so");
+        assert!(opened_footer.refused_expanded);
+        assert_eq!(opened_footer.refused_claims.len(), 1);
+        assert_eq!(opened_footer.refused_claims[0].title, "impossible");
+
+        let closed = toggle_refused_claims_on_model(&model).expect("the session can be reviewed");
+        let closed_footer = closed.footer.expect("a refused claim says so");
+        assert!(!closed_footer.refused_expanded);
+        assert!(closed_footer.refused_claims.is_empty());
     }
 }

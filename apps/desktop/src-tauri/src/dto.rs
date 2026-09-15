@@ -9,8 +9,8 @@ use app::{
 };
 use domain::{
     AnchorLocation, DiffFile, DiffLineKind, DiffSide, EmptyDiffReason, ExcludedDraft, FileStatus,
-    Finding, GuidanceSelection, ReviewEvent, ReviewSession, ReviewSubmission, SessionFailure,
-    SessionSource, Severity, SubmissionOutcome,
+    Finding, GuidanceSelection, RawLocation, RejectedFinding, ReviewEvent, ReviewSession,
+    ReviewSubmission, SessionFailure, SessionSource, Severity, SubmissionOutcome,
 };
 use serde::{Deserialize, Serialize};
 
@@ -359,11 +359,25 @@ pub struct FindingDto {
     pub is_selected: bool,
 }
 
+/// One claim a run refused, and why.
+#[derive(Clone, Debug, Serialize, specta::Type)]
+pub struct RefusedClaimDto {
+    pub title: String,
+    /// "path SIDE line N", or "path SIDE lines N to M" for a range. Absent for
+    /// a claim about the change as a whole.
+    pub location: Option<String>,
+    pub reason: String,
+}
+
 /// The caveats under the panel: what was refused, and what was never looked at.
 #[derive(Clone, Debug, Serialize, specta::Type)]
 pub struct PanelFooterDto {
     /// Claims that did not survive checking against the diff.
     pub refused: Option<String>,
+    /// Whether the refused claims list is open.
+    pub refused_expanded: bool,
+    /// Each refused claim, in the order it was refused.
+    pub refused_claims: Vec<RefusedClaimDto>,
     /// Present when a completed run did not see the whole change.
     pub not_reviewed: Option<String>,
     /// The files that run did not see, named under the count that describes them.
@@ -1106,7 +1120,7 @@ pub fn project_panel(review: &ReviewModel) -> Option<ReviewPanelDto> {
             .iter()
             .map(|finding| project_finding(finding, selected))
             .collect(),
-        footer: project_footer(session, run),
+        footer: project_footer(session, run, review.refused_expanded()),
     })
 }
 
@@ -1262,25 +1276,65 @@ fn nothing_to_act_on(rejected: usize, suppressed: usize) -> String {
 }
 
 /// The caveats: what was refused, and what was never looked at.
-fn project_footer(session: &ReviewSession, run: &ReviewRunState) -> Option<PanelFooterDto> {
-    let rejected = session.findings().rejected().len();
-    let refused = (rejected > 0).then(|| format!("{rejected} claim(s) refused"));
+fn project_footer(
+    session: &ReviewSession,
+    run: &ReviewRunState,
+    refused_expanded: bool,
+) -> Option<PanelFooterDto> {
+    let rejected = session.findings().rejected();
+    let refused = (!rejected.is_empty()).then(|| format!("{} claim(s) refused", rejected.len()));
+    // Uncapped, so the list is only built once a reviewer asks to see it.
+    let refused_claims = if refused_expanded {
+        project_refused_claims(rejected)
+    } else {
+        Vec::new()
+    };
     let ReviewRunState::Complete { unreviewed, .. } = run else {
         return refused.map(|refused| PanelFooterDto {
             refused: Some(refused),
+            refused_expanded,
+            refused_claims,
             not_reviewed: None,
             unreviewed: Vec::new(),
         });
     };
-    if rejected == 0 && unreviewed.is_empty() {
+    if rejected.is_empty() && unreviewed.is_empty() {
         return None;
     }
     Some(PanelFooterDto {
         refused,
+        refused_expanded,
+        refused_claims,
         not_reviewed: (!unreviewed.is_empty())
             .then(|| format!("{} file(s) not reviewed", unreviewed.len())),
         unreviewed: unreviewed.clone(),
     })
+}
+
+/// Each refused claim, in the order the run refused them.
+fn project_refused_claims(rejected: &[RejectedFinding]) -> Vec<RefusedClaimDto> {
+    rejected
+        .iter()
+        .map(|claim| RefusedClaimDto {
+            title: claim.raw.title.clone(),
+            location: claim.raw.location.as_ref().map(format_raw_location),
+            reason: claim.reason.to_string(),
+        })
+        .collect()
+}
+
+/// "path SIDE line N", or "path SIDE lines N to M" for a range.
+///
+/// Matches the phrasing `AnchorError::RangeCrossesHunks` already uses, so a
+/// refused range does not show two different forms on adjacent lines.
+fn format_raw_location(location: &RawLocation) -> String {
+    match location.start_line {
+        Some(start) if start != location.line => format!(
+            "{} {} lines {} to {}",
+            location.path, location.side, start, location.line
+        ),
+        _ => format!("{} {} line {}", location.path, location.side, location.line),
+    }
 }
 
 #[cfg(test)]
@@ -1662,5 +1716,108 @@ mod tests {
 
         assert_eq!(snapshot.warnings.len(), 1);
         assert_eq!(snapshot.warnings[0].summary, "drafts are not being saved");
+    }
+
+    /// Two claims, refused for different reasons: one about a line, one about
+    /// the change as a whole.
+    fn session_with_refused_claims() -> ReviewSession {
+        let mut session = anchored_session();
+        let anchors = session
+            .anchors()
+            .expect("anchored session has anchors")
+            .clone();
+        let origin = domain::FindingOrigin::Ai("claude-code".into());
+        let raw = vec![
+            domain::RawFinding {
+                location: Some(domain::RawLocation {
+                    path: "src/review.rs".into(),
+                    side: domain::DiffSide::Right,
+                    line: 9999,
+                    start_line: None,
+                }),
+                severity: domain::Severity::Warning,
+                confidence: 0.9,
+                title: "impossible line".to_owned(),
+                rationale: String::new(),
+                proposed_comment: "Handle the failure here.".to_owned(),
+                guidance_sources: Vec::new(),
+            },
+            domain::RawFinding {
+                location: None,
+                severity: domain::Severity::Warning,
+                confidence: 0.9,
+                title: "nothing to post".to_owned(),
+                rationale: String::new(),
+                proposed_comment: String::new(),
+                guidance_sources: Vec::new(),
+            },
+        ];
+        session.set_findings(domain::Findings::validate(raw, &anchors, &origin));
+        session
+    }
+
+    #[test]
+    fn project_footer_lists_each_refused_claim_with_its_title_location_and_reason_once_expanded() {
+        let session = session_with_refused_claims();
+
+        let footer =
+            project_footer(&session, &ReviewRunState::Idle, true).expect("two claims refused");
+
+        assert_eq!(footer.refused_claims.len(), 2);
+        assert_eq!(footer.refused_claims[0].title, "impossible line");
+        assert_eq!(
+            footer.refused_claims[0].location.as_deref(),
+            Some("src/review.rs RIGHT line 9999")
+        );
+        assert_eq!(
+            footer.refused_claims[0].reason,
+            "src/review.rs RIGHT line 9999 is not a displayed diff line"
+        );
+
+        assert_eq!(footer.refused_claims[1].title, "nothing to post");
+        assert_eq!(footer.refused_claims[1].location, None);
+        assert_eq!(footer.refused_claims[1].reason, "no comment to post");
+    }
+
+    /// Rejected claims are uncapped, so the list stays out of every collapsed
+    /// snapshot rather than being cloned and serialised for nothing.
+    #[test]
+    fn project_footer_sends_the_claims_list_only_once_expanded() {
+        let session = session_with_refused_claims();
+
+        let collapsed =
+            project_footer(&session, &ReviewRunState::Idle, false).expect("two claims refused");
+        assert!(!collapsed.refused_expanded);
+        assert!(collapsed.refused_claims.is_empty());
+
+        let expanded =
+            project_footer(&session, &ReviewRunState::Idle, true).expect("two claims refused");
+        assert!(expanded.refused_expanded);
+        assert_eq!(expanded.refused_claims.len(), 2);
+    }
+
+    #[test]
+    fn format_raw_location_renders_a_range_the_same_way_anchor_error_does() {
+        let range = domain::RawLocation {
+            path: "src/review.rs".into(),
+            side: domain::DiffSide::Right,
+            line: 5,
+            start_line: Some(3),
+        };
+        assert_eq!(
+            format_raw_location(&range),
+            "src/review.rs RIGHT lines 3 to 5"
+        );
+    }
+
+    #[test]
+    fn format_raw_location_collapses_to_one_line_when_start_matches_line() {
+        let single = domain::RawLocation {
+            path: "src/review.rs".into(),
+            side: domain::DiffSide::Right,
+            line: 5,
+            start_line: Some(5),
+        };
+        assert_eq!(format_raw_location(&single), "src/review.rs RIGHT line 5");
     }
 }

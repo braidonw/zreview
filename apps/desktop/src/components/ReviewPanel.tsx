@@ -1,5 +1,11 @@
 import type { FindingConflict } from "../hooks/sessionReducer";
-import type { FindingDto, GuidanceDto, ReviewPanelDto, SeverityDto } from "../bindings";
+import type {
+  FindingDto,
+  GuidanceDto,
+  RefusedClaimDto,
+  ReviewPanelDto,
+  SeverityDto,
+} from "../bindings";
 import "./ReviewPanel.css";
 
 const SEVERITY_LABEL: Record<SeverityDto, string> = {
@@ -25,6 +31,7 @@ export function ReviewPanel({
   onCancelReview,
   onToggleGuidanceSection,
   onToggleGuidanceFile,
+  onToggleRefusedClaims,
   onRevealFinding,
   onAcceptFinding,
   onDismissFinding,
@@ -40,6 +47,7 @@ export function ReviewPanel({
   onCancelReview: () => void;
   onToggleGuidanceSection: () => void;
   onToggleGuidanceFile: (path: string) => void;
+  onToggleRefusedClaims: () => void;
   onRevealFinding: (id: number) => void;
   onAcceptFinding: (id: number) => void;
   onDismissFinding: (id: number) => void;
@@ -101,7 +109,14 @@ export function ReviewPanel({
       </div>
       {footer !== null && (
         <footer className="review-panel__footer">
-          {footer.refused !== null && <p>{footer.refused}</p>}
+          {footer.refused !== null && (
+            <RefusedClaimsSection
+              refused={footer.refused}
+              expanded={footer.refused_expanded}
+              claims={footer.refused_claims}
+              onToggle={onToggleRefusedClaims}
+            />
+          )}
           {footer.not_reviewed !== null && (
             <>
               <p className="review-panel__not-reviewed">{footer.not_reviewed}</p>
@@ -115,6 +130,53 @@ export function ReviewPanel({
         </footer>
       )}
     </aside>
+  );
+}
+
+/**
+ * The refused count, expandable into each claim's title, location, and reason.
+ *
+ * Collapsed by default. A reviewer who wants to know why a claim was refused
+ * can ask, but the count alone is enough most of the time.
+ */
+function RefusedClaimsSection({
+  refused,
+  expanded,
+  claims,
+  onToggle,
+}: {
+  refused: string;
+  expanded: boolean;
+  claims: RefusedClaimDto[];
+  onToggle: () => void;
+}) {
+  return (
+    <>
+      <button
+        type="button"
+        className="review-panel__refused-header"
+        aria-expanded={expanded}
+        onClick={onToggle}
+      >
+        <span>{refused}</span>
+        <span className="review-panel__disclosure">{expanded ? "hide" : "show"}</span>
+      </button>
+      {expanded && (
+        <ul className="review-panel__refused">
+          {claims.map((claim, index) => (
+            <li key={index}>
+              {claim.title.trim() !== "" && (
+                <p className="review-panel__refused-title">{claim.title}</p>
+              )}
+              {claim.location !== null && (
+                <p className="review-panel__refused-location">{claim.location}</p>
+              )}
+              <p className="review-panel__refused-reason">{claim.reason}</p>
+            </li>
+          ))}
+        </ul>
+      )}
+    </>
   );
 }
 

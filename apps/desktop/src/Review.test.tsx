@@ -10,9 +10,11 @@ import {
   makeFile,
   makeFileSummary,
   makeFinding,
+  makeFooter,
   makeGuidance,
   makeGuidanceEntry,
   makePanel,
+  makeRefusedClaim,
   makeRow,
   makeSidebar,
   makeSnapshot,
@@ -30,6 +32,7 @@ const runReview = vi.fn();
 const cancelReview = vi.fn();
 const toggleGuidancePanel = vi.fn();
 const toggleGuidance = vi.fn();
+const toggleRefusedClaims = vi.fn();
 const acceptFinding = vi.fn();
 const overwriteFinding = vi.fn();
 const dismissFinding = vi.fn();
@@ -50,6 +53,7 @@ vi.mock("./bindings", () => ({
     cancelReview: () => cancelReview(),
     toggleGuidancePanel: () => toggleGuidancePanel(),
     toggleGuidance: (path: unknown) => toggleGuidance(path),
+    toggleRefusedClaims: () => toggleRefusedClaims(),
     acceptFinding: (id: unknown) => acceptFinding(id),
     overwriteFinding: (id: unknown) => overwriteFinding(id),
     dismissFinding: (id: unknown) => dismissFinding(id),
@@ -95,6 +99,7 @@ beforeEach(() => {
   cancelReview.mockReset();
   toggleGuidancePanel.mockReset();
   toggleGuidance.mockReset();
+  toggleRefusedClaims.mockReset();
   acceptFinding.mockReset();
   overwriteFinding.mockReset();
   dismissFinding.mockReset();
@@ -160,6 +165,33 @@ describe("the review panel in a Session", () => {
 
     await waitFor(() => expect(screen.queryByText("AGENTS.md")).toBeNull());
     expect(screen.getByText("1 guidance file · 2 KB")).toBeTruthy();
+  });
+
+  it("expands the refused claims list and shows each claim's reason", async () => {
+    const user = userEvent.setup();
+    reviewPanel.mockResolvedValue({
+      status: "ok",
+      data: makePanel({ footer: makeFooter({ refused: "1 claim(s) refused" }) }),
+    });
+    toggleRefusedClaims.mockResolvedValue({
+      status: "ok",
+      data: makePanel({
+        footer: makeFooter({
+          refused: "1 claim(s) refused",
+          refused_expanded: true,
+          refused_claims: [makeRefusedClaim()],
+        }),
+      }),
+    });
+    await openPanel();
+
+    await user.click(screen.getByRole("button", { name: /1 claim\(s\) refused/ }));
+
+    await waitFor(() =>
+      expect(
+        screen.getByText("src/review_fixture_00.rs RIGHT line 9999 is not a displayed diff line"),
+      ).toBeTruthy(),
+    );
   });
 
   it("shows what a refused toggle said, leaving the diff and the composer alone", async () => {
@@ -412,11 +444,11 @@ describe("the review panel in a Session", () => {
           heading: "Nothing to act on.",
           detail: "2 claim(s) did not check out and 1 were previously dismissed.",
         },
-        footer: {
+        footer: makeFooter({
           refused: "2 claim(s) refused",
           not_reviewed: "1 file(s) not reviewed",
           unreviewed: ["vendor/lib.rs"],
-        },
+        }),
       }),
     });
     await openPanel();
@@ -442,11 +474,11 @@ describe("the review panel in a Session", () => {
       data: makePanel({
         findings: [makeFinding({ id: 1 })],
         run: { state: "Complete", accepted: 1, rejected: 1, suppressed: 0 },
-        footer: {
+        footer: makeFooter({
           refused: "1 claim(s) refused",
           not_reviewed: "1 file(s) not reviewed",
           unreviewed: ["vendor/lib.rs"],
-        },
+        }),
       }),
     });
     await openPanel();

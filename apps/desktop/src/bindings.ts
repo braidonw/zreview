@@ -253,6 +253,28 @@ export const commands = {
 	footer: PanelFooterDto | null,
 } | null, SessionFailureDto>(__TAURI_INVOKE("toggle_guidance_panel")),
 	/**
+	 *  Opens or closes the refused claims list.
+	 * 
+	 *  # Errors
+	 * 
+	 *  Returns a failure when no session is open.
+	 */
+	toggleRefusedClaims: () => typedError<{
+	/**
+	 *  How many times the panel has changed, so a snapshot that was read before
+	 *  a change can be told from one that carries it.
+	 */
+	revision: number,
+	/**  "Review" before there is anything to act on, otherwise the finding count. */
+	heading: string,
+	guidance: GuidanceDto,
+	run: ReviewRunDto,
+	note: PanelNoteDto | null,
+	/**  Waiting for the reviewer, most severe and most confident first. */
+	findings: FindingDto[],
+	footer: PanelFooterDto | null,
+} | null, SessionFailureDto>(__TAURI_INVOKE("toggle_refused_claims")),
+	/**
 	 *  Turns one guidance file on or off for the next run.
 	 * 
 	 *  # Errors
@@ -694,6 +716,10 @@ export type OpenSessionDto = {
 export type PanelFooterDto = {
 	/**  Claims that did not survive checking against the diff. */
 	refused: string | null,
+	/**  Whether the refused claims list is open. */
+	refused_expanded: boolean,
+	/**  Each refused claim, in the order it was refused. */
+	refused_claims: RefusedClaimDto[],
 	/**  Present when a completed run did not see the whole change. */
 	not_reviewed: string | null,
 	/**  The files that run did not see, named under the count that describes them. */
@@ -726,6 +752,17 @@ export type RefreshStateDto =
 /**  Something Home would not do, and why. */
 export type RefusalDto = {
 	path: string,
+	reason: string,
+};
+
+/**  One claim a run refused, and why. */
+export type RefusedClaimDto = {
+	title: string,
+	/**
+	 *  "path SIDE line N", or "path SIDE lines N to M" for a range. Absent for
+	 *  a claim about the change as a whole.
+	 */
+	location: string | null,
 	reason: string,
 };
 

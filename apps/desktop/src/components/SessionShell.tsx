@@ -24,6 +24,7 @@ export function SessionShell({
   onCancelReview,
   onToggleGuidanceSection,
   onToggleGuidanceFile,
+  onToggleRefusedClaims,
   onRevealFinding,
   onAcceptFinding,
   onDismissFinding,
@@ -50,6 +51,7 @@ export function SessionShell({
   onCancelReview: () => void;
   onToggleGuidanceSection: () => void;
   onToggleGuidanceFile: (path: string) => void;
+  onToggleRefusedClaims: () => void;
   onRevealFinding: (id: number) => void;
   onAcceptFinding: (id: number) => void;
   onDismissFinding: (id: number) => void;
@@ -128,6 +130,7 @@ export function SessionShell({
             onCancelReview={onCancelReview}
             onToggleGuidanceSection={onToggleGuidanceSection}
             onToggleGuidanceFile={onToggleGuidanceFile}
+            onToggleRefusedClaims={onToggleRefusedClaims}
             onRevealFinding={onRevealFinding}
             onAcceptFinding={onAcceptFinding}
             onDismissFinding={onDismissFinding}
