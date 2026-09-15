@@ -23,12 +23,13 @@
 //! - **No writable checkout.** The working directory is set so relative paths
 //!   resolve, and the agent has no tool with which to write to it.
 //!
-//! A run is bounded in time and in output size, and cancellation is checked before
-//! and after the wait, so abandoning a review stops paying for it.
+//! A run is bounded in time and in output size, and cancellation is checked
+//! before, during, and after the wait, so abandoning a review stops paying for it.
 
 use std::{
     ffi::{OsStr, OsString},
     io::Write as _,
+    os::unix::process::CommandExt as _,
     path::{Path, PathBuf},
     process::{Child, Command, Output, Stdio},
     sync::Arc,
@@ -204,7 +205,12 @@ impl CodingAgent {
         )
     }
 
-    fn run(&self, body: &str, schema: &str) -> Result<Output, ReviewError> {
+    fn run(
+        &self,
+        body: &str,
+        schema: &str,
+        events: &dyn ReviewEventSink,
+    ) -> Result<Output, ReviewError> {
         let program = self.program();
         let mut child = Command::new(&self.executable)
             .current_dir(&self.working_directory)
@@ -213,6 +219,8 @@ impl CodingAgent {
             // needs for its own sign-in it reads for itself.
             .env_remove("GH_TOKEN")
             .env_remove("GITHUB_TOKEN")
+            // Its own group, so a kill takes the agent's children with it.
+            .process_group(0)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -229,31 +237,31 @@ impl CodingAgent {
         // Closing stdin is what tells the agent the prompt is complete.
         drop(stdin);
         if let Err(source) = written {
-            let _ = child.kill();
-            let _ = child.wait();
+            kill_group(&mut child);
             return Err(ReviewError::Launch {
                 program,
                 message: format!("could not send the review material: {source}"),
             });
         }
 
-        self.wait_with_timeout(child, &program)
+        self.wait_with_timeout(child, &program, events)
     }
 
-    /// Waits for the child, killing it if it outlives the timeout.
+    /// Waits for the child, killing it if it outlives the timeout or the review
+    /// is cancelled.
     ///
     /// The child handle stays here rather than moving onto a waiting thread, so a
-    /// timeout kills exactly the process this review started. An earlier version
+    /// kill hits exactly the process this review started. An earlier version
     /// signalled by name instead, which would have killed every `claude` on the
     /// machine — including the reviewer's own interactive session.
     ///
-    /// A coding agent may spawn children of its own, and killing the direct child
-    /// does not reap those. Doing better would need a process group, which needs
-    /// `unsafe` and is forbidden here, so the direct kill is the honest limit.
+    /// A coding agent may spawn children of its own, so it runs in its own process
+    /// group and a kill takes the whole group with it.
     fn wait_with_timeout(
         &self,
         mut child: Child,
         program: &Arc<str>,
+        events: &dyn ReviewEventSink,
     ) -> Result<Output, ReviewError> {
         // The pipes are drained on their own threads: a child that fills a pipe
         // buffer blocks until someone reads it, and it would block there long
@@ -269,17 +277,20 @@ impl CodingAgent {
                 Ok(Some(status)) => break status,
                 Ok(None) => {}
                 Err(source) => {
-                    let _ = child.kill();
+                    // A failed wait means the child is already reaped and its pid
+                    // may have been reused, so there is nothing safe to signal.
                     return Err(ReviewError::Launch {
                         program: Arc::clone(program),
                         message: source.to_string(),
                     });
                 }
             }
+            if events.is_cancelled() {
+                kill_group(&mut child);
+                return Err(ReviewError::Cancelled);
+            }
             if std::time::Instant::now() >= deadline {
-                let _ = child.kill();
-                // Reap it, so the timed-out agent does not linger as a zombie.
-                let _ = child.wait();
+                kill_group(&mut child);
                 return Err(ReviewError::TimedOut {
                     program: Arc::clone(program),
                     seconds: self.timeout.as_secs(),
@@ -294,6 +305,21 @@ impl CodingAgent {
             stderr: reading_stderr.join().unwrap_or_default(),
         })
     }
+}
+
+/// Kills the agent and everything it spawned, then reaps it.
+///
+/// The signal goes out before the wait. Once the child is reaped its pid is free
+/// for reuse, and the group id would no longer be ours to signal.
+#[expect(unsafe_code)]
+fn kill_group(child: &mut Child) {
+    let pid = libc::pid_t::try_from(child.id()).expect("a pid fits in pid_t");
+    // SAFETY: process_group(0) made the pgid this pid, which is unwaited and so
+    // still ours.
+    let _ = unsafe { libc::kill(-pid, libc::SIGKILL) };
+    // The leader directly too, in case it moved itself out of the group.
+    let _ = child.kill();
+    let _ = child.wait();
 }
 
 /// How often a running agent is checked for having finished.
@@ -349,7 +375,7 @@ impl ReviewBackend for CodingAgent {
             )),
         });
 
-        let output = self.run(&body, &schema)?;
+        let output = self.run(&body, &schema, events)?;
         if events.is_cancelled() {
             return Err(ReviewError::Cancelled);
         }
@@ -656,7 +682,15 @@ fn launch_error(program: &Arc<str>, executable: &OsStr, source: &std::io::Error)
 
 #[cfg(test)]
 mod tests {
-    use std::{fs, os::unix::fs::PermissionsExt, sync::Arc};
+    use std::{
+        fs,
+        os::unix::fs::PermissionsExt,
+        sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        },
+        time::Instant,
+    };
 
     use domain::{
         ChangeCounts, DiffFile, DiffHunk, DiffLine, DiffLineKind, FileStatus, IgnoreProgress,
@@ -707,6 +741,18 @@ mod tests {
         }
     }
 
+    /// A request whose prompt overfills the stdin pipe.
+    ///
+    /// `run` writes the whole prompt before it starts the clock, so with this
+    /// request the timeout cannot begin until the stub is reading its stdin.
+    fn request_that_blocks_run_until_the_stub_reads_stdin() -> ReviewRequest {
+        let mut request = request();
+        request.title = Some("A large change".to_owned());
+        // A pipe holds at most 64 KiB.
+        request.description = Some("x".repeat(256 * 1024));
+        request
+    }
+
     /// One finding, in the envelope `claude --print --output-format json` returns.
     fn print_envelope(findings_json: &str) -> String {
         let result = serde_json::to_string(findings_json).expect("the reply is quotable");
@@ -720,6 +766,69 @@ mod tests {
     fn agent(directory: &Path, script: &str) -> CodingAgent {
         let executable = stub(directory, "claude", script);
         CodingAgent::new(Agent::ClaudeCode, directory).with_executable(executable)
+    }
+
+    /// A sink whose cancellation the test flips from another thread.
+    struct CancelFlag(Arc<AtomicBool>);
+
+    impl ReviewEventSink for CancelFlag {
+        fn progress(&self, _progress: ReviewProgress) {}
+        fn is_cancelled(&self) -> bool {
+            self.0.load(Ordering::SeqCst)
+        }
+    }
+
+    /// A stub that launches a child of its own, records its pid, and waits on it.
+    ///
+    /// The pid is recorded before stdin is read, so once the stub is reading, its
+    /// child exists.
+    fn stub_with_grandchild(pidfile: &Path) -> String {
+        format!(
+            "sleep 30 &\necho $! >{}\ncat >/dev/null\nwait",
+            pidfile.to_string_lossy()
+        )
+    }
+
+    /// Whether a process with this pid still exists.
+    fn is_alive(pid: &str) -> bool {
+        Command::new("kill")
+            .args(["-0", pid])
+            .stderr(Stdio::null())
+            .status()
+            .expect("kill runs")
+            .success()
+    }
+
+    /// Polls until the process is gone, allowing time for its reaper.
+    fn is_dead_within(pid: &str, budget: Duration) -> bool {
+        let deadline = Instant::now() + budget;
+        while is_alive(pid) {
+            if Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        true
+    }
+
+    /// Polls until the stub has written a whole line to the file, returning it.
+    ///
+    /// Generous, because a burst of process starts can stall for seconds.
+    fn wait_for_line(path: &Path) -> String {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            if let Ok(content) = fs::read_to_string(path)
+                && content.ends_with('\n')
+            {
+                return content.trim_end().to_owned();
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the stub never wrote {}",
+                path.display()
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
     }
 
     #[test]
@@ -807,9 +916,9 @@ mod tests {
     #[test]
     fn no_forge_credential_reaches_the_review_engine() {
         // Checked in a child process rather than by mutating this one's
-        // environment: `set_var` is unsafe under edition 2024 and this workspace
-        // forbids unsafe code. The child inherits the tokens, so what it observes
-        // is what a real review would inherit.
+        // environment, which the other tests share and would race. The child
+        // inherits the tokens, so what it observes is what a real review would
+        // inherit.
         if std::env::var_os(SCRUB_CHILD).is_none() {
             let status = Command::new(std::env::current_exe().expect("the test binary's path"))
                 .args([
@@ -975,6 +1084,83 @@ mod tests {
 
         assert!(matches!(error, ReviewError::TimedOut { seconds: 0, .. }));
         assert!(error.is_retryable());
+    }
+
+    #[test]
+    fn cancelling_mid_run_stops_the_agent_promptly() {
+        let directory = tempfile::tempdir().expect("a temporary directory");
+        let running = directory.path().join("running");
+        let backend = agent(
+            directory.path(),
+            &format!(
+                "cat >/dev/null\necho running >{}\nsleep 30",
+                running.to_string_lossy()
+            ),
+        )
+        .with_timeout(Duration::from_secs(30));
+        let cancel = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&cancel);
+        let cancelled = std::thread::spawn(move || {
+            wait_for_line(&running);
+            flag.store(true, Ordering::SeqCst);
+            Instant::now()
+        });
+
+        let error = backend
+            .review(&request(), &CancelFlag(cancel))
+            .expect_err("the review was cancelled");
+
+        assert!(matches!(error, ReviewError::Cancelled));
+        let cancelled_at = cancelled.join().expect("the flag was set");
+        assert!(cancelled_at.elapsed() < Duration::from_secs(5));
+    }
+
+    #[test]
+    fn cancelling_kills_the_agents_own_children() {
+        let directory = tempfile::tempdir().expect("a temporary directory");
+        let pidfile = directory.path().join("grandchild.pid");
+        let backend = agent(directory.path(), &stub_with_grandchild(&pidfile))
+            .with_timeout(Duration::from_secs(30));
+        let cancel = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&cancel);
+        let grandchild = std::thread::spawn(move || {
+            let pid = wait_for_line(&pidfile);
+            flag.store(true, Ordering::SeqCst);
+            pid
+        });
+
+        let error = backend
+            .review(&request(), &CancelFlag(cancel))
+            .expect_err("the review was cancelled");
+
+        assert!(matches!(error, ReviewError::Cancelled));
+        let pid = grandchild.join().expect("the pid was read");
+        assert!(
+            is_dead_within(&pid, Duration::from_secs(2)),
+            "the agent's child {pid} outlived the cancel"
+        );
+    }
+
+    #[test]
+    fn a_timeout_kills_the_agents_own_children() {
+        let directory = tempfile::tempdir().expect("a temporary directory");
+        let pidfile = directory.path().join("grandchild.pid");
+        let backend = agent(directory.path(), &stub_with_grandchild(&pidfile))
+            .with_timeout(Duration::from_millis(250));
+
+        let error = backend
+            .review(
+                &request_that_blocks_run_until_the_stub_reads_stdin(),
+                &IgnoreProgress,
+            )
+            .expect_err("the stub hangs");
+
+        assert!(matches!(error, ReviewError::TimedOut { .. }));
+        let pid = wait_for_line(&pidfile);
+        assert!(
+            is_dead_within(&pid, Duration::from_secs(2)),
+            "the agent's child {pid} outlived the timeout"
+        );
     }
 
     #[test]
@@ -1157,8 +1343,8 @@ mod tests {
 
     #[test]
     fn an_out_of_credit_error_names_a_shadowing_api_key() {
-        // In a child process, because the parent's environment cannot be mutated
-        // safely under `forbid(unsafe_code)`.
+        // In a child process, because the parent's environment is shared with
+        // the other tests and mutating it would race them.
         const CHILD: &str = "ZREVIEW_SHADOW_CHILD";
         if std::env::var_os(CHILD).is_none() {
             let status = Command::new(std::env::current_exe().expect("the test binary's path"))
