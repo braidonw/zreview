@@ -758,7 +758,10 @@ export type RefusalDto = {
 /**  One claim a run refused, and why. */
 export type RefusedClaimDto = {
 	title: string,
-	/**  "path SIDE line N", absent for a claim about the change as a whole. */
+	/**
+	 *  "path SIDE line N", or "path SIDE lines N to M" for a range. Absent for
+	 *  a claim about the change as a whole.
+	 */
 	location: string | null,
 	reason: string,
 };

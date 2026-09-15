@@ -4416,19 +4416,14 @@ mod tests {
         run_with(&model, &backend);
 
         let opened = toggle_refused_claims_on_model(&model).expect("the session can be reviewed");
-        assert!(
-            opened
-                .footer
-                .expect("a refused claim says so")
-                .refused_expanded
-        );
+        let opened_footer = opened.footer.expect("a refused claim says so");
+        assert!(opened_footer.refused_expanded);
+        assert_eq!(opened_footer.refused_claims.len(), 1);
+        assert_eq!(opened_footer.refused_claims[0].title, "impossible");
 
         let closed = toggle_refused_claims_on_model(&model).expect("the session can be reviewed");
-        assert!(
-            !closed
-                .footer
-                .expect("a refused claim says so")
-                .refused_expanded
-        );
+        let closed_footer = closed.footer.expect("a refused claim says so");
+        assert!(!closed_footer.refused_expanded);
+        assert!(closed_footer.refused_claims.is_empty());
     }
 }
