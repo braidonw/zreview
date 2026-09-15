@@ -3329,7 +3329,6 @@ mod tests {
             );
         }
 
-        // Moved onto a different row than it was written against, on purpose.
         let drafts = reanchor_draft_on_model(&model, 0, "feature.txt", DiffSide::Right, 1, 1)
             .expect("the stale draft should move onto row 1");
 
@@ -3337,6 +3336,47 @@ mod tests {
         assert_eq!(drafts.anchored.len(), 1);
         assert_eq!(drafts.anchored[0].row, 1);
         assert_eq!(drafts.anchored[0].body, "stale note");
+    }
+
+    /// The head advanced without touching the drafted line, so the draft's own
+    /// row is exactly where it belongs, and reopening finds it there once.
+    #[test]
+    fn reanchor_draft_on_model_moves_a_stale_draft_back_onto_its_own_row() {
+        let repository = temporary_repository();
+        let data = TempDir::new().unwrap();
+        let storage = ReviewStorage::At(data.path().join("review-data.sqlite3"));
+
+        {
+            let model = local_model(&local_request(&repository), &storage);
+            edit_draft_on_model(&model, 0, 0, 0, "stale note".to_owned()).unwrap();
+        }
+
+        let path = repository.path();
+        git(path, ["checkout", "--quiet", "feature"]);
+        std::fs::write(path.join("other.txt"), "unrelated\n").unwrap();
+        git(path, ["add", "."]);
+        git(path, ["commit", "--quiet", "-m", "advance"]);
+        git(path, ["checkout", "--quiet", "main"]);
+
+        {
+            let model = local_model(&local_request(&repository), &storage);
+            let drafts = reanchor_draft_on_model(&model, 0, "feature.txt", DiffSide::Right, 1, 0)
+                .expect("the stale draft should move back onto row 0");
+
+            assert!(drafts.stale.is_empty());
+            assert_eq!(drafts.anchored.len(), 1);
+            assert_eq!(drafts.anchored[0].row, 0);
+            assert_eq!(drafts.anchored[0].body, "stale note");
+        }
+
+        let model = local_model(&local_request(&repository), &storage);
+        let guard = lock(&model);
+        let SessionPhase::Ready(review) = guard.phase() else {
+            panic!("session should be ready");
+        };
+        assert_eq!(review.session().drafts().stale_count(), 0);
+        assert_eq!(review.session().drafts().len(), 1, "moved, not duplicated");
+        assert_eq!(review.session().draft_at(0, 0).unwrap().body, "stale note");
     }
 
     #[test]

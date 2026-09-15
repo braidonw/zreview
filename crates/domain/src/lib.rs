@@ -589,7 +589,8 @@ impl ReviewSession {
     ///
     /// Returns the anchors involved — the one vacated and the one now holding the
     /// text — so persistence can follow the move. `None` when the target row
-    /// cannot carry a comment, or `stale` names no stale draft.
+    /// cannot carry a comment, another draft already holds it, or `stale` names
+    /// no stale draft.
     pub fn reanchor_draft(
         &mut self,
         stale: &DiffAnchor,
@@ -598,7 +599,12 @@ impl ReviewSession {
     ) -> Option<ReanchoredDraft> {
         let target = self.anchor_for(file, row)?;
         // Checked before the text is removed, so a refused move changes nothing.
-        if self.drafts.get(&target).is_some() {
+        // The stale draft's own old position does not count as occupied.
+        if self
+            .drafts
+            .get(&target)
+            .is_some_and(|held| held.anchor != *stale)
+        {
             return None;
         }
         let body = Arc::make_mut(&mut self.drafts).take_stale(stale)?;
@@ -1666,6 +1672,41 @@ mod tests {
         assert_eq!(session.drafts().stale_count(), 1);
         // It did not take the row it would have occupied.
         assert!(session.draft_at(0, 6).is_none());
+    }
+
+    /// The head moved on but the line did not, so the draft's own old position is
+    /// the obvious place to put it back. The stale entry must not count as
+    /// occupying it.
+    #[test]
+    fn a_stale_draft_can_be_moved_back_onto_its_own_position() {
+        let mut session = anchored_session();
+        let mut old = session.anchor_for(0, 6).unwrap();
+        old.head_sha = "0".repeat(40).into();
+        session.restore_drafts([(old.clone(), "written against an older head".to_owned())]);
+
+        let moved = session
+            .reanchor_draft(&old, 0, 6)
+            .expect("its own row can carry it again");
+
+        assert_eq!(moved.vacated, old);
+        assert_eq!(moved.anchored, session.anchor_for(0, 6).unwrap());
+        let draft = session.draft_at(0, 6).expect("it should be on the row");
+        assert_eq!(draft.body, "written against an older head");
+        assert!(!draft.is_stale);
+        assert_eq!(session.drafts().stale_count(), 0);
+        assert_eq!(session.drafts().len(), 1, "moved, not duplicated");
+    }
+
+    /// The row belongs to another draft, so the move is still refused.
+    #[test]
+    fn re_anchoring_refuses_a_row_another_draft_holds() {
+        let mut session = anchored_session();
+        session.restore_drafts([(stale_anchor(), "still worth saying".to_owned())]);
+        assert!(session.set_draft(0, 6, "already here"));
+
+        assert!(session.reanchor_draft(&stale_anchor(), 0, 6).is_none());
+        assert_eq!(session.drafts().stale_count(), 1);
+        assert_eq!(session.draft_at(0, 6).unwrap().body, "already here");
     }
 
     fn stale_anchor() -> DiffAnchor {
