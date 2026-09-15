@@ -5,10 +5,16 @@
 
 .summary-editor__field .cm-editor {
   height: 76px;
-  border-radius: 6px;
+  border-radius: var(--radius-large);
   border: 1px solid var(--border-default);
 }
 
 .summary-editor__field .cm-scroller {
   overflow: auto;
+}
+
+/* Rings the editor box, not the content, since the scroller clips it. */
+.summary-editor__field .cm-editor.cm-focused {
+  outline: 2px solid var(--border-focus);
+  outline-offset: 2px;
 }

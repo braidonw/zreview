@@ -59,7 +59,7 @@
 }
 
 .diff-row__gutter {
-  padding-right: 8px;
+  padding-right: var(--space-8);
   text-align: right;
   color: var(--text-faint);
   flex-shrink: 0;
@@ -102,9 +102,9 @@
 
 .diff-row__draft-chip {
   flex-shrink: 0;
-  margin-right: 8px;
-  padding: 0 6px;
-  border-radius: 3px;
+  margin-right: var(--space-8);
+  padding: 0 var(--space-6);
+  border-radius: var(--radius-small);
   background: var(--accent-dim);
   color: var(--accent-text);
   font-family: var(--font-sans);
@@ -114,10 +114,10 @@
 
 .diff-row__pill {
   flex-shrink: 0;
-  margin-right: 8px;
-  padding: 4px 10px;
+  margin-right: var(--space-8);
+  padding: var(--space-4) var(--space-12);
   border: none;
-  border-radius: 4px;
+  border-radius: var(--radius-medium);
   background: var(--accent-base);
   color: var(--text-on-accent);
   font-family: var(--font-sans);

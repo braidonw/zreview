@@ -4,8 +4,8 @@
   flex-direction: column;
   align-items: center;
   justify-content: center;
-  gap: 8px;
-  padding: 0 48px;
+  gap: var(--space-8);
+  padding: 0 var(--space-48);
   text-align: center;
   background: var(--surface-base);
 }

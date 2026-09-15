@@ -1,17 +1,17 @@
 .comment-composer {
-  margin-left: calc(var(--gutter-width) * 2 + 20px);
-  margin-right: 12px;
-  margin-top: 4px;
-  margin-bottom: 8px;
+  margin-left: calc(var(--gutter-width) * 2 + var(--space-20));
+  margin-right: var(--space-12);
+  margin-top: var(--space-4);
+  margin-bottom: var(--space-8);
   display: flex;
   flex-direction: column;
-  gap: 8px;
+  gap: var(--space-8);
   font-family: var(--font-sans);
 }
 
 .comment-composer__editor .cm-editor {
   height: 104px;
-  border-radius: 6px;
+  border-radius: var(--radius-large);
   border: 1px solid var(--border-default);
 }
 
@@ -19,16 +19,22 @@
   overflow: auto;
 }
 
+/* Rings the editor box, not the content, since the scroller clips it. */
+.comment-composer__editor .cm-editor.cm-focused {
+  outline: 2px solid var(--border-focus);
+  outline-offset: 2px;
+}
+
 .comment-composer__actions {
   display: flex;
-  gap: 8px;
+  gap: var(--space-8);
 }
 
 .comment-composer__done,
 .comment-composer__discard {
   height: 32px;
-  padding: 0 12px;
-  border-radius: 6px;
+  padding: 0 var(--space-12);
+  border-radius: var(--radius-large);
   border: 1px solid var(--border-strong);
   background: transparent;
   color: var(--text-secondary);

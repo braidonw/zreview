@@ -1,10 +1,10 @@
 .submit-bar {
   flex-shrink: 0;
   height: 92px;
-  padding: 8px 12px;
+  padding: var(--space-8) var(--space-12);
   display: flex;
   align-items: center;
-  gap: 12px;
+  gap: var(--space-12);
   border-top: 1px solid var(--border-default);
   background: var(--surface-base);
   font-family: var(--font-mono);
@@ -16,7 +16,7 @@
   flex-shrink: 0;
   display: flex;
   flex-direction: column;
-  gap: 4px;
+  gap: var(--space-4);
 }
 
 .submit-bar__ready {
@@ -32,13 +32,13 @@
 .submit-bar__actions {
   flex-shrink: 0;
   display: flex;
-  gap: 8px;
+  gap: var(--space-8);
 }
 
 .submit-bar__action {
-  padding: 8px 12px;
+  padding: var(--space-8) var(--space-12);
   border: none;
-  border-radius: 6px;
+  border-radius: var(--radius-large);
   color: var(--text-on-accent);
   font-family: inherit;
   font-size: var(--size-label);
