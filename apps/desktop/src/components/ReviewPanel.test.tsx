@@ -453,6 +453,24 @@ describe("ReviewPanel", () => {
     expect(screen.getAllByText("src/review_fixture_00.rs RIGHT line 9999")).toHaveLength(1);
   });
 
+  it("omits the title line for a claim refused with no title, but still shows the reason", () => {
+    render(
+      <ReviewPanel
+        panel={makePanel({
+          footer: makeFooter({
+            refused: "1 claim(s) refused",
+            refused_expanded: true,
+            refused_claims: [makeRefusedClaim({ title: "  ", location: null, reason: "no title" })],
+          }),
+        })}
+        {...baseHandlers()}
+      />,
+    );
+
+    expect(document.querySelector(".review-panel__refused-title")).toBeNull();
+    expect(screen.getByText("no title")).toBeTruthy();
+  });
+
   it("shows no refused claims button when the run refused nothing", () => {
     render(<ReviewPanel panel={makePanel({ footer: makeFooter() })} {...baseHandlers()} />);
 

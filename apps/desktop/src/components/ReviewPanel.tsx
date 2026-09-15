@@ -136,7 +136,7 @@ export function ReviewPanel({
 /**
  * The refused count, expandable into each claim's title, location, and reason.
  *
- * Collapsed by default: a reviewer who wants to know why a claim was refused
+ * Collapsed by default. A reviewer who wants to know why a claim was refused
  * can ask, but the count alone is enough most of the time.
  */
 function RefusedClaimsSection({
@@ -165,7 +165,9 @@ function RefusedClaimsSection({
         <ul className="review-panel__refused">
           {claims.map((claim, index) => (
             <li key={index}>
-              <p className="review-panel__refused-title">{claim.title}</p>
+              {claim.title.trim() !== "" && (
+                <p className="review-panel__refused-title">{claim.title}</p>
+              )}
               {claim.location !== null && (
                 <p className="review-panel__refused-location">{claim.location}</p>
               )}
